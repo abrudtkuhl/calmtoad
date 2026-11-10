@@ -2,7 +2,9 @@
 
 Calm Toad checks a website for common problems like missing page titles, broken links, and images without descriptions.
 
-![Calm Toad showing a crawl of pmprompt.com](assets/pmprompt-crawl.png)
+[![Watch Calm Toad crawl pmprompt.com](assets/pmprompt-crawl.png)](https://cdn2.48web.com/assets/frogvtoad%202026-11-10%20at%2013.40.39.mp4)
+
+[Watch the side-by-side demo](https://cdn2.48web.com/assets/frogvtoad%202026-11-10%20at%2013.40.39.mp4) · [Calm Toad website source on GitHub](https://github.com/abrudtkuhl/calmtoad-website)
 
 ## Install Calm Toad
 
