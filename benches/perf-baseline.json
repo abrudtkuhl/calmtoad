@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "metric": "min_ns_per_op",
+  "os": "macos",
+  "arch": "x86_64",
+  "unit": "ns_per_op",
+  "scenarios": {
+    "calibration": 390718.750,
+    "crawl": 10246.083,
+    "audit": 819.583,
+    "audit_incremental": 1528.141,
+    "counts": 270.419,
+    "parse_typical": 19219.688,
+    "parse_large": 1499710.832
+  }
+}

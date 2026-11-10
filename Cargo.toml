@@ -1,0 +1,18 @@
+[package]
+name = "calmtoad"
+version = "0.1.0"
+edition = "2024"
+description = "A small SEO spider: crawl one host and audit titles, meta descriptions, H1s, response codes, canonicals, images and links."
+publish = false
+
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "78d22ed8eef60d76ac3f322ffc5883f3fcbc57f5" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "78d22ed8eef60d76ac3f322ffc5883f3fcbc57f5" }
+# No CLI binary or per-page parse-error bookkeeping; the spider never reads either.
+scraper = { version = "0.22", default-features = false }
+ureq = "2.12"
+url = "2.5"
+
+[[bench]]
+name = "crawl"
+harness = false
