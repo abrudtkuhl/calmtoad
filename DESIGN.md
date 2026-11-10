@@ -228,8 +228,8 @@ Eight tabs in one row: Internal, Titles, Meta, H1, Response, Canonical, Images, 
 - **Cells:** sans for content, mono and right-aligned for status codes and counts. Long URLs and titles truncate with an ellipsis rather than wrapping.
 - **Issues:** empty issues read "OK" in muted ink; hard failures are red; soft issues are amber. A non-auditable page shows a faint em dash, because a 404 has no title to judge.
 
-### Detail Strip
-Pinned under the table, separated by a top hairline. The selected URL sits on its own line in mono muted ink. Below it, four equal fields — Title, Meta description, H1, Canonical — each with a 10px mono uppercase label and a 12.5px sans value. Missing values are an em dash in faint ink. The strip never becomes a modal or a second table.
+### Page Details Drawer
+The drawer sits to the right of the results table and starts hidden. Selecting a result opens it; the page-details icon in the results header toggles it. The header shows the selected URL with copy and open-in-browser icon buttons. Title, Meta description, H1, Canonical, status, word count, content type, and image alt counts appear below. Missing values are an em dash in faint ink.
 
 ### Status Footer
 34px tall, hairline above. A 5px dot carries the state; the message is 10.5px mono at muted ink; SAME HOST ONLY is the right-hand 10px mono label. The footer is the only place the crawl result is stated in full, including when the page cap stopped it.

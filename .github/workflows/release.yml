@@ -79,12 +79,16 @@ jobs:
         include:
           - os: ubuntu-26.04
             asset: linux-x86_64
+            download: Calm-Toad-Linux.tar.gz
           - os: macos-latest
             asset: macos-aarch64
+            download: Calm-Toad-Mac-Apple-Silicon.zip
           - os: macos-26-intel
             asset: macos-x86_64
+            download: Calm-Toad-Mac-Intel.zip
           - os: windows-latest
             asset: windows-x86_64
+            download: Calm-Toad-Windows.zip
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -107,23 +111,23 @@ jobs:
       - name: Prepare Linux download
         if: runner.os == 'Linux'
         env:
-          VERSION: ${{ needs.create_tag.outputs.version }}
-          ASSET: ${{ matrix.asset }}
+          DOWNLOAD: ${{ matrix.download }}
         run: |
           set -euo pipefail
-          package="dist/calmtoad-v${VERSION}-${ASSET}"
+          package="dist/Calm Toad"
           mkdir -p "$package"
-          cp target/release/calmtoad README.md "$package/"
-          tar -C dist -czf "dist/calmtoad-v${VERSION}-${ASSET}.tar.gz" "${package#dist/}"
+          cp target/release/calmtoad "$package/Calm Toad"
+          cp README.md "$package/"
+          tar -C dist -czf "dist/${DOWNLOAD}" "${package#dist/}"
 
       - name: Prepare macOS app download
         if: runner.os == 'macOS'
         env:
           VERSION: ${{ needs.create_tag.outputs.version }}
-          ASSET: ${{ matrix.asset }}
+          DOWNLOAD: ${{ matrix.download }}
         run: |
           set -euo pipefail
-          package="dist/calmtoad-v${VERSION}-${ASSET}"
+          package="dist/Calm Toad"
           app="$package/Calm Toad.app"
           mkdir -p "$app/Contents/MacOS"
           cp target/release/calmtoad "$app/Contents/MacOS/calmtoad"
@@ -143,24 +147,24 @@ jobs:
           </dict>
           </plist>
           PLIST
-          ditto -c -k --sequesterRsrc --keepParent "$package" "dist/calmtoad-v${VERSION}-${ASSET}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$package" "dist/${DOWNLOAD}"
 
       - name: Prepare Windows download
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          VERSION: ${{ needs.create_tag.outputs.version }}
-          ASSET: ${{ matrix.asset }}
+          DOWNLOAD: ${{ matrix.download }}
         run: |
-          $package = "dist/calmtoad-v$env:VERSION-$env:ASSET"
+          $package = "dist/Calm Toad"
           New-Item -ItemType Directory -Force -Path $package | Out-Null
-          Copy-Item target/release/calmtoad.exe, README.md $package
-          Compress-Archive -Path "$package/*" -DestinationPath "dist/calmtoad-v$env:VERSION-$env:ASSET.zip" -Force
+          Copy-Item target/release/calmtoad.exe "$package/Calm Toad.exe"
+          Copy-Item README.md $package
+          Compress-Archive -Path "$package/*" -DestinationPath "dist/$env:DOWNLOAD" -Force
 
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.asset }}
-          path: dist/calmtoad-v${{ needs.create_tag.outputs.version }}-${{ matrix.asset }}.*
+          path: dist/${{ matrix.download }}
           if-no-files-found: error
           retention-days: 7
 
@@ -192,10 +196,16 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/calmtoad-* --clobber
+            assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+            if [[ -n "$assets" ]]; then
+              while IFS= read -r asset; do
+                gh release delete-asset "$TAG" "$asset" --yes
+              done <<< "$assets"
+            fi
+            gh release upload "$TAG" dist/Calm-Toad-* --clobber
             gh release edit "$TAG" --title "Calm Toad $TAG"
           else
-            gh release create "$TAG" dist/calmtoad-* \
+            gh release create "$TAG" dist/Calm-Toad-* \
               --verify-tag \
               --title "Calm Toad $TAG" \
               --generate-notes
@@ -213,4 +223,4 @@ jobs:
             --artifact-type application/vnd.calmtoad.release.v1 \
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --annotation "org.opencontainers.image.version=${TAG}" \
-            dist/calmtoad-*
+            dist/Calm-Toad-*

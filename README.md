@@ -1,48 +1,38 @@
 # Calm Toad
 
-A desktop website crawler for SEO audits. Crawl a site, then review its URLs, page titles, descriptions, headings, response codes, canonicals, images, and internal links.
+Calm Toad checks a website for common problems like missing page titles, broken links, and images without descriptions.
 
 ![Calm Toad showing a crawl of pmprompt.com](assets/pmprompt-crawl.png)
 
-## Download and install
+## Install Calm Toad
 
-Go to [the latest Calm Toad download](https://github.com/abrudtkuhl/calmtoad/releases/latest) and choose the download for your computer:
-
-| Your computer | Choose this download | Then |
-| --- | --- | --- |
-| Windows PC | File ending in `windows-x86_64.zip` | In Downloads, right-click the file, choose **Extract All**, open the new folder, and double-click `calmtoad.exe`. |
-| Mac with an Apple chip (M1, M2, M3, or later) | File ending in `macos-aarch64.zip` | Open the download and drag `Calm Toad.app` into Applications. Open Calm Toad from Applications. |
-| Mac with an Intel processor | File ending in `macos-x86_64.zip` | Open the download and drag `Calm Toad.app` into Applications. Open Calm Toad from Applications. |
-| Linux PC | File ending in `linux-x86_64.tar.gz` | Open the download and choose **Extract**. Open the folder it creates and launch Calm Toad. |
-
-To check which Mac you have, open the Apple menu and choose **About This Mac**. If it says **Chip**, choose the Apple chip download; if it says **Processor**, choose Intel. If Calm Toad does not open on Linux, use the agent instructions below to have it set up for you.
-
-The Mac app is not signed by Apple yet, so macOS may ask you to approve it the first time you open it. If you choose to continue, follow [Apple's instructions](https://support.apple.com/en-us/102445). These downloads are also available through [GitHub Packages](https://github.com/abrudtkuhl/calmtoad/pkgs/container/calmtoad).
-
-### Have an agent install it
-
-Copy this instruction into an agent that can use your computer:
+The easiest way to install Calm Toad is to ask an AI assistant that can use your computer. Copy and paste this:
 
 ```text
-Please install Calm Toad for me.
+Please install Calm Toad on this computer for me. Use the official download for my computer:
 
-1. Get the latest version from the official download page: https://github.com/abrudtkuhl/calmtoad/releases/latest.
-2. Choose the download for this computer. On a Mac, check **About This Mac** to see whether it has an Apple chip or an Intel processor.
-3. Install Calm Toad in the normal Apps folder for my account and open it to make sure it works.
-4. Ask me before entering an administrator password, installing system software, or changing security settings. If the Mac shows a security warning, stop and explain it to me. Do not turn off Mac security.
-5. Tell me where Calm Toad is installed and whether it opened successfully.
+- Windows: https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Windows.zip
+- Mac with an Apple chip: https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Apple-Silicon.zip
+- Mac with an Intel processor: https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Intel.zip
+- Linux: https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Linux.tar.gz
+
+Figure out which link matches this computer. If you are unsure, ask me before downloading. Install Calm Toad in the usual place for apps and open it to make sure it works. Ask me before using an administrator password or changing security settings. If something gets in the way, explain it in plain language. When you're done, tell me where Calm Toad is and confirm that it opened.
 ```
 
-## Build and run
+### Install it yourself
 
-Requires a Rust toolchain that supports edition 2024.
+**Windows:** [Download Calm Toad for Windows](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Windows.zip). In Downloads, right-click the file, choose **Extract All**, open the new folder, and double-click **Calm Toad**.
 
-```sh
-cargo run
-```
+**Mac:** Choose the [Apple chip download](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Apple-Silicon.zip) for an M-series Mac, or the [Intel download](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Intel.zip). If you are unsure, open the Apple menu and choose **About This Mac**. Open the download, open the **Calm Toad** folder it creates, then drag **Calm Toad.app** into Applications.
 
-Enter `https://pmprompt.com/` to try a real crawl. Calm Toad follows links on that site, reads `robots.txt`, respects `X-Robots-Tag: noindex`, and streams results into the table. It does not render JavaScript.
+**Linux:** [Download Calm Toad for Linux](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Linux.tar.gz). Open the download, choose **Extract**, then open the new folder and double-click **Calm Toad**. If Linux asks whether to run or display it, choose **Run**. If it does not open, use the instructions above to ask an AI assistant to set it up.
 
-## Contribute
+The Mac app is not signed by Apple yet, so macOS may show a security warning the first time you open it. If you choose to continue, follow [Apple's instructions](https://support.apple.com/en-us/102445).
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, checks, pull requests, and releases.
+To try it, open Calm Toad, enter `https://pmprompt.com/`, and press **Crawl**.
+
+## Building or improving Calm Toad
+
+Developers: see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, pull requests, and releases.
+
+For automated installs, the downloads are also available through [GitHub Packages](https://github.com/abrudtkuhl/calmtoad/pkgs/container/calmtoad).

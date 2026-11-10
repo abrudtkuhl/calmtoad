@@ -16,10 +16,12 @@ use calmtoad::crawl::{
     response_issue, title_issue,
 };
 use rune::tooling::AppSpec;
-use rune::{Align, Color, Cx, El, TextCase, TextEdit, TextStyle, Tx, Waker, col, el, row, text};
+use rune::{
+    Align, Color, Cx, El, Icon, TextCase, TextEdit, TextStyle, Tx, Waker, col, el, row, text,
+};
 use rune_kit::{
-    Button, ButtonVariant, Cell, Checkbox, ControlSize, Kit, SortDir, Table, TableColumn,
-    TableState, TableStyle,
+    Button, ButtonVariant, Cell, Checkbox, ControlSize, IconButton, IconButtonVariant, Kit,
+    SortDir, Table, TableColumn, TableState, TableStyle,
 };
 
 mod theme;
@@ -35,6 +37,17 @@ enum Tab {
     Images,
     Links,
 }
+
+static OPEN_LINK: Icon = Icon {
+    name: "open-link",
+    view: 16.0,
+    body: r#"<path d="M9 3h4v4M13 3L7 9M12 9v4H3V4h4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+static DETAILS_PANEL: Icon = Icon {
+    name: "details-panel",
+    view: 16.0,
+    body: r#"<rect x="1.5" y="2" width="13" height="12" rx="1" fill="none" stroke="currentColor"/><path d="M10 2v12" stroke="currentColor"/>"#,
+};
 
 enum CrawlEvent {
     Page(Box<Page>),
@@ -52,6 +65,7 @@ struct State {
     depth_limit: TextEdit,
     tab: Tab,
     issues_only: bool,
+    details_open: bool,
     table: TableState,
     pages: Vec<Page>,
     /// Indices into `pages` after the current tab's "issues only" filter, in display order.
@@ -75,6 +89,7 @@ fn init() -> State {
         depth_limit: TextEdit::new(MAX_DEPTH.to_string()),
         tab: Tab::Internal,
         issues_only: false,
+        details_open: false,
         table,
         pages: Vec::new(),
         visible: Vec::new(),
@@ -541,7 +556,7 @@ fn pages_field(k: &Kit, state: &State) -> El {
             rune_kit::TextInput::new(&state.pages_limit)
                 .plain()
                 .height(38.0)
-                .width(Some(42.0))
+                .width(Some(60.0))
                 .text_style(k.ty.mono)
                 .label("Page limit")
                 .on_edit(|state: &mut State| &mut state.pages_limit)
@@ -684,6 +699,22 @@ fn section_header(k: &Kit, state: &State) -> El {
         })
         .build(k)
         .key("issues");
+    let details = IconButton::new(&DETAILS_PANEL)
+        .variant(IconButtonVariant::GhostMuted)
+        .label(if state.details_open {
+            "Hide page details"
+        } else {
+            "Show page details"
+        })
+        .help(if state.details_open {
+            "Hide page details"
+        } else {
+            "Show page details"
+        })
+        .expanded(state.details_open)
+        .on_press(|state: &mut State| state.details_open = !state.details_open)
+        .build(k)
+        .key("details-toggle");
     row()
         .w_full()
         .px(GUTTER)
@@ -698,6 +729,7 @@ fn section_header(k: &Kit, state: &State) -> El {
                 .child(text(summary).font(k.ty.text_small).color(k.c.text_muted)),
         )
         .child(el().grow(1.0))
+        .child(details)
         .child(issues)
 }
 
@@ -706,9 +738,12 @@ fn results(k: &Kit, state: &State) -> El {
     if state.pages.is_empty() {
         return frame.child(empty(k, state));
     }
-    frame
-        .child(table(k, state).grow(1.0).min_w(0.0).h_full())
-        .child(detail(k, state).w(330.0).h_full())
+    let frame = frame.child(table(k, state).grow(1.0).min_w(0.0).h_full());
+    if state.details_open {
+        frame.child(detail(k, state).w(330.0).h_full())
+    } else {
+        frame
+    }
 }
 
 fn empty(k: &Kit, state: &State) -> El {
@@ -768,6 +803,9 @@ fn table(k: &Kit, state: &State) -> El {
     .on_sort(|state: &mut State, column, dir, _| {
         state.table.set_sort(column, dir);
         sort_pages(state);
+    });
+    table = table.on_select(|state: &mut State, _id, _tx| {
+        state.details_open = true;
     });
     table = match tab {
         Tab::Internal => table
@@ -1085,8 +1123,42 @@ fn detail(k: &Kit, state: &State) -> El {
         );
     };
 
+    let page_url = page.url.clone();
+    let actions = row()
+        .gap(6.0)
+        .child(
+            IconButton::new(&rune_kit::glyphs::COPY)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Copy page URL")
+                .help("Copy page URL")
+                .on_press_tx({
+                    let url = page_url.clone();
+                    move |_: &mut State, tx: &mut Tx| tx.copy(url.clone())
+                })
+                .build(k),
+        )
+        .child(
+            IconButton::new(&OPEN_LINK)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Open page in browser")
+                .help("Open page in browser")
+                .on_press_tx({
+                    let url = page_url.clone();
+                    move |_: &mut State, tx: &mut Tx| {
+                        let _ = tx.open_url(&url);
+                    }
+                })
+                .build(k),
+        );
     panel
-        .child(micro(k, "Selected page"))
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .child(micro(k, "Selected page"))
+                .child(el().grow(1.0))
+                .child(actions),
+        )
         .child(
             text(page.url.clone())
                 .key("detail-url")

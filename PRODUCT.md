@@ -22,7 +22,7 @@ The app serves people who need a desktop crawl followed by on-page and response 
 
 ## Operating Context
 
-A native window. Paste a URL, press Crawl, then switch tabs. Issues only hides clean rows for the current tab. The selected row shows its URL, title, meta description, and H1 under the table. The footer states the crawl result, including when the page cap stopped it. `cargo run` opens the window.
+A native window. Paste a URL, press Crawl, then switch tabs. Issues only hides clean rows for the current tab. Select a result to open its page details drawer; copy its URL or open it in a browser from the drawer. The footer states the crawl result, including when the page cap stopped it. `cargo run` opens the window.
 
 ## Capabilities and Constraints
 
