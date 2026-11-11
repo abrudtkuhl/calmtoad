@@ -1,0 +1,4 @@
+# Signed fixtures must retain their exact bytes, including on Windows checkouts.
+tests/fixtures/update-manifest.json -text
+tests/fixtures/update-manifest.json.minisig -text
+tests/fixtures/update-test.pub -text
