@@ -28,12 +28,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.3
 
-      - name: System libraries (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
-          sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y libxkbcommon-dev
-
       - name: Format
         run: cargo fmt --check
 
@@ -51,11 +45,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2.9.3
-
-      - name: System libraries
-        run: |
-          sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
-          sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y libxkbcommon-dev
 
       # Baselines are per platform: comparing a Linux run against macOS timings is too noisy
       # to gate. When the Linux baseline is missing, record one and upload it so it can be
