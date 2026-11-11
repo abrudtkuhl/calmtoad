@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Refresh the committed baseline. Run this on the machine (or CI runner) that will gate.
+# Refresh the committed baseline. Run this on the local machine that will run the gate.
 #
 #   scripts/update-baseline.sh
 #   scripts/update-baseline.sh --samples 9

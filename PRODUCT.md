@@ -38,7 +38,7 @@ Confirmed in the current app:
 - Canonical, image, and link checks: a missing canonical or one that points elsewhere, images without alt text, broken same-host links, inbound and outbound link counts, and redirect chains.
 - The window title is Calm Toad. The interface itself carries no logo or wordmark. The eight tabs are Internal, Titles, Meta, H1, Response, Canonical, Images, and Links.
 - In-app updates: the app checks a minisign-signed `latest.json` from GitHub Releases on launch and every 24 hours, verifies the package's size and SHA-256, stages it beside the install, and swaps it in after a user-confirmed restart. The old copy is kept until the new app starts; a failed install restores it. The updater only handles official portable installs in writable locations and never interrupts a crawl.
-- `cargo bench --bench crawl` times a synthetic 300-page crawl, the audit rebuild, issue counting, and parsing; it can emit JSON and gate on a calibration-normalized baseline. `.github/workflows/ci.yml` runs fmt, clippy, tests, and the performance gate.
+- `cargo bench --bench crawl` times a synthetic 300-page crawl, the audit rebuild, issue counting, and parsing; it can emit JSON and gate on a calibration-normalized baseline. `.github/workflows/ci.yml` runs fmt, clippy, and tests; the performance gate runs locally.
 
 Undecided, and not implied by the market:
 

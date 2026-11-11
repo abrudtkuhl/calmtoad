@@ -26,13 +26,13 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The Linux CI job also runs the performance gate:
+Run the performance gate locally when changing crawl, parsing, or audit performance:
 
 ```sh
-cargo bench --bench crawl
+scripts/perf-gate.sh
 ```
 
-The benchmark uses a synthetic site and does not make network requests. CI runs formatting, Clippy, and tests on Ubuntu, macOS, and Windows, plus the performance gate on Linux.
+The benchmark uses a synthetic site and does not make network requests. CI runs formatting, Clippy, and tests on Ubuntu, macOS, and Windows. Benchmarks run locally and do not block CI or releases.
 
 ## Performance
 
@@ -47,7 +47,7 @@ scripts/profile.sh                            # flamegraph (needs cargo-flamegra
 scripts/profile.sh audit --seconds 5          # profile one phase
 ```
 
-The baseline also stores a calibration run and the platform it came from. `--compare` scales the baseline by the calibration ratio, so a slower machine does not read as a code regression, and warns when the platform differs. The gate compares the fastest sample (best of nine) to resist scheduler noise. CI runs the gate with a 30% threshold and uploads the JSON report as an artifact. The multi-threaded crawl is reported but not gated, because its throughput depends on the runner's core count. Refresh the baseline on the machine or runner that will gate:
+The baseline also stores a calibration run and the platform it came from. `--compare` scales the baseline by the calibration ratio, so a slower machine does not read as a code regression, and warns when the platform differs. The gate compares the fastest sample (best of nine) to resist scheduler noise. The multi-threaded crawl is reported but not gated, because its throughput depends on the runner's core count. Refresh the baseline on the local machine that will run the gate:
 
 ```sh
 scripts/update-baseline.sh --samples 9
