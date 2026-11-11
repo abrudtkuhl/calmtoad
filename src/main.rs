@@ -17,7 +17,7 @@ use calmtoad::crawl::{
 };
 use rune::tooling::AppSpec;
 use rune::{
-    Align, Color, Cx, El, Icon, TextCase, TextEdit, TextStyle, Tx, Waker, col, el, row, text,
+    Align, Color, Cx, El, Icon, TextCase, TextEdit, TextStyle, Tx, Waker, col, el, icon, row, text,
 };
 use rune_kit::{
     Button, ButtonVariant, Cell, Checkbox, ControlSize, IconButton, IconButtonVariant, Kit,
@@ -25,6 +25,12 @@ use rune_kit::{
 };
 
 mod theme;
+
+static TOAD_MARK: Icon = Icon {
+    name: "toad-mark",
+    view: 16.0,
+    body: r##"<path fill="#173821" d="M4 0h2v1h4V0h2v2h2v2h1v6h-1v2h-2v2h-2v1H6v-1H4v-2H2v-2H1V4h1V2h2z"/><path fill="#32c768" d="M4 2h2v2h4V2h2v2h2v6h-2v2h-2v1H6v-1H4v-2H2V4h2z"/><path fill="#a4f18c" d="M4 2h2v2H4zm6 0h2v2h-2zM3 5h2v1H3zM11 5h2v1h-2z"/><path fill="#f0f2ef" d="M4 2h2v3H4zm6 0h2v3h-2z"/><path fill="#102317" d="M5 3h1v2H5zm6 0h1v2h-1zM7 6h1v1H7zm2 0h1v1H9zM5 8h6v1h1v1h-2v1H6v-1H4V9h1z"/><path fill="#228c47" d="M3 9h2v1H3zm8 0h2v1h-2zM4 11h2v1H4zm6 0h2v1h-2z"/>"##,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
@@ -476,6 +482,7 @@ fn topbar(k: &Kit, state: &State, counts: &Counts, inset: f32) -> El {
         .pr(GUTTER)
         .center_y()
         .gap(16.0)
+        .child(icon(&TOAD_MARK, 20.0).key("toad-mark").label("Calm Toad"))
         .child(tabs)
         .child(el().grow(1.0))
         .child(crawl_state(k, state))
@@ -1362,6 +1369,9 @@ fn scene_pmprompt(state: &mut State) {
 }
 
 fn main() {
+    if let Err(error) = rune::set_app_icon(include_bytes!("../assets/toad-app-icon.png").to_vec()) {
+        eprintln!("Could not set Calm Toad app icon: {error}");
+    }
     rune::run(AppSpec {
         scenes: &[
             ("empty", scene_empty),
@@ -1399,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn the_five_tabs_switch_and_issues_only_hides_clean_titles() {
+    fn tabs_switch_and_issues_only_hides_clean_titles() {
         let mut state = init();
         load_sample(&mut state);
         let mut rt = Runtime::new(
@@ -1413,10 +1423,13 @@ mod tests {
         );
         rt.frame(0.016);
         let all = texts(&rt);
-        assert!(rt.find("brand").is_none(), "the header has no brand mark");
+        assert!(
+            rt.find("toad-mark").is_some(),
+            "the header shows the Calm Toad mark"
+        );
         assert!(all.contains("Internal"), "{all}");
         assert!(all.contains("https://example.com/"), "{all}");
-        assert!(all.contains("Welcome"), "{all}");
+        assert!(all.contains("9 pages crawled"), "{all}");
 
         let (x, y) = rt.find("tab-response").expect("response tab");
         rt.pointer_down(x, y);
