@@ -31,7 +31,22 @@ Figure out which link matches this computer. If you are unsure, ask me before do
 
 The Mac app is not signed by Apple yet, so macOS may show a security warning the first time you open it. If you choose to continue, follow [Apple's instructions](https://support.apple.com/en-us/102445).
 
+### Updates
+
+Calm Toad checks for a new version when it opens and every 24 hours after that.
+When one is available, a strip offers the download; nothing installs until you
+choose **Restart and install**, so an active crawl is never interrupted.
+Downloads are verified against a signed manifest before they are used. If Calm
+Toad lives somewhere it cannot write to (or macOS is running it from a temporary
+location), it explains that instead of installing.
+
+Versions installed before this updater existed need one manual upgrade. After
+that, updates are handled inside the app. You can also choose **Check for
+Updates…** from the app menu at any time.
+
 To try it, open Calm Toad, enter `https://pmprompt.com/`, and press **Crawl**.
+
+Use **Export CSV** above the results to save the current tab. The file includes the columns and rows currently shown, so the active sort and **Issues only** filter are applied.
 
 ## Building or improving Calm Toad
 

@@ -1,17 +1,26 @@
 [package]
 name = "calmtoad"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A small SEO spider: crawl one host and audit titles, meta descriptions, H1s, response codes, canonicals, images and links."
 publish = false
 
 [dependencies]
-rune = { git = "https://github.com/anomalyco/rune", rev = "78d22ed8eef60d76ac3f322ffc5883f3fcbc57f5" }
+flate2 = "1.1.11"
+minisign-verify = "0.3.0"
+rune = { git = "https://github.com/anomalyco/rune", rev = "78d22ed8eef60d76ac3f322ffc5883f3fcbc57f5", features = ["native-file-dialog"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "78d22ed8eef60d76ac3f322ffc5883f3fcbc57f5" }
 # No CLI binary or per-page parse-error bookkeeping; the spider never reads either.
 scraper = { version = "0.22", default-features = false }
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tar = "0.4.46"
+tempfile = "3.27.0"
 ureq = "2.12"
 url = "2.5"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [[bench]]
 name = "crawl"

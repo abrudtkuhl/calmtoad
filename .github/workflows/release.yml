@@ -12,7 +12,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.version }}
+  # Releases promote `--latest`. Serialize every version so two runs can never race
+  # each other, and so a retry of an older version cannot overtake a newer one.
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -23,6 +25,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
+      mode: ${{ steps.tag.outputs.mode }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -31,10 +34,19 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Validate version and create tag
+      - name: Install minisign for the signing preflight
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends minisign
+
+      - name: Validate version and notes, then create tag
         id: tag
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           REQUESTED_VERSION: ${{ inputs.version }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
           set -euo pipefail
 
@@ -48,20 +60,111 @@ jobs:
             echo "Requested $REQUESTED_VERSION, but Cargo.toml declares $version." >&2
             exit 1
           fi
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Cargo.toml version is not a supported SemVer version: $version" >&2
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "The updater only ships stable versions; Cargo.toml declares: $version" >&2
             exit 1
           fi
 
+          python3 -m unittest discover -s scripts -p 'test_release_notes.py'
+          python3 scripts/release_notes.py "$version" > "$RUNNER_TEMP/release-notes.md"
+
           tag="v$version"
+          # This is exactly the release that releases/latest/download resolves to.
+          # Fail closed: a transient API error must not be mistaken for "no releases",
+          # which would let an older draft promote itself with --latest.
+          latest_error="$RUNNER_TEMP/latest-release.err"
+          latest_status=0
+          latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name // ""' 2>"$latest_error")" || latest_status=$?
+          if [[ "$latest_status" -ne 0 ]]; then
+            if grep -qE 'HTTP 404|Not Found' "$latest_error"; then
+              latest_tag=""
+            else
+              cat "$latest_error" >&2
+              echo "Could not determine the latest release; refusing to promote an older draft." >&2
+              exit 1
+            fi
+          fi
+          latest_version=""
+          if [[ -n "$latest_tag" ]]; then
+            latest_version="${latest_tag#v}"
+            if [[ "$version" != "$(printf '%s\n%s\n' "$latest_version" "$version" | sort -V | tail -n1)" ]]; then
+              echo "$version is older than the latest published release ($latest_tag)." >&2
+              echo "Publish a newer version instead; latest is never moved backwards." >&2
+              exit 1
+            fi
+          fi
+
+          # A published release for this exact version is the only case allowed to run
+          # again. It updates notes and never touches the tag, assets, or latest.
+          mode="new"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if [[ "$(gh release view "$tag" --json isDraft --jq .isDraft)" != "true" ]]; then
+              if [[ -n "$latest_version" && "$version" == "$latest_version" ]]; then
+                mode="notes-only"
+              else
+                echo "$tag is published but is not the latest release ($latest_tag)." >&2
+                echo "Refusing to modify a published release that latest does not point at." >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          previous_tag="$(git tag --merged HEAD --sort=-version:refname 'v[0-9]*' | awk -v current="$tag" '$0 != current' | sed -n '1p')"
+          if [[ -n "$previous_tag" ]]; then
+            printf '\n**Full changelog:** https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$previous_tag" "$tag" >> "$RUNNER_TEMP/release-notes.md"
+          fi
+
+          if [[ "$mode" == "notes-only" ]]; then
+            echo "Release $tag is already published and latest: updating notes only."
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "mode=notes-only" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -z "${MINISIGN_SECRET_KEY:-}" ]]; then
+            echo "Add the MINISIGN_SECRET_KEY repository secret before releasing." >&2
+            exit 1
+          fi
+
+          tag_exists=false
           if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            tag_exists=true
             git fetch --no-tags origin "refs/tags/$tag:refs/tags/$tag"
             existing_commit="$(git rev-parse "$tag^{commit}")"
             if [[ "$existing_commit" != "$GITHUB_SHA" ]] && ! git merge-base --is-ancestor "$existing_commit" "$GITHUB_SHA"; then
               echo "$tag already exists outside the selected main history." >&2
               exit 1
             fi
-          else
+            # Build and publish check out the tag, not this commit. If the tag carries
+            # different signing material or manifest tooling, retrying it here cannot
+            # repair that: the new scripts and key would never be used.
+            if ! git diff --quiet "$tag" "$GITHUB_SHA" -- assets/updater.pub scripts/release-manifest.sh; then
+              echo "$tag predates the current updater signing tooling." >&2
+              echo "An existing tag builds with its own assets/updater.pub and" >&2
+              echo "scripts/release-manifest.sh, so this retry cannot fix it." >&2
+              echo "Release a new version, or deliberately delete and recreate the tag" >&2
+              echo "before retrying with current tooling." >&2
+              exit 1
+            fi
+          fi
+
+          # Prove the stored private key signs, and that the committed public key
+          # verifies that signature, before a tag exists. A broken key pair then
+          # fails here instead of leaving a fresh tag and a stuck draft behind.
+          key="$RUNNER_TEMP/minisign.key"
+          probe="$RUNNER_TEMP/signing-preflight.txt"
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          trap 'rm -f "$key" "$probe" "$probe.minisig"' EXIT
+          printf 'calmtoad signing preflight\n' > "$probe"
+          minisign -Sm "$probe" -s "$key" -t "Calm Toad signing preflight"
+          minisign -Vm "$probe" -p assets/updater.pub
+          rm -f "$key" "$probe" "$probe.minisig"
+          trap - EXIT
+
+          if [[ "$tag_exists" == false ]]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git tag -a "$tag" "$GITHUB_SHA" -m "Calm Toad $tag"
@@ -70,9 +173,47 @@ jobs:
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "mode=new" >> "$GITHUB_OUTPUT"
+
+      # Carry validated notes from the dispatch commit through retries, even when
+      # the existing tag predates the release-notes tooling.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: changelog-notes
+          path: ${{ runner.temp }}/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  notes:
+    needs: create_tag
+    if: needs.create_tag.outputs.mode == 'notes-only'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: changelog-notes
+          path: ${{ runner.temp }}/notes
+
+      - name: Update published release notes only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.create_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/notes/release-notes.md"
+          if [[ ! -s "$notes" ]]; then
+            echo "Validated release notes are missing or empty." >&2
+            exit 1
+          fi
+          # Leave the tag, every asset, the manifest, and latest untouched.
+          gh release edit "$TAG" --notes-file "$notes" --repo "$GITHUB_REPOSITORY"
 
   build:
     needs: create_tag
+    if: needs.create_tag.outputs.mode == 'new'
     strategy:
       fail-fast: false
       matrix:
@@ -179,6 +320,7 @@ jobs:
 
   publish:
     needs: [create_tag, build]
+    if: needs.create_tag.outputs.mode == 'new'
     runs-on: ubuntu-26.04
     permissions:
       contents: write
@@ -194,31 +336,112 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: changelog-notes
+          path: ${{ runner.temp }}/notes
+
       - uses: oras-project/setup-oras@v2.0.3
         with:
           version: 1.3.6
 
-      - name: Create GitHub Release
+      - name: Install minisign
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends minisign
+
+      # Everything is uploaded to a draft first. The manifest goes up last, and the
+      # release is only made public after its assets and signature verify, so the
+      # latest/download/latest.json URL never points at a half-uploaded release.
+      - name: Stage the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.create_tag.outputs.tag }}
         run: |
           set -euo pipefail
+          notes="$RUNNER_TEMP/notes/release-notes.md"
+          if [[ ! -s "$notes" ]]; then
+            echo "Validated release notes are missing or empty." >&2
+            exit 1
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
-            if [[ -n "$assets" ]]; then
-              while IFS= read -r asset; do
-                gh release delete-asset "$TAG" "$asset" --yes
-              done <<< "$assets"
+            if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+              echo "$TAG is already published; publish a new version instead of replacing its assets." >&2
+              exit 1
             fi
+            # Resume a draft left by an earlier failed run.
+            while IFS= read -r asset; do
+              if [[ -n "$asset" ]]; then
+                gh release delete-asset "$TAG" "$asset" --yes
+              fi
+            done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
             gh release upload "$TAG" dist/Calm-Toad-* --clobber
-            gh release edit "$TAG" --title "Calm Toad $TAG"
+            gh release edit "$TAG" --title "Calm Toad $TAG" --notes-file "$notes"
           else
             gh release create "$TAG" dist/Calm-Toad-* \
+              --draft \
               --verify-tag \
               --title "Calm Toad $TAG" \
-              --generate-notes
+              --notes-file "$notes"
           fi
+
+      - name: Build and sign the update manifest
+        env:
+          TAG: ${{ needs.create_tag.outputs.tag }}
+          VERSION: ${{ needs.create_tag.outputs.version }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MINISIGN_SECRET_KEY:-}" ]]; then
+            echo "Add the MINISIGN_SECRET_KEY repository secret before releasing." >&2
+            exit 1
+          fi
+          chmod +x scripts/release-manifest.sh
+          scripts/release-manifest.sh "$VERSION" "$TAG" "$RUNNER_TEMP/notes/release-notes.md" dist
+
+          key="$RUNNER_TEMP/minisign.key"
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          minisign -Sm dist/latest.json -s "$key" -t "Calm Toad $TAG update manifest"
+          rm -f "$key"
+
+          # Check the exact bytes we are about to upload.
+          minisign -Vm dist/latest.json -p assets/updater.pub
+          jq -e '.schema_version == 1' dist/latest.json >/dev/null
+
+      - name: Upload the signed manifest to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.create_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/latest.json dist/latest.json.minisig --clobber
+
+      - name: Verify the draft before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.create_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          verify="$RUNNER_TEMP/verify"
+          mkdir -p "$verify"
+          gh release download "$TAG" --dir "$verify"
+
+          minisign -Vm "$verify/latest.json" -p assets/updater.pub
+          for platform in macos-aarch64 macos-x86_64 windows-x86_64 linux-x86_64; do
+            name="$(jq -r --arg p "$platform" '.platforms[$p].url | split("/") | last' "$verify/latest.json")"
+            expected="$(jq -r --arg p "$platform" '.platforms[$p].sha256' "$verify/latest.json")"
+            if [[ ! -f "$verify/$name" ]]; then
+              echo "The draft is missing $name." >&2
+              exit 1
+            fi
+            actual="$(sha256sum "$verify/$name" | awk '{ print $1 }')"
+            if [[ "$expected" != "$actual" ]]; then
+              echo "Checksum mismatch for $name." >&2
+              exit 1
+            fi
+          done
 
       - name: Publish downloads to GitHub Packages
         env:
@@ -233,3 +456,9 @@ jobs:
             --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --annotation "org.opencontainers.image.version=${TAG}" \
             dist/Calm-Toad-*
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.create_tag.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false --latest

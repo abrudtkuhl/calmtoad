@@ -15,9 +15,11 @@ use calmtoad::crawl::{
     counts_with, crawl_site_stream, h1_issue, image_issue, index_issue, links_issue, meta_issue,
     redirect_issue, response_issue, title_issue,
 };
+use calmtoad::update;
 use rune::tooling::AppSpec;
 use rune::{
-    Align, Color, Cx, El, Icon, TextCase, TextEdit, TextStyle, Tx, Waker, col, el, icon, row, text,
+    Align, Color, Cx, El, FileDialogOptions, Icon, MenuItem, TextCase, TextEdit, TextStyle, Tx,
+    Waker, col, el, icon, row, text,
 };
 use rune_kit::{
     Button, ButtonVariant, Cell, Checkbox, ControlSize, IconButton, IconButtonVariant, Kit,
@@ -65,6 +67,35 @@ struct CrawlJob {
     cancel: Arc<AtomicBool>,
 }
 
+/// What the update strip is showing.
+enum UpdateUi {
+    Idle,
+    Checking,
+    Available(update::AvailableUpdate),
+    Downloading {
+        version: String,
+        received: u64,
+        total: Option<u64>,
+    },
+    Ready(update::DownloadedUpdate),
+    Installing,
+    Failed(String),
+    UpToDate,
+}
+
+struct UpdateJob {
+    rx: mpsc::Receiver<UpdateEvent>,
+    cancel: Arc<AtomicBool>,
+    /// A person asked for this check, so its errors deserve a banner.
+    manual: bool,
+}
+
+enum UpdateEvent {
+    Checked(Result<Option<update::AvailableUpdate>, String>),
+    Progress { received: u64, total: Option<u64> },
+    Downloaded(Result<update::DownloadedUpdate, String>),
+}
+
 struct State {
     url: TextEdit,
     pages_limit: TextEdit,
@@ -81,9 +112,16 @@ struct State {
     crawling: bool,
     crawl_started: Option<Instant>,
     crawl_elapsed: Option<Duration>,
+    export_notice: Option<Result<String, String>>,
     max_pages: usize,
     job: Option<CrawlJob>,
     waker: Option<Waker>,
+    update: UpdateUi,
+    update_job: Option<UpdateJob>,
+    settings: update::Settings,
+    next_update_check: Option<Instant>,
+    /// The first frame has been laid out, so a pending update can keep its new copy.
+    update_confirmed: bool,
 }
 
 fn init() -> State {
@@ -104,17 +142,132 @@ fn init() -> State {
         crawling: false,
         crawl_started: None,
         crawl_elapsed: None,
+        export_notice: None,
         max_pages: DEFAULT_MAX_PAGES,
         job: None,
         waker: None,
+        update: UpdateUi::Idle,
+        update_job: None,
+        settings: update::Settings::load(),
+        next_update_check: None,
+        update_confirmed: false,
     }
 }
 
 fn setup(state: &mut State, waker: Waker) {
     state.waker = Some(waker);
+    update::install::cleanup_stale();
 }
 
-fn poll(state: &mut State, _t: f64, _tx: &mut Tx) -> bool {
+fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
+    if !state.update_confirmed {
+        // The window has laid out a frame. Now the new copy is known to start, so the
+        // previous version can be removed.
+        state.update_confirmed = true;
+        update::install::confirm_pending();
+    }
+    let update_changed = poll_updates(state, tx);
+    let crawl_changed = poll_crawl(state);
+    update_changed || crawl_changed
+}
+
+fn poll_updates(state: &mut State, tx: &mut Tx) -> bool {
+    let mut changed = false;
+    let mut finished = false;
+    if let Some(job) = &state.update_job {
+        loop {
+            match job.rx.try_recv() {
+                Ok(UpdateEvent::Checked(result)) => {
+                    finished = true;
+                    state.settings.mark_checked();
+                    let _ = state.settings.save();
+                    match result {
+                        Ok(Some(update)) => {
+                            state.update = if state.settings.skip_matches(&update.version) {
+                                UpdateUi::Idle
+                            } else {
+                                UpdateUi::Available(update)
+                            };
+                        }
+                        Ok(None) => state.update = UpdateUi::UpToDate,
+                        // An automatic check that could not reach GitHub stays quiet;
+                        // the next one is a day away and the footer still shows the
+                        // version. A check the person asked for reports the reason.
+                        Err(error) => {
+                            state.update = if job.manual {
+                                UpdateUi::Failed(error)
+                            } else {
+                                UpdateUi::Idle
+                            };
+                        }
+                    }
+                    changed = true;
+                }
+                Ok(UpdateEvent::Progress { received, total }) => {
+                    if let UpdateUi::Downloading {
+                        received: current,
+                        total: current_total,
+                        ..
+                    } = &mut state.update
+                    {
+                        *current = received;
+                        *current_total = total;
+                        changed = true;
+                    }
+                }
+                Ok(UpdateEvent::Downloaded(result)) => {
+                    finished = true;
+                    // A cancel the person asked for is not a failure to report.
+                    let cancelled = job.cancel.load(Ordering::Relaxed);
+                    state.update = match result {
+                        Ok(downloaded) => UpdateUi::Ready(downloaded),
+                        Err(_) if cancelled => UpdateUi::Idle,
+                        Err(error) => UpdateUi::Failed(error),
+                    };
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+    }
+    if finished {
+        state.update_job = None;
+    }
+
+    let busy = matches!(
+        state.update,
+        UpdateUi::Checking
+            | UpdateUi::Downloading { .. }
+            | UpdateUi::Ready(_)
+            | UpdateUi::Installing
+    );
+    if state.update_job.is_none() && !busy {
+        let now = Instant::now();
+        match state.next_update_check {
+            None => {
+                let due = now + Duration::from_secs(3);
+                state.next_update_check = Some(due);
+                tx.wake_after(Duration::from_secs(3));
+            }
+            Some(due) if now >= due => {
+                if state.settings.is_due() {
+                    start_check(state, false);
+                }
+                let next = now + Duration::from_secs(24 * 60 * 60);
+                state.next_update_check = Some(next);
+                tx.wake_after(Duration::from_secs(24 * 60 * 60));
+            }
+            Some(_) => {}
+        }
+    }
+    changed
+}
+
+fn poll_crawl(state: &mut State) -> bool {
     let Some(job) = state.job.take() else {
         return false;
     };
@@ -171,6 +324,130 @@ fn poll(state: &mut State, _t: f64, _tx: &mut Tx) -> bool {
     changed || did_finish
 }
 
+fn start_check(state: &mut State, manual: bool) {
+    if state.update_job.is_some() {
+        return;
+    }
+    if manual {
+        state.update = UpdateUi::Checking;
+    }
+    let (tx, rx) = mpsc::channel();
+    let waker = state.waker.clone();
+    std::thread::spawn(move || {
+        let result = update::check().map_err(|error| error.to_string());
+        let _ = tx.send(UpdateEvent::Checked(result));
+        if let Some(wake) = &waker {
+            wake();
+        }
+    });
+    state.update_job = Some(UpdateJob {
+        rx,
+        cancel: Arc::new(AtomicBool::new(false)),
+        manual,
+    });
+}
+
+fn start_download(state: &mut State) {
+    if state.update_job.is_some() {
+        return;
+    }
+    let UpdateUi::Available(offered) = std::mem::replace(&mut state.update, UpdateUi::Idle) else {
+        state.update = UpdateUi::Idle;
+        return;
+    };
+    let version = offered.version.clone();
+    let total = Some(offered.asset.size);
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = cancel.clone();
+    let waker = state.waker.clone();
+    std::thread::spawn(move || {
+        let progress_tx = tx.clone();
+        let progress_wake = waker.clone();
+        let result = update::download(&offered, &thread_cancel, move |received, total| {
+            let _ = progress_tx.send(UpdateEvent::Progress { received, total });
+            if let Some(wake) = &progress_wake {
+                wake();
+            }
+        })
+        .map_err(|error| error.to_string());
+        let _ = tx.send(UpdateEvent::Downloaded(result));
+        if let Some(wake) = &waker {
+            wake();
+        }
+    });
+    state.update = UpdateUi::Downloading {
+        version,
+        received: 0,
+        total,
+    };
+    state.update_job = Some(UpdateJob {
+        rx,
+        cancel,
+        manual: true,
+    });
+}
+
+fn cancel_download(state: &mut State) {
+    if let Some(job) = &state.update_job {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn dismiss_update(state: &mut State) {
+    cancel_download(state);
+    state.update = UpdateUi::Idle;
+}
+
+fn skip_update(state: &mut State) {
+    let version = match &state.update {
+        UpdateUi::Available(offered) => Some(offered.version.clone()),
+        _ => None,
+    };
+    if let Some(version) = version {
+        let _ = state.settings.skip(&version);
+    }
+    state.update = UpdateUi::Idle;
+}
+
+fn can_install(state: &State) -> bool {
+    !state.crawling && matches!(state.update, UpdateUi::Ready(_))
+}
+
+fn start_install(state: &mut State, tx: &mut Tx) {
+    // Starting the helper swaps the running binary. Never begin that while a crawl is
+    // feeding results into this process; the user can stop the crawl first.
+    if !can_install(state) {
+        return;
+    }
+    let UpdateUi::Ready(downloaded) = std::mem::replace(&mut state.update, UpdateUi::Installing)
+    else {
+        return;
+    };
+    match update::install::prepare(&downloaded) {
+        Ok(prepared) => match update::install::start_helper(&prepared) {
+            Ok(()) => {
+                // Keep the lock until this process really exits. The helper polls it
+                // and would otherwise be free to swap files during shutdown.
+                std::mem::forget(prepared);
+                tx.quit();
+            }
+            Err(error) => state.update = UpdateUi::Failed(error.to_string()),
+        },
+        Err(error) => state.update = UpdateUi::Failed(error.to_string()),
+    }
+}
+
+fn check_for_updates_menu(state: &mut State, _tx: &mut Tx) {
+    state.settings.clear_skip().ok();
+    start_check(state, true);
+}
+
+fn retry_update(state: &mut State) {
+    state.settings.clear_skip().ok();
+    start_check(state, true);
+}
+
 fn start_crawl(state: &mut State) {
     if state.crawling {
         return;
@@ -205,6 +482,7 @@ fn start_crawl(state: &mut State) {
     state.crawling = true;
     state.crawl_started = Some(Instant::now());
     state.crawl_elapsed = None;
+    state.export_notice = None;
     state.pages.clear();
     state.visible.clear();
     state.audit = Audit::default();
@@ -438,8 +716,11 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     if state.crawling {
         app = app.child(progress_line(&k, state));
     }
-    app.child(command_bar(&k, state))
-        .child(section_header(&k, state))
+    app = app.child(command_bar(&k, state));
+    if let Some(banner) = update_banner(&k, state) {
+        app = app.child(banner);
+    }
+    app.child(section_header(&k, state))
         .child(results(&k, state))
         .child(status_line(&k, state))
 }
@@ -474,7 +755,7 @@ fn topbar(k: &Kit, state: &State, counts: &Counts, inset: f32) -> El {
         .into_iter()
         .map(|tab| tab_button(k, state, tab, counts)),
     );
-    row()
+    let mut bar = row()
         .w_full()
         .h(52.0)
         .pl(GUTTER + inset)
@@ -483,9 +764,215 @@ fn topbar(k: &Kit, state: &State, counts: &Counts, inset: f32) -> El {
         .gap(16.0)
         .child(icon(&TOAD_MARK, 20.0).key("toad-mark").label("Calm Toad"))
         .child(tabs)
-        .child(el().grow(1.0))
-        .child(crawl_state(k, state))
+        .child(el().grow(1.0));
+    if let Some(chip) = update_chip(k, state) {
+        bar = bar.child(chip);
+    }
+    bar.child(crawl_state(k, state))
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+}
+
+fn update_chip(k: &Kit, state: &State) -> Option<El> {
+    match &state.update {
+        UpdateUi::Available(offered) => Some(
+            Button::new(format!("Update {}", offered.version))
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Regular)
+                .help(format!("Download Calm Toad {}", offered.version))
+                .on_press(start_download)
+                .build(k),
+        ),
+        UpdateUi::Downloading { .. } => Some(
+            text("Updating…")
+                .font(k.ty.small)
+                .color(k.c.warning.fg)
+                .text_case(TextCase::Uppercase),
+        ),
+        UpdateUi::Checking => Some(
+            text("Checking…")
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .text_case(TextCase::Uppercase),
+        ),
+        _ => None,
+    }
+}
+
+fn update_banner(k: &Kit, state: &State) -> Option<El> {
+    match &state.update {
+        UpdateUi::Available(offered) => {
+            let mut actions = vec![
+                Button::new("Download update")
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(ControlSize::Regular)
+                    .on_press(start_download)
+                    .build(k),
+                Button::new("Later")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Regular)
+                    .on_press(dismiss_update)
+                    .build(k),
+                Button::new("Skip version")
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Regular)
+                    .help(format!("Do not remind me about {}", offered.version))
+                    .on_press(skip_update)
+                    .build(k),
+            ];
+            if let Some(url) = offered.release_url.clone() {
+                actions.insert(
+                    1,
+                    Button::new("Release notes")
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Regular)
+                        .on_press_tx(move |_: &mut State, tx: &mut Tx| {
+                            let _ = tx.open_url(&url);
+                        })
+                        .build(k),
+                );
+            }
+            Some(banner(
+                k,
+                format!("Calm Toad {} is available", offered.version),
+                if offered.notes.trim().is_empty() {
+                    format!("You are running {}.", update::CURRENT_VERSION)
+                } else {
+                    short_notes(&offered.notes)
+                },
+                actions,
+                None,
+            ))
+        }
+        UpdateUi::Downloading {
+            version,
+            received,
+            total,
+        } => {
+            let fraction = total
+                .filter(|total| *total > 0)
+                .map(|total| *received as f32 / total as f32)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            Some(banner(
+                k,
+                format!("Downloading Calm Toad {version}"),
+                format!(
+                    "{} of {}",
+                    format_bytes(*received),
+                    total.map(format_bytes).unwrap_or_else(|| "…".into())
+                ),
+                vec![
+                    Button::new("Cancel")
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Regular)
+                        .on_press(cancel_download)
+                        .build(k),
+                ],
+                Some(fraction),
+            ))
+        }
+        UpdateUi::Ready(downloaded) => Some(banner(
+            k,
+            format!("Calm Toad {} is ready", downloaded.version),
+            if state.crawling {
+                "Stop the crawl before restarting to install.".into()
+            } else {
+                "Restarting will clear the current crawl results.".into()
+            },
+            vec![
+                Button::new("Restart and install")
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(ControlSize::Regular)
+                    .disabled(state.crawling)
+                    .on_press_tx(start_install)
+                    .build(k),
+            ],
+            None,
+        )),
+        UpdateUi::Failed(error) => Some(banner(
+            k,
+            "Update did not finish".into(),
+            error.clone(),
+            vec![
+                Button::new("Check again")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Regular)
+                    .on_press(retry_update)
+                    .build(k),
+                Button::new("Dismiss")
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Regular)
+                    .on_press(dismiss_update)
+                    .build(k),
+            ],
+            None,
+        )),
+        _ => None,
+    }
+}
+
+fn banner(k: &Kit, title: String, detail: String, actions: Vec<El>, progress: Option<f32>) -> El {
+    let mut body = col().w_full().gap(7.0).child(
+        row()
+            .w_full()
+            .gap(12.0)
+            .center_y()
+            .child(
+                col()
+                    .gap(3.0)
+                    .min_w(0.0)
+                    .child(text(title).font(k.ty.text_small).color(k.c.text_base))
+                    .child(
+                        text(detail)
+                            .font(k.ty.small)
+                            .color(k.c.text_muted)
+                            .wrap()
+                            .w_full(),
+                    ),
+            )
+            .child(el().grow(1.0))
+            .children(actions),
+    );
+    if let Some(fraction) = progress {
+        body = body.child(
+            row()
+                .w_full()
+                .h(3.0)
+                .fill(k.c.border_weak)
+                .child(el().h_full().w_frac(fraction).fill(k.c.text_base))
+                .child(el().grow(1.0)),
+        );
+    }
+    col().w_full().px(GUTTER).pb(12.0).child(
+        body.px(14.0)
+            .py(10.0)
+            .fill(k.c.layer_01)
+            .border(1.0, k.c.border_weak)
+            .radius(k.radius.lg),
+    )
+}
+
+fn short_notes(notes: &str) -> String {
+    let line = notes
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let summary: String = line.chars().take(140).collect();
+    if line.chars().count() > 140 {
+        format!("{summary}…")
+    } else {
+        summary
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
 }
 
 fn crawl_state(k: &Kit, state: &State) -> El {
@@ -721,6 +1208,18 @@ fn section_header(k: &Kit, state: &State) -> El {
         .on_press(|state: &mut State| state.details_open = !state.details_open)
         .build(k)
         .key("details-toggle");
+    let export = Button::new("Export CSV")
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Regular)
+        .help(format!(
+            "Save the {} visible rows from {} in the current sort order",
+            shown,
+            tab_title(state.tab)
+        ))
+        .disabled(state.crawling || shown == 0)
+        .on_press_tx(export_csv)
+        .build(k)
+        .key("export-csv");
     row()
         .w_full()
         .px(GUTTER)
@@ -735,8 +1234,182 @@ fn section_header(k: &Kit, state: &State) -> El {
                 .child(text(summary).font(k.ty.text_small).color(k.c.text_muted)),
         )
         .child(el().grow(1.0))
+        .child(export)
         .child(details)
         .child(issues)
+}
+
+fn export_csv(state: &mut State, tx: &mut Tx) {
+    if state.crawling || state.visible.is_empty() {
+        return;
+    }
+
+    let tab = state.tab;
+    let headers = export_headers(tab);
+    let rows = state
+        .visible
+        .iter()
+        .filter_map(|index| state.pages.get(*index))
+        .map(|page| export_row(tab, page, &state.audit))
+        .collect::<Vec<_>>();
+    let csv = calmtoad::export::to_csv(headers, &rows);
+    let row_count = rows.len();
+    let options = FileDialogOptions {
+        title: format!("Export {} as CSV", tab_title(tab)),
+        file_name: Some(format!("calmtoad-{}.csv", tab_slug(tab))),
+        ..Default::default()
+    }
+    .filter("CSV files", &["csv"]);
+
+    state.export_notice = None;
+    tx.save_file(
+        options,
+        move |state: &mut State, result, _tx| match result {
+            Ok(Some(path)) => {
+                let path = csv_path(path);
+                match std::fs::write(&path, csv.as_bytes()) {
+                    Ok(()) => {
+                        let name = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("CSV file");
+                        state.export_notice =
+                            Some(Ok(format!("Exported {row_count} rows to {name}")));
+                    }
+                    Err(error) => {
+                        state.export_notice = Some(Err(format!("Could not save CSV: {error}")));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                state.export_notice = Some(Err(format!("Could not open save dialog: {error}")));
+            }
+        },
+    );
+}
+
+fn csv_path(mut path: std::path::PathBuf) -> std::path::PathBuf {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"))
+    {
+        path.set_extension("csv");
+    }
+    path
+}
+
+fn tab_slug(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Internal => "internal-urls",
+        Tab::Titles => "titles",
+        Tab::Meta => "meta-descriptions",
+        Tab::H1 => "h1",
+        Tab::Response => "response-codes",
+        Tab::Canonical => "canonicals",
+        Tab::Images => "images",
+        Tab::Links => "links",
+    }
+}
+
+fn export_headers(tab: Tab) -> &'static [&'static str] {
+    match tab {
+        Tab::Internal => &["ADDRESS", "STATUS", "INDEXABLE", "WORDS"],
+        Tab::Titles => &["ADDRESS", "TITLE", "LENGTH", "ISSUE"],
+        Tab::Meta => &["ADDRESS", "META DESCRIPTION", "LENGTH", "ISSUE"],
+        Tab::H1 => &["ADDRESS", "H1", "COUNT", "ISSUE"],
+        Tab::Response => &["ADDRESS", "STATUS", "CONTENT TYPE", "ISSUE"],
+        Tab::Canonical => &["ADDRESS", "CANONICAL", "ISSUE"],
+        Tab::Images => &["ADDRESS", "IMAGES", "NO ALT", "ISSUE"],
+        Tab::Links => &["ADDRESS", "INBOUND", "OUTBOUND", "ISSUE"],
+    }
+}
+
+fn export_row(tab: Tab, page: &Page, audit: &Audit) -> Vec<String> {
+    let issue = || {
+        if matches!(
+            tab,
+            Tab::Titles | Tab::Meta | Tab::H1 | Tab::Canonical | Tab::Images
+        ) && !auditable(page)
+        {
+            "—".to_string()
+        } else {
+            let issue = issue_for(tab, page, audit);
+            if issue.is_empty() { "OK".into() } else { issue }
+        }
+    };
+    let count = |value: usize| {
+        if auditable(page) {
+            value.to_string()
+        } else {
+            "—".into()
+        }
+    };
+    let mut row = vec![page.url.clone()];
+    match tab {
+        Tab::Internal => {
+            row.push(if page.status == 0 {
+                "ERR".into()
+            } else {
+                page.status.to_string()
+            });
+            let index = index_issue(page);
+            row.push(if index.is_empty() {
+                "Yes".into()
+            } else {
+                index.into()
+            });
+            row.push(page.words.to_string());
+        }
+        Tab::Titles => {
+            row.push(dash(&page.title));
+            row.push(if auditable(page) || !page.title.is_empty() {
+                page.title.chars().count().to_string()
+            } else {
+                "—".into()
+            });
+            row.push(issue());
+        }
+        Tab::Meta => {
+            row.push(dash(&page.meta_description));
+            row.push(if auditable(page) || !page.meta_description.is_empty() {
+                page.meta_description.chars().count().to_string()
+            } else {
+                "—".into()
+            });
+            row.push(issue());
+        }
+        Tab::H1 => {
+            row.push(dash(&page.h1()));
+            row.push(count(page.h1s.len()));
+            row.push(issue());
+        }
+        Tab::Response => {
+            row.push(if page.status == 0 {
+                "ERR".into()
+            } else {
+                page.status.to_string()
+            });
+            row.push(mime(&page.content_type));
+            row.push(issue());
+        }
+        Tab::Canonical => {
+            row.push(dash(&page.canonical));
+            row.push(issue());
+        }
+        Tab::Images => {
+            row.push(count(page.images));
+            row.push(count(page.images_missing_alt));
+            row.push(issue());
+        }
+        Tab::Links => {
+            row.push(audit.inbound(page).to_string());
+            row.push(count(page.links.len()));
+            row.push(issue());
+        }
+    }
+    row
 }
 
 fn results(k: &Kit, state: &State) -> El {
@@ -1236,6 +1909,10 @@ fn status_line(k: &Kit, state: &State) -> El {
             .map(|started| started.elapsed())
             .unwrap_or_default();
         format!("{} pages · {}", state.pages.len(), format_duration(elapsed))
+    } else if let Some(notice) = &state.export_notice {
+        match notice {
+            Ok(message) | Err(message) => message.clone(),
+        }
     } else if let Some(elapsed) = state.crawl_elapsed {
         if state.issues_only {
             format!(
@@ -1257,7 +1934,7 @@ fn status_line(k: &Kit, state: &State) -> El {
     };
     let color = if state.crawling {
         k.c.warning.fg
-    } else if failed(state) {
+    } else if state.export_notice.as_ref().is_some_and(Result::is_err) || failed(state) {
         k.c.danger.fg
     } else if !state.pages.is_empty() {
         k.c.success.fg
@@ -1279,6 +1956,29 @@ fn status_line(k: &Kit, state: &State) -> El {
                 .color(k.c.text_muted),
         )
         .child(el().grow(1.0))
+        .child(
+            text(update_status(state))
+                .font(TextStyle::new(10.5, 400.0).mono().lh(15.0).tracking(0.2))
+                .color(k.c.text_muted),
+        )
+        .child(
+            text(format!("v{}", update::CURRENT_VERSION))
+                .font(TextStyle::new(10.5, 400.0).mono().lh(15.0).tracking(0.2))
+                .color(k.c.text_faint),
+        )
+}
+
+fn update_status(state: &State) -> String {
+    match &state.update {
+        UpdateUi::Checking => "Checking for updates".into(),
+        UpdateUi::UpToDate => "Up to date".into(),
+        UpdateUi::Available(offered) => format!("{} available", offered.version),
+        UpdateUi::Downloading { .. } => "Downloading update".into(),
+        UpdateUi::Ready(_) => "Restart to update".into(),
+        UpdateUi::Failed(_) => "Update failed".into(),
+        UpdateUi::Installing => "Installing update".into(),
+        UpdateUi::Idle => String::new(),
+    }
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -1355,6 +2055,38 @@ fn scene_crawling(state: &mut State) {
     state.message = "Crawling https://example.com/…".into();
 }
 
+fn scene_update_available(state: &mut State) {
+    state.update = UpdateUi::Available(update::AvailableUpdate {
+        version: "0.2.0".into(),
+        notes: "Faster crawls and a quieter update strip.".into(),
+        release_url: Some(
+            "https://github.com/abrudtkuhl/calmtoad/releases/tag/v0.2.0".into(),
+        ),
+        asset: update::manifest::PlatformAsset {
+            url: "https://github.com/abrudtkuhl/calmtoad/releases/download/v0.2.0/Calm-Toad-Mac-Apple-Silicon.zip".into(),
+            sha256: "a".repeat(64),
+            size: 8_123_456,
+        },
+    });
+}
+
+fn scene_update_downloading(state: &mut State) {
+    state.update = UpdateUi::Downloading {
+        version: "0.2.0".into(),
+        received: 3_100_000,
+        total: Some(8_123_456),
+    };
+}
+
+fn scene_update_ready(state: &mut State) {
+    state.update = UpdateUi::Ready(update::DownloadedUpdate::placeholder("0.2.0"));
+}
+
+fn scene_update_failed(state: &mut State) {
+    state.update =
+        UpdateUi::Failed("The update’s checksum did not match; it was discarded.".into());
+}
+
 fn scene_pmprompt(state: &mut State) {
     const SEED: &str = "https://pmprompt.com/";
     state.url.replace_text(SEED);
@@ -1370,10 +2102,13 @@ fn scene_pmprompt(state: &mut State) {
 }
 
 fn main() {
+    if let Some(code) = update::install::apply_from_env() {
+        std::process::exit(code);
+    }
     if let Err(error) = rune::set_app_icon(include_bytes!("../assets/toad-app-icon.png").to_vec()) {
         eprintln!("Could not set Calm Toad app icon: {error}");
     }
-    rune::run(AppSpec {
+    rune::App::new(AppSpec {
         scenes: &[
             ("empty", scene_empty),
             ("sample", scene_sample),
@@ -1387,13 +2122,19 @@ fn main() {
             ("title-issues", scene_title_issues),
             ("error", scene_error),
             ("crawling", scene_crawling),
+            ("update-available", scene_update_available),
+            ("update-downloading", scene_update_downloading),
+            ("update-ready", scene_update_ready),
+            ("update-failed", scene_update_failed),
             ("pmprompt", scene_pmprompt),
         ],
         setup: Some(setup),
         poll: Some(poll),
         min_size: Some((880.0, 560.0)),
         ..AppSpec::new("Calm Toad", (1180.0, 740.0), init, view)
-    });
+    })
+    .menu_item(MenuItem::new("Check for Updates…", check_for_updates_menu))
+    .run();
 }
 
 #[cfg(test)]
@@ -1418,6 +2159,10 @@ mod tests {
         assert!(
             rt.find("toad-mark").is_some(),
             "the header shows the Calm Toad mark"
+        );
+        assert!(
+            rt.find("export-csv").is_some(),
+            "the results header exposes CSV export"
         );
         assert!(rt.find("grid").is_some(), "the results table is present");
         assert_eq!(rt.state.visible.len(), rt.state.pages.len());
@@ -1463,5 +2208,60 @@ mod tests {
         assert!(rt.find("empty-title").is_some(), "error state is rendered");
         assert!(rt.state.pages.is_empty());
         assert!(!rt.state.crawling);
+    }
+
+    #[test]
+    fn csv_export_uses_visible_rows_in_the_active_tab_order() {
+        let mut state = init();
+        load_sample(&mut state);
+        state.tab = Tab::Titles;
+        state.issues_only = true;
+        state.table.set_sort("title", SortDir::Descending);
+        sort_pages(&mut state);
+
+        let exported = state
+            .visible
+            .iter()
+            .map(|index| export_row(state.tab, &state.pages[*index], &state.audit))
+            .collect::<Vec<_>>();
+
+        assert!(!exported.is_empty());
+        assert_eq!(
+            export_headers(state.tab),
+            &["ADDRESS", "TITLE", "LENGTH", "ISSUE"]
+        );
+        assert_eq!(exported.len(), state.visible.len());
+        assert_eq!(exported[0][0], state.pages[state.visible[0]].url);
+        assert!(exported.iter().all(|row| row[3] != "OK"));
+    }
+
+    #[test]
+    fn csv_export_path_always_uses_a_csv_extension() {
+        assert_eq!(
+            csv_path("crawl".into()),
+            std::path::PathBuf::from("crawl.csv")
+        );
+        assert_eq!(
+            csv_path("crawl.CSV".into()),
+            std::path::PathBuf::from("crawl.CSV")
+        );
+        assert_eq!(
+            csv_path("crawl.txt".into()),
+            std::path::PathBuf::from("crawl.csv")
+        );
+    }
+
+    #[test]
+    fn install_waits_for_a_finished_crawl() {
+        let mut state = init();
+        scene_update_ready(&mut state);
+        assert!(can_install(&state));
+
+        state.crawling = true;
+        assert!(!can_install(&state));
+
+        state.crawling = false;
+        state.update = UpdateUi::Idle;
+        assert!(!can_install(&state));
     }
 }
