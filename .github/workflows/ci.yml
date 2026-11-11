@@ -30,7 +30,9 @@ jobs:
 
       - name: System libraries (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y libxkbcommon-dev
 
       - name: Format
         run: cargo fmt --check
@@ -51,7 +53,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
 
       - name: System libraries
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y libxkbcommon-dev
 
       # Baselines are per platform: comparing a Linux run against macOS timings is too noisy
       # to gate. When the Linux baseline is missing, record one and upload it so it can be
@@ -70,7 +74,7 @@ jobs:
 
       - name: Upload perf report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-report
           path: perf-report.json
@@ -78,7 +82,7 @@ jobs:
 
       - name: Upload generated baseline
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-baseline-linux-x86_64
           path: benches/perf-baseline-linux-x86_64.json
