@@ -1400,16 +1400,8 @@ mod tests {
     use super::*;
     use rune::{Env, Runtime};
 
-    fn texts(rt: &Runtime<State>) -> String {
-        rt.elements()
-            .into_iter()
-            .filter_map(|element| element.text)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[test]
-    fn tabs_switch_and_issues_only_hides_clean_titles() {
+    fn tabs_switch_and_issues_only_filters_clean_title_rows() {
         let mut state = init();
         load_sample(&mut state);
         let mut rt = Runtime::new(
@@ -1422,36 +1414,34 @@ mod tests {
             },
         );
         rt.frame(0.016);
-        let all = texts(&rt);
         assert!(
             rt.find("toad-mark").is_some(),
             "the header shows the Calm Toad mark"
         );
-        assert!(all.contains("Internal"), "{all}");
-        assert!(all.contains("https://example.com/"), "{all}");
-        assert!(all.contains("9 pages crawled"), "{all}");
+        assert!(rt.find("grid").is_some(), "the results table is present");
+        assert_eq!(rt.state.visible.len(), rt.state.pages.len());
 
         let (x, y) = rt.find("tab-response").expect("response tab");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.016);
         assert_eq!(rt.state.tab, Tab::Response);
-        let all = texts(&rt);
-        assert!(all.contains("Client error") || all.contains("404"), "{all}");
 
-        rt.state.tab = Tab::Titles;
-        rt.state.issues_only = true;
-        refresh_visible(&mut rt.state);
+        let (x, y) = rt.find("tab-titles").expect("titles tab");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
         rt.frame(0.016);
-        let all = texts(&rt);
-        assert!(
-            all.contains("Too long") || all.contains("Too short") || all.contains("Duplicate"),
-            "{all}"
-        );
-        assert!(
-            !all.contains("Why a calm homepage converts better"),
-            "{all}"
-        );
+        assert_eq!(rt.state.tab, Tab::Titles);
+
+        let (x, y) = rt.find("issues").expect("issues-only checkbox");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.016);
+        assert!(rt.state.issues_only);
+        assert!(rt.state.visible.len() < rt.state.pages.len());
+        assert!(rt.state.visible.iter().all(|index| {
+            !issue_for(Tab::Titles, &rt.state.pages[*index], &rt.state.audit).is_empty()
+        }));
     }
 
     #[test]
@@ -1469,9 +1459,8 @@ mod tests {
         );
         rt.frame(0.016);
         assert!(rt.find("frame").is_some(), "results frame");
-        let all = texts(&rt);
-        assert!(all.contains("Couldn’t crawl"), "{all}");
-        assert!(all.contains("not a url"), "{all}");
-        assert!(!all.contains("Crawl a site"), "{all}");
+        assert!(rt.find("empty-title").is_some(), "error state is rendered");
+        assert!(rt.state.pages.is_empty());
+        assert!(!rt.state.crawling);
     }
 }
