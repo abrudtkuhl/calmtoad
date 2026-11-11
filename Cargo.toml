@@ -1,6 +1,6 @@
 [package]
 name = "calmtoad"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A small SEO spider: crawl one host and audit titles, meta descriptions, H1s, response codes, canonicals, images and links."
 publish = false

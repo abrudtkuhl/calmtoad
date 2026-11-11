@@ -80,7 +80,7 @@ fn fast_map<K: std::hash::Hash + Eq, V>(capacity: usize) -> FastMap<K, V> {
     map
 }
 
-pub const MAX_PAGES: usize = 40;
+pub const DEFAULT_MAX_PAGES: usize = 40;
 pub const MAX_DEPTH: u8 = 3;
 pub const TITLE_MIN: usize = 30;
 pub const TITLE_MAX: usize = 60;
@@ -139,7 +139,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_pages: MAX_PAGES,
+            max_pages: DEFAULT_MAX_PAGES,
             max_depth: MAX_DEPTH,
         }
     }
@@ -910,7 +910,9 @@ fn crawl_engine(
         };
     }
 
-    let mut seen: FastSet<String> = fast_set(limits.max_pages.saturating_mul(4).max(16));
+    // Reserve a modest starting amount. The user can set a large page limit, so
+    // allocating the full crawl budget before discovering any URLs is wasteful.
+    let mut seen: FastSet<String> = fast_set(limits.max_pages.min(256).saturating_mul(4).max(16));
     seen.insert(seed.clone());
     let mut pages = Vec::with_capacity(limits.max_pages.min(256));
     let mut committed = 1_usize;

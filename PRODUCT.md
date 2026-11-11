@@ -29,7 +29,7 @@ A native window. Paste a URL, press Crawl, then switch tabs. Issues only hides c
 Confirmed in the current app:
 
 - Same host only. Other hosts are not followed.
-- Defaults are 40 pages and 3 levels deep (the seed is level 0). The window accepts up to 2,000 pages and 10 levels.
+- Defaults are 40 pages and 3 levels deep (the seed is level 0). The page limit has no fixed maximum; crawl size depends on the limit you enter and the computer's available resources. Depth can be set up to 10.
 - Does not render JavaScript. Reads robots.txt (Allow, Disallow, Crawl-delay) and honors `X-Robots-Tag: noindex`.
 - Fetches run in parallel and stream into the table as they land; Stop cancels the crawl. Transient 429/5xx/transport failures retry with backoff, and a 429/503 pauses the pool.
 - Skips fragments and non-page schemes (mailto, javascript, tel, data) and common asset extensions. HTML is parsed; redirects are recorded, not treated as pages to audit.

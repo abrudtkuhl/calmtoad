@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use calmtoad::crawl;
 use calmtoad::crawl::{
-    Audit, Counts, Limits, MAX_DEPTH, MAX_PAGES, Page, auditable, canonical_issue, counts_with,
-    crawl_site_stream, h1_issue, image_issue, index_issue, links_issue, meta_issue, redirect_issue,
-    response_issue, title_issue,
+    Audit, Counts, DEFAULT_MAX_PAGES, Limits, MAX_DEPTH, Page, auditable, canonical_issue,
+    counts_with, crawl_site_stream, h1_issue, image_issue, index_issue, links_issue, meta_issue,
+    redirect_issue, response_issue, title_issue,
 };
 use rune::tooling::AppSpec;
 use rune::{
@@ -91,7 +91,7 @@ fn init() -> State {
     table.set_sort("url", SortDir::Ascending);
     State {
         url: TextEdit::new("https://example.com/"),
-        pages_limit: TextEdit::new(MAX_PAGES.to_string()),
+        pages_limit: TextEdit::new(DEFAULT_MAX_PAGES.to_string()),
         depth_limit: TextEdit::new(MAX_DEPTH.to_string()),
         tab: Tab::Internal,
         issues_only: false,
@@ -104,7 +104,7 @@ fn init() -> State {
         crawling: false,
         crawl_started: None,
         crawl_elapsed: None,
-        max_pages: MAX_PAGES,
+        max_pages: DEFAULT_MAX_PAGES,
         job: None,
         waker: None,
     }
@@ -191,8 +191,7 @@ fn start_crawl(state: &mut State) {
             .parse::<usize>()
             .ok()
             .filter(|pages| *pages > 0)
-            .unwrap_or(MAX_PAGES)
-            .min(2_000),
+            .unwrap_or(DEFAULT_MAX_PAGES),
         max_depth: state
             .depth_limit
             .text
@@ -563,7 +562,7 @@ fn pages_field(k: &Kit, state: &State) -> El {
             rune_kit::TextInput::new(&state.pages_limit)
                 .plain()
                 .height(38.0)
-                .width(Some(60.0))
+                .width(Some(76.0))
                 .text_style(k.ty.mono)
                 .label("Page limit")
                 .on_edit(|state: &mut State| &mut state.pages_limit)
@@ -1359,11 +1358,13 @@ fn scene_crawling(state: &mut State) {
 fn scene_pmprompt(state: &mut State) {
     const SEED: &str = "https://pmprompt.com/";
     state.url.replace_text(SEED);
-    state.pages_limit.replace_text(MAX_PAGES.to_string());
+    state
+        .pages_limit
+        .replace_text(DEFAULT_MAX_PAGES.to_string());
     state.depth_limit.replace_text(MAX_DEPTH.to_string());
     let started = Instant::now();
     let outcome = crawl::crawl_site(SEED);
-    state.max_pages = MAX_PAGES;
+    state.max_pages = DEFAULT_MAX_PAGES;
     set_pages(state, outcome.pages, outcome.message);
     state.crawl_elapsed = Some(started.elapsed());
 }
