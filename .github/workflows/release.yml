@@ -101,6 +101,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.3
 
+      - name: Prepare xkbcommon linker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          library="$(ldconfig -p | awk '$1 == "libxkbcommon.so.0" { print $NF; exit }')"
+          if [[ -z "$library" ]]; then
+            echo "The Linux runner does not provide libxkbcommon.so.0." >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/xkbcommon"
+          ln -s "$library" "$RUNNER_TEMP/xkbcommon/libxkbcommon.so"
+          echo "RUSTFLAGS=-L native=$RUNNER_TEMP/xkbcommon" >> "$GITHUB_ENV"
+
       - name: Build
         run: cargo build --release --locked
 

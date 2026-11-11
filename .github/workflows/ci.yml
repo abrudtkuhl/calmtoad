@@ -28,6 +28,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.3
 
+      - name: Prepare xkbcommon linker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          library="$(ldconfig -p | awk '$1 == "libxkbcommon.so.0" { print $NF; exit }')"
+          if [[ -z "$library" ]]; then
+            echo "The Linux runner does not provide libxkbcommon.so.0." >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/xkbcommon"
+          ln -s "$library" "$RUNNER_TEMP/xkbcommon/libxkbcommon.so"
+          echo "RUSTFLAGS=-L native=$RUNNER_TEMP/xkbcommon" >> "$GITHUB_ENV"
+
       - name: Format
         run: cargo fmt --check
 
@@ -45,6 +58,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2.9.3
+
+      - name: Prepare xkbcommon linker
+        run: |
+          set -euo pipefail
+          library="$(ldconfig -p | awk '$1 == "libxkbcommon.so.0" { print $NF; exit }')"
+          if [[ -z "$library" ]]; then
+            echo "The Linux runner does not provide libxkbcommon.so.0." >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/xkbcommon"
+          ln -s "$library" "$RUNNER_TEMP/xkbcommon/libxkbcommon.so"
+          echo "RUSTFLAGS=-L native=$RUNNER_TEMP/xkbcommon" >> "$GITHUB_ENV"
 
       # Baselines are per platform: comparing a Linux run against macOS timings is too noisy
       # to gate. When the Linux baseline is missing, record one and upload it so it can be
