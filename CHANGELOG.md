@@ -5,6 +5,17 @@ date are being prepared for release.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-12
+
+### Added
+
+- Read a site's sitemaps during a crawl and audit the URLs they list. The new Sitemaps tab has URLs and Files views, says when a URL was blocked, skipped, or left by the page limit, and exports the active view to CSV.
+- Discover sitemaps from robots.txt declarations, falling back to `/sitemap.xml` and then `/sitemap_index.xml`, and read XML urlset/index files including gzip with bounded document, entry, depth, and redirect limits.
+
+### Improved
+
+- Keep the footer clear of the initial ready message when the app opens.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

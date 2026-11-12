@@ -1,7 +1,7 @@
 //! A desktop SEO spider: crawl one host, then open the views people use first.
 //!
-//! Internal URLs, titles, meta descriptions, H1s, response codes, canonicals, image alt text and
-//! internal links. `cargo run` opens the window. `cargo run -- --snap shots/sample.png --scene sample --size 1180x740`
+//! Internal URLs, titles, meta descriptions, H1s, response codes, canonicals, image alt text,
+//! internal links, and the URLs a site's sitemaps list. `cargo run` opens the window. `cargo run -- --snap shots/sample.png --scene sample --size 1180x740`
 //! renders it headless.
 
 use std::borrow::Cow;
@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 use calmtoad::crawl;
 use calmtoad::crawl::{
     Audit, Counts, DEFAULT_MAX_PAGES, Limits, MAX_DEPTH, Page, auditable, canonical_issue,
-    counts_with, crawl_site_stream, h1_issue, image_issue, index_issue, links_issue, meta_issue,
-    redirect_issue, response_issue, title_issue,
+    counts_with, h1_issue, image_issue, index_issue, links_issue, meta_issue, redirect_issue,
+    response_issue, title_issue,
 };
+use calmtoad::sitemap::{FileState, SitemapFile, SitemapKind, SitemapReport, SitemapUrl, UrlState};
 use calmtoad::update;
 use rune::tooling::AppSpec;
 use rune::{
@@ -44,6 +45,13 @@ enum Tab {
     Canonical,
     Images,
     Links,
+    Sitemaps,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SitemapView {
+    Urls,
+    Files,
 }
 
 static OPEN_LINK: Icon = Icon {
@@ -59,7 +67,11 @@ static DETAILS_PANEL: Icon = Icon {
 
 enum CrawlEvent {
     Page(Box<Page>),
-    Done(String),
+    SitemapFile(SitemapFile),
+    SitemapUrl(SitemapUrl),
+    SitemapPartial(String),
+    SitemapDone,
+    Done(String, Box<SitemapReport>),
 }
 
 struct CrawlJob {
@@ -100,6 +112,7 @@ struct State {
     url: TextEdit,
     pages_limit: TextEdit,
     depth_limit: TextEdit,
+    use_sitemaps: bool,
     tab: Tab,
     issues_only: bool,
     details_open: bool,
@@ -108,6 +121,11 @@ struct State {
     /// Indices into `pages` after the current tab's "issues only" filter, in display order.
     visible: Vec<usize>,
     audit: Audit,
+    sitemap: SitemapReport,
+    sitemap_view: SitemapView,
+    sitemap_visible: Vec<usize>,
+    sitemap_file_visible: Vec<usize>,
+    sitemap_discovering: bool,
     message: String,
     crawling: bool,
     crawl_started: Option<Instant>,
@@ -131,6 +149,7 @@ fn init() -> State {
         url: TextEdit::new("https://example.com/"),
         pages_limit: TextEdit::new(DEFAULT_MAX_PAGES.to_string()),
         depth_limit: TextEdit::new(MAX_DEPTH.to_string()),
+        use_sitemaps: true,
         tab: Tab::Internal,
         issues_only: false,
         details_open: false,
@@ -138,6 +157,11 @@ fn init() -> State {
         pages: Vec::new(),
         visible: Vec::new(),
         audit: Audit::default(),
+        sitemap: SitemapReport::default(),
+        sitemap_view: SitemapView::Urls,
+        sitemap_visible: Vec::new(),
+        sitemap_file_visible: Vec::new(),
+        sitemap_discovering: false,
         message: "Ready · enter a site URL to begin. Up to 40 pages and 3 levels deep.".into(),
         crawling: false,
         crawl_started: None,
@@ -273,20 +297,43 @@ fn poll_crawl(state: &mut State) -> bool {
     };
     let start_len = state.pages.len();
     let mut changed = false;
+    let mut sitemap_changed = false;
     let mut finished = None;
     loop {
         match job.rx.try_recv() {
             Ok(CrawlEvent::Page(page)) => {
+                state.sitemap.observe_page(&page);
                 state.pages.push(*page);
                 changed = true;
+                sitemap_changed = true;
             }
-            Ok(CrawlEvent::Done(message)) => {
-                finished = Some(message);
+            Ok(CrawlEvent::SitemapFile(file)) => {
+                state.sitemap.insert_file(file);
+                sitemap_changed = true;
+            }
+            Ok(CrawlEvent::SitemapUrl(url)) => {
+                state.sitemap.insert_url(url);
+                sitemap_changed = true;
+            }
+            Ok(CrawlEvent::SitemapPartial(reason)) => {
+                state.sitemap.note_partial(reason);
+                sitemap_changed = true;
+            }
+            Ok(CrawlEvent::SitemapDone) => {
+                state.sitemap.discovery_done = true;
+                state.sitemap_discovering = false;
+                sitemap_changed = true;
+            }
+            Ok(CrawlEvent::Done(message, report)) => {
+                finished = Some((message, report));
                 break;
             }
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
-                finished = Some(format!("{} pages on the site", state.pages.len()));
+                finished = Some((
+                    format!("{} pages on the site", state.pages.len()),
+                    Box::new(std::mem::take(&mut state.sitemap)),
+                ));
                 break;
             }
         }
@@ -304,15 +351,22 @@ fn poll_crawl(state: &mut State) -> bool {
         }
         state.message = format!("{} pages so far…", state.pages.len());
         refresh_visible(state);
+    } else if sitemap_changed && state.tab == Tab::Sitemaps {
+        refresh_sitemap_visible(state);
     }
     let did_finish = finished.is_some();
     match finished {
-        Some(message) => {
+        Some((message, report)) => {
             state.crawling = false;
             state.crawl_elapsed = state.crawl_started.take().map(|started| started.elapsed());
             state.message = message;
             state.audit = Audit::from_pages(&state.pages);
+            state.sitemap = *report;
+            state.sitemap_discovering = false;
             sort_pages(state);
+            if state.tab == Tab::Sitemaps {
+                sort_sitemap(state);
+            }
             if let Some(url) = state.pages.first().map(|page| page.url.clone()) {
                 state.table.select(url);
             } else {
@@ -321,7 +375,7 @@ fn poll_crawl(state: &mut State) -> bool {
         }
         None => state.job = Some(job),
     }
-    changed || did_finish
+    changed || sitemap_changed || did_finish
 }
 
 fn start_check(state: &mut State, manual: bool) {
@@ -486,26 +540,41 @@ fn start_crawl(state: &mut State) {
     state.pages.clear();
     state.visible.clear();
     state.audit = Audit::default();
+    state.sitemap = SitemapReport::default();
+    state.sitemap.discovery_done = !state.use_sitemaps;
+    state.sitemap_discovering = state.use_sitemaps;
+    state.sitemap_visible.clear();
+    state.sitemap_file_visible.clear();
     state.table.clear_selection();
     state.message = format!("Crawling {seed}…");
 
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let waker = state.waker.clone();
+    let options = crawl::CrawlOptions {
+        sitemaps: state.use_sitemaps,
+    };
     state.job = Some(CrawlJob {
         rx,
         cancel: cancel.clone(),
     });
     std::thread::spawn(move || {
-        let page_tx = tx.clone();
+        let event_tx = tx.clone();
         let wake = waker.clone();
-        let outcome = crawl_site_stream(&seed, limits, &cancel, |page| {
-            let _ = page_tx.send(CrawlEvent::Page(Box::new(page.clone())));
+        let outcome = crawl::crawl_site_with(&seed, limits, options, &cancel, |event| {
+            let event = match event {
+                crawl::CrawlEvent::Page(page) => CrawlEvent::Page(Box::new(page)),
+                crawl::CrawlEvent::SitemapFile(file) => CrawlEvent::SitemapFile(file),
+                crawl::CrawlEvent::SitemapUrl(url) => CrawlEvent::SitemapUrl(url),
+                crawl::CrawlEvent::SitemapPartial(reason) => CrawlEvent::SitemapPartial(reason),
+                crawl::CrawlEvent::SitemapDone => CrawlEvent::SitemapDone,
+            };
+            let _ = event_tx.send(event);
             if let Some(wake) = &wake {
                 wake();
             }
         });
-        let _ = tx.send(CrawlEvent::Done(outcome.message));
+        let _ = tx.send(CrawlEvent::Done(outcome.message, Box::new(outcome.sitemap)));
         if let Some(wake) = &waker {
             wake();
         }
@@ -520,6 +589,10 @@ fn stop_crawl(state: &mut State) {
 }
 
 fn refresh_visible(state: &mut State) {
+    if state.tab == Tab::Sitemaps {
+        refresh_sitemap_visible(state);
+        return;
+    }
     let tab = state.tab;
     let issues_only = state.issues_only;
     let pages = &state.pages;
@@ -531,6 +604,93 @@ fn refresh_visible(state: &mut State) {
         .map(|(index, _)| index)
         .collect();
     state.visible = visible;
+}
+
+fn refresh_sitemap_visible(state: &mut State) {
+    let issues_only = state.issues_only;
+    match state.sitemap_view {
+        SitemapView::Urls => {
+            state.sitemap_visible = state
+                .sitemap
+                .urls
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| !issues_only || entry.needs_attention())
+                .map(|(index, _)| index)
+                .collect();
+        }
+        SitemapView::Files => {
+            state.sitemap_file_visible = state
+                .sitemap
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, file)| !issues_only || file.needs_attention())
+                .map(|(index, _)| index)
+                .collect();
+        }
+    }
+}
+
+fn sort_sitemap(state: &mut State) {
+    refresh_sitemap_visible(state);
+    let Some((column, dir)) = state
+        .table
+        .sort()
+        .map(|(column, dir)| (column.to_string(), dir))
+    else {
+        return;
+    };
+    match state.sitemap_view {
+        SitemapView::Urls => {
+            let State {
+                sitemap,
+                sitemap_visible,
+                ..
+            } = state;
+            sitemap_visible.sort_by(|left, right| {
+                dir.apply(compare_sitemap_url(
+                    &sitemap.urls[*left],
+                    &sitemap.urls[*right],
+                    &column,
+                ))
+            });
+        }
+        SitemapView::Files => {
+            let State {
+                sitemap,
+                sitemap_file_visible,
+                ..
+            } = state;
+            sitemap_file_visible.sort_by(|left, right| {
+                dir.apply(compare_sitemap_file(
+                    &sitemap.files[*left],
+                    &sitemap.files[*right],
+                    &column,
+                ))
+            });
+        }
+    }
+}
+
+fn compare_sitemap_url(a: &SitemapUrl, b: &SitemapUrl, column: &str) -> std::cmp::Ordering {
+    match column {
+        "state" => a.state.label().cmp(b.state.label()),
+        "status" => a.status.cmp(&b.status),
+        "issue" => a.issue.cmp(&b.issue),
+        "source" => a.sources.first().cmp(&b.sources.first()),
+        _ => a.url.cmp(&b.url),
+    }
+}
+
+fn compare_sitemap_file(a: &SitemapFile, b: &SitemapFile, column: &str) -> std::cmp::Ordering {
+    match column {
+        "state" => a.state.label().cmp(b.state.label()),
+        "status" => a.status.cmp(&b.status),
+        "urls" => a.urls.cmp(&b.urls),
+        "issue" => a.issue.cmp(&b.issue),
+        _ => a.url.cmp(&b.url),
+    }
 }
 
 fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
@@ -550,14 +710,22 @@ fn load_sample(state: &mut State) {
     state.crawling = false;
     state.issues_only = false;
     state.tab = Tab::Internal;
+    state.sitemap_view = SitemapView::Urls;
+    state.sitemap_discovering = false;
+    state.sitemap = calmtoad::sitemap::sample_report();
     set_pages(
         state,
         crawl::sample_pages(),
         "9 pages on example.com".into(),
     );
+    refresh_sitemap_visible(state);
 }
 
 fn sort_pages(state: &mut State) {
+    if state.tab == Tab::Sitemaps {
+        sort_sitemap(state);
+        return;
+    }
     let tab = state.tab;
     let Some((column, dir)) = state
         .table
@@ -610,6 +778,12 @@ fn visible_index(state: &State, row: usize) -> usize {
 }
 
 fn visible_len(state: &State) -> usize {
+    if state.tab == Tab::Sitemaps {
+        return match state.sitemap_view {
+            SitemapView::Urls => state.sitemap_visible.len(),
+            SitemapView::Files => state.sitemap_file_visible.len(),
+        };
+    }
     state.visible.len()
 }
 
@@ -633,6 +807,7 @@ fn issue_for(tab: Tab, page: &Page, audit: &Audit) -> String {
         Tab::Canonical => canonical_issue(page),
         Tab::Images => image_issue(page),
         Tab::Links => links_issue(page, audit),
+        Tab::Sitemaps => String::new(),
     }
 }
 
@@ -646,10 +821,11 @@ fn tab_key(tab: Tab) -> &'static str {
         Tab::Canonical => "tab-canonical",
         Tab::Images => "tab-images",
         Tab::Links => "tab-links",
+        Tab::Sitemaps => "tab-sitemaps",
     }
 }
 
-fn tab_label(tab: Tab, counts: &Counts) -> String {
+fn tab_label(tab: Tab, counts: &Counts, sitemap: &SitemapReport) -> String {
     match tab {
         Tab::Internal => format!("Internal {}", counts.pages),
         Tab::Titles => format!("Titles {}", counts.title),
@@ -659,6 +835,7 @@ fn tab_label(tab: Tab, counts: &Counts) -> String {
         Tab::Canonical => format!("Canonical {}", counts.canonical),
         Tab::Images => format!("Images {}", counts.images),
         Tab::Links => format!("Links {}", counts.links),
+        Tab::Sitemaps => format!("Sitemaps {}", sitemap.urls.len()),
     }
 }
 
@@ -672,10 +849,11 @@ fn tab_short(tab: Tab) -> &'static str {
         Tab::Canonical => "Canonical",
         Tab::Images => "Images",
         Tab::Links => "Links",
+        Tab::Sitemaps => "Sitemaps",
     }
 }
 
-fn tab_count(tab: Tab, counts: &Counts) -> usize {
+fn tab_count(tab: Tab, counts: &Counts, sitemap: &SitemapReport) -> usize {
     match tab {
         Tab::Internal => counts.pages,
         Tab::Titles => counts.title,
@@ -685,6 +863,7 @@ fn tab_count(tab: Tab, counts: &Counts) -> usize {
         Tab::Canonical => counts.canonical,
         Tab::Images => counts.images,
         Tab::Links => counts.links,
+        Tab::Sitemaps => sitemap.urls.len(),
     }
 }
 
@@ -698,6 +877,15 @@ fn tab_title(tab: Tab) -> &'static str {
         Tab::Canonical => "Canonicals",
         Tab::Images => "Image alt text",
         Tab::Links => "Internal links",
+        Tab::Sitemaps => "Sitemaps",
+    }
+}
+
+fn active_title(state: &State) -> &'static str {
+    match (state.tab, state.sitemap_view) {
+        (Tab::Sitemaps, SitemapView::Urls) => "Sitemap URLs",
+        (Tab::Sitemaps, SitemapView::Files) => "Sitemap files",
+        _ => tab_title(state.tab),
     }
 }
 
@@ -751,6 +939,7 @@ fn topbar(k: &Kit, state: &State, counts: &Counts, inset: f32) -> El {
             Tab::Canonical,
             Tab::Images,
             Tab::Links,
+            Tab::Sitemaps,
         ]
         .into_iter()
         .map(|tab| tab_button(k, state, tab, counts)),
@@ -1017,6 +1206,8 @@ fn command_bar(k: &Kit, state: &State) -> El {
             .child(pages_field(k, state))
             .child(vrule(k))
             .child(depth_field(k, state))
+            .child(vrule(k))
+            .child(sitemaps_toggle(k, state))
             .child(crawl_button(k, state)),
     )
 }
@@ -1082,6 +1273,18 @@ fn depth_field(k: &Kit, state: &State) -> El {
         )
 }
 
+fn sitemaps_toggle(k: &Kit, state: &State) -> El {
+    row().h_full().px(12.0).center_y().child(
+        Checkbox::new(state.use_sitemaps)
+            .label("Use sitemaps")
+            .description("Read robots.txt and sitemap files")
+            .disabled(state.crawling)
+            .on_toggle(|state: &mut State| state.use_sitemaps ^= true)
+            .build(k)
+            .key("use-sitemaps"),
+    )
+}
+
 fn crawl_button(k: &Kit, state: &State) -> El {
     let font = TextStyle::new(10.5, 500.0).mono().lh(14.0).tracking(1.2);
     if state.crawling {
@@ -1117,7 +1320,7 @@ fn crawl_button(k: &Kit, state: &State) -> El {
 
 fn tab_button(k: &Kit, state: &State, tab: Tab, counts: &Counts) -> El {
     let selected = state.tab == tab;
-    let count = tab_count(tab, counts);
+    let count = tab_count(tab, counts, &state.sitemap);
     let count_ink = k.c.text_muted;
     let label_ink = if selected {
         k.c.text_base
@@ -1125,7 +1328,7 @@ fn tab_button(k: &Kit, state: &State, tab: Tab, counts: &Counts) -> El {
         k.c.text_muted
     };
     let small = k.ty.small;
-    Button::new(tab_label(tab, counts))
+    Button::new(tab_label(tab, counts, &state.sitemap))
         .control_size(ControlSize::Regular)
         .variant(if selected {
             ButtonVariant::Neutral
@@ -1169,6 +1372,9 @@ fn progress_line(k: &Kit, state: &State) -> El {
 }
 
 fn section_header(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Sitemaps {
+        return sitemap_section_header(k, state);
+    }
     let total = state.pages.len();
     let shown = visible_len(state);
     let summary = if total == 0 {
@@ -1184,15 +1390,152 @@ fn section_header(k: &Kit, state: &State) -> El {
     } else {
         format!("{total} pages crawled")
     };
-    let issues = Checkbox::new(state.issues_only)
-        .label("Issues only")
-        .on_toggle(|state: &mut State| {
-            state.issues_only ^= true;
-            refresh_visible(state);
-        })
+    row()
+        .w_full()
+        .px(GUTTER)
+        .pt(12.0)
+        .pb(14.0)
+        .center_y()
+        .gap(16.0)
+        .child(
+            col()
+                .gap(3.0)
+                .child(micro(k, active_title(state)))
+                .child(text(summary).font(k.ty.text_small).color(k.c.text_muted)),
+        )
+        .child(el().grow(1.0))
+        .child(export_button(k, state, shown))
+        .child(details_toggle(k, state))
+        .child(issues_checkbox(k, state))
+}
+
+fn sitemap_section_header(k: &Kit, state: &State) -> El {
+    let total = match state.sitemap_view {
+        SitemapView::Urls => state.sitemap.urls.len(),
+        SitemapView::Files => state.sitemap.files.len(),
+    };
+    let shown = visible_len(state);
+    let summary = if state.issues_only {
+        format!("{shown} of {total} shown")
+    } else {
+        sitemap_summary(state)
+    };
+    let view = |label: &'static str, view: SitemapView, key: &'static str| {
+        Button::new(label)
+            .variant(if state.sitemap_view == view {
+                ButtonVariant::Neutral
+            } else {
+                ButtonVariant::Ghost
+            })
+            .control_size(ControlSize::Regular)
+            .help(match view {
+                SitemapView::Urls => "URLs listed by the sitemaps",
+                SitemapView::Files => "Sitemap files that were read or tried",
+            })
+            .on_press(move |state: &mut State| {
+                state.sitemap_view = view;
+                state.table.set_sort("url", SortDir::Ascending);
+                sort_sitemap(state);
+            })
+            .build(k)
+            .key(key)
+    };
+    row()
+        .w_full()
+        .px(GUTTER)
+        .pt(12.0)
+        .pb(14.0)
+        .center_y()
+        .gap(12.0)
+        .child(
+            col()
+                .gap(3.0)
+                .grow(1.0)
+                .min_w(0.0)
+                .child(micro(k, active_title(state)))
+                .child(
+                    text(summary)
+                        .font(k.ty.text_small)
+                        .color(k.c.text_muted)
+                        .w_full()
+                        .wrap(),
+                ),
+        )
+        .child(view("URLs", SitemapView::Urls, "sitemap-urls"))
+        .child(view("Files", SitemapView::Files, "sitemap-files"))
+        .child(export_button(k, state, shown))
+        .child(details_toggle(k, state))
+        .child(issues_checkbox(k, state))
+}
+
+fn sitemap_summary(state: &State) -> String {
+    let summary = state.sitemap.summary();
+    if !state.sitemap.discovery_done {
+        if !state.crawling && !state.sitemap_discovering {
+            return "Sitemaps not read".to_string();
+        }
+        return if state.sitemap.files.is_empty() {
+            "Reading sitemaps".to_string()
+        } else {
+            format!(
+                "Reading sitemaps · {} files · {} listed",
+                summary.files, summary.listed
+            )
+        };
+    }
+    if !state.use_sitemaps {
+        return "Sitemaps are off".to_string();
+    }
+    if summary.files == 0 {
+        return match &state.sitemap.partial {
+            Some(partial) => format!("Sitemaps incomplete · {partial}"),
+            None => "No sitemaps found".to_string(),
+        };
+    }
+    let mut parts = vec![
+        format!(
+            "{} {}",
+            summary.files,
+            if summary.files == 1 { "file" } else { "files" }
+        ),
+        format!("{} listed", summary.listed),
+        format!("{} checked", summary.checked),
+    ];
+    for (count, label) in [
+        (summary.blocked, "blocked"),
+        (summary.skipped, "skipped"),
+        (summary.not_checked, "not checked"),
+        (summary.pending, "pending"),
+    ] {
+        if count > 0 {
+            parts.push(format!("{count} {label}"));
+        }
+    }
+    if summary.file_errors > 0 {
+        parts.push(format!("{} file errors", summary.file_errors));
+    }
+    if let Some(partial) = &state.sitemap.partial {
+        parts.push(partial.clone());
+    }
+    parts.join(" · ")
+}
+
+fn export_button(k: &Kit, state: &State, shown: usize) -> El {
+    Button::new("Export CSV")
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Regular)
+        .help(format!(
+            "Save the {shown} visible rows from {} in the current sort order",
+            active_title(state)
+        ))
+        .disabled(state.crawling || shown == 0)
+        .on_press_tx(export_csv)
         .build(k)
-        .key("issues");
-    let details = IconButton::new(&DETAILS_PANEL)
+        .key("export-csv")
+}
+
+fn details_toggle(k: &Kit, state: &State) -> El {
+    IconButton::new(&DETAILS_PANEL)
         .variant(IconButtonVariant::GhostMuted)
         .label(if state.details_open {
             "Hide page details"
@@ -1207,40 +1550,52 @@ fn section_header(k: &Kit, state: &State) -> El {
         .expanded(state.details_open)
         .on_press(|state: &mut State| state.details_open = !state.details_open)
         .build(k)
-        .key("details-toggle");
-    let export = Button::new("Export CSV")
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Regular)
-        .help(format!(
-            "Save the {} visible rows from {} in the current sort order",
-            shown,
-            tab_title(state.tab)
-        ))
-        .disabled(state.crawling || shown == 0)
-        .on_press_tx(export_csv)
+        .key("details-toggle")
+}
+
+fn issues_checkbox(k: &Kit, state: &State) -> El {
+    Checkbox::new(state.issues_only)
+        .label("Issues only")
+        .on_toggle(|state: &mut State| {
+            state.issues_only ^= true;
+            refresh_visible(state);
+        })
         .build(k)
-        .key("export-csv");
-    row()
-        .w_full()
-        .px(GUTTER)
-        .pt(12.0)
-        .pb(14.0)
-        .center_y()
-        .gap(16.0)
-        .child(
-            col()
-                .gap(3.0)
-                .child(micro(k, tab_title(state.tab)))
-                .child(text(summary).font(k.ty.text_small).color(k.c.text_muted)),
-        )
-        .child(el().grow(1.0))
-        .child(export)
-        .child(details)
-        .child(issues)
+        .key("issues")
 }
 
 fn export_csv(state: &mut State, tx: &mut Tx) {
-    if state.crawling || state.visible.is_empty() {
+    if state.crawling {
+        return;
+    }
+    if state.tab == Tab::Sitemaps {
+        let view = state.sitemap_view;
+        let headers = sitemap_export_headers(view);
+        let rows = match view {
+            SitemapView::Urls => state
+                .sitemap_visible
+                .iter()
+                .filter_map(|index| state.sitemap.urls.get(*index))
+                .map(sitemap_url_row)
+                .collect::<Vec<_>>(),
+            SitemapView::Files => state
+                .sitemap_file_visible
+                .iter()
+                .filter_map(|index| state.sitemap.files.get(*index))
+                .map(sitemap_file_row)
+                .collect::<Vec<_>>(),
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let (title, slug) = match view {
+            SitemapView::Urls => ("Sitemap URLs", "sitemap-urls"),
+            SitemapView::Files => ("Sitemap files", "sitemap-files"),
+        };
+        save_csv(state, tx, headers, rows, title, slug);
+        return;
+    }
+    if state.visible.is_empty() {
         return;
     }
 
@@ -1252,11 +1607,22 @@ fn export_csv(state: &mut State, tx: &mut Tx) {
         .filter_map(|index| state.pages.get(*index))
         .map(|page| export_row(tab, page, &state.audit))
         .collect::<Vec<_>>();
+    save_csv(state, tx, headers, rows, active_title(state), tab_slug(tab));
+}
+
+fn save_csv(
+    state: &mut State,
+    tx: &mut Tx,
+    headers: &'static [&'static str],
+    rows: Vec<Vec<String>>,
+    title: &'static str,
+    slug: &'static str,
+) {
     let csv = calmtoad::export::to_csv(headers, &rows);
     let row_count = rows.len();
     let options = FileDialogOptions {
-        title: format!("Export {} as CSV", tab_title(tab)),
-        file_name: Some(format!("calmtoad-{}.csv", tab_slug(tab))),
+        title: format!("Export {title} as CSV"),
+        file_name: Some(format!("calmtoad-{slug}.csv")),
         ..Default::default()
     }
     .filter("CSV files", &["csv"]);
@@ -1310,6 +1676,7 @@ fn tab_slug(tab: Tab) -> &'static str {
         Tab::Canonical => "canonicals",
         Tab::Images => "images",
         Tab::Links => "links",
+        Tab::Sitemaps => "sitemaps",
     }
 }
 
@@ -1323,7 +1690,52 @@ fn export_headers(tab: Tab) -> &'static [&'static str] {
         Tab::Canonical => &["ADDRESS", "CANONICAL", "ISSUE"],
         Tab::Images => &["ADDRESS", "IMAGES", "NO ALT", "ISSUE"],
         Tab::Links => &["ADDRESS", "INBOUND", "OUTBOUND", "ISSUE"],
+        Tab::Sitemaps => sitemap_export_headers(SitemapView::Urls),
     }
+}
+
+fn sitemap_export_headers(view: SitemapView) -> &'static [&'static str] {
+    match view {
+        SitemapView::Urls => &["ADDRESS", "STATE", "STATUS", "SOURCE", "ISSUE"],
+        SitemapView::Files => &["ADDRESS", "ORIGIN", "STATE", "STATUS", "URLS", "ISSUE"],
+    }
+}
+
+fn sitemap_url_row(entry: &SitemapUrl) -> Vec<String> {
+    vec![
+        entry.url.clone(),
+        entry.state.label().to_string(),
+        if entry.status == 0 {
+            "—".into()
+        } else {
+            entry.status.to_string()
+        },
+        entry.sources.join(" · "),
+        if entry.issue.is_empty() {
+            "OK".into()
+        } else {
+            entry.issue.clone()
+        },
+    ]
+}
+
+fn sitemap_file_row(file: &SitemapFile) -> Vec<String> {
+    vec![
+        file.url.clone(),
+        file.origin.label().to_string(),
+        file.state.label().to_string(),
+        if file.status == 0 {
+            "—".into()
+        } else {
+            file.status.to_string()
+        },
+        file.urls.to_string(),
+        if file.issue.is_empty() {
+            "OK".into()
+        } else {
+            file.issue.clone()
+        },
+    ]
 }
 
 fn export_row(tab: Tab, page: &Page, audit: &Audit) -> Vec<String> {
@@ -1408,13 +1820,22 @@ fn export_row(tab: Tab, page: &Page, audit: &Audit) -> Vec<String> {
             row.push(count(page.links.len()));
             row.push(issue());
         }
+        Tab::Sitemaps => {}
     }
     row
 }
 
 fn results(k: &Kit, state: &State) -> El {
     let frame = row().key("frame").w_full().grow(1.0).min_h(0.0);
-    if state.pages.is_empty() {
+    let has_rows = if state.tab == Tab::Sitemaps {
+        match state.sitemap_view {
+            SitemapView::Urls => !state.sitemap.urls.is_empty(),
+            SitemapView::Files => !state.sitemap.files.is_empty(),
+        }
+    } else {
+        !state.pages.is_empty()
+    };
+    if !has_rows {
         return frame.child(empty(k, state));
     }
     let frame = frame.child(table(k, state).grow(1.0).min_w(0.0).h_full());
@@ -1426,7 +1847,9 @@ fn results(k: &Kit, state: &State) -> El {
 }
 
 fn empty(k: &Kit, state: &State) -> El {
-    let (title, copy) = if state.crawling {
+    let (title, copy) = if state.tab == Tab::Sitemaps {
+        sitemap_empty(state)
+    } else if state.crawling {
         (
             "Fetching pages".to_string(),
             "Following links on this site, up to 40 pages and 3 levels deep.".to_string(),
@@ -1459,7 +1882,88 @@ fn empty(k: &Kit, state: &State) -> El {
         )
 }
 
+fn sitemap_empty(state: &State) -> (String, String) {
+    if !state.use_sitemaps {
+        return (
+            "Sitemaps are off".into(),
+            "Turn on Use sitemaps and crawl again to read this site’s sitemaps.".into(),
+        );
+    }
+    if state.crawling || state.sitemap_discovering {
+        return (
+            "Reading sitemaps".into(),
+            "Checking robots.txt and the sitemap files this site serves.".into(),
+        );
+    }
+    if !state.sitemap.discovery_done {
+        return (
+            "Sitemaps not read".into(),
+            "Sitemap discovery did not run for this crawl.".into(),
+        );
+    }
+    if state.sitemap.files.is_empty() {
+        if let Some(partial) = &state.sitemap.partial {
+            return (
+                "Sitemaps stopped".into(),
+                format!("Reading sitemaps did not finish: {partial}."),
+            );
+        }
+        return if state.pages.is_empty() && failed(state) {
+            ("Couldn’t crawl".into(), state.message.clone())
+        } else {
+            (
+                "No sitemaps found".into(),
+                "This site did not declare one, and /sitemap.xml and /sitemap_index.xml are missing."
+                    .into(),
+            )
+        };
+    }
+    let failed_files = state
+        .sitemap
+        .files
+        .iter()
+        .filter(|file| file.state == FileState::Error)
+        .count();
+    if failed_files > 0 {
+        return (
+            "No URLs listed".into(),
+            format!(
+                "{} sitemap {} failed. Switch to Files to see why.",
+                failed_files,
+                if failed_files == 1 { "file" } else { "files" }
+            ),
+        );
+    }
+    let skipped_files = state
+        .sitemap
+        .files
+        .iter()
+        .filter(|file| file.state == FileState::Skipped)
+        .count();
+    if skipped_files > 0 {
+        return (
+            "No URLs listed".into(),
+            format!(
+                "{} sitemap {} skipped. Switch to Files to see why.",
+                skipped_files,
+                if skipped_files == 1 {
+                    "file was"
+                } else {
+                    "files were"
+                }
+            ),
+        );
+    }
+    (
+        "No URLs listed".into(),
+        "The sitemap files were read but did not list any page URLs.".into(),
+    )
+}
+
 fn table(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Sitemaps {
+        return sitemap_table(k, state);
+    }
     let kit = k.clone();
     let tab = state.tab;
     let mut table = Table::new(
@@ -1660,6 +2164,7 @@ fn table(k: &Kit, state: &State) -> El {
                     .min(160.0)
                     .sortable(),
             ),
+        Tab::Sitemaps => table,
     };
     table
         .cell(move |state: &State, row, column| {
@@ -1669,6 +2174,205 @@ fn table(k: &Kit, state: &State) -> El {
             cell(&kit, state.tab, page, &state.audit, column)
         })
         .build(state, k)
+}
+
+fn sitemap_table(k: &Kit, state: &State) -> El {
+    let kit = k.clone();
+    match state.sitemap_view {
+        SitemapView::Urls => Table::new(
+            |state: &State| &state.table,
+            |state: &mut State| &mut state.table,
+            |state: &State| state.sitemap_visible.len(),
+            |state: &State, row| {
+                Cow::Owned(
+                    state
+                        .sitemap_visible
+                        .get(row)
+                        .and_then(|index| state.sitemap.urls.get(*index))
+                        .map(|entry| entry.url.clone())
+                        .unwrap_or_default(),
+                )
+            },
+        )
+        .name("Sitemap URLs")
+        .style(table_style(k))
+        .zebra(false)
+        .column(
+            TableColumn::new("url", "ADDRESS")
+                .flex(2.4)
+                .min(180.0)
+                .sortable(),
+        )
+        .column(TableColumn::new("state", "STATE").width(118.0).sortable())
+        .column(
+            TableColumn::new("status", "STATUS")
+                .width(90.0)
+                .align(Align::End)
+                .sortable(),
+        )
+        .column(
+            TableColumn::new("source", "SOURCE")
+                .flex(1.2)
+                .min(120.0)
+                .sortable(),
+        )
+        .column(
+            TableColumn::new("issue", "ISSUE")
+                .flex(1.8)
+                .min(160.0)
+                .sortable(),
+        )
+        .on_sort(|state: &mut State, column, dir, _| {
+            state.table.set_sort(column, dir);
+            sort_sitemap(state);
+        })
+        .on_select(|state: &mut State, _id, _tx| {
+            state.details_open = true;
+        })
+        .cell(move |state: &State, row, column| {
+            let Some(entry) = state
+                .sitemap_visible
+                .get(row)
+                .and_then(|index| state.sitemap.urls.get(*index))
+            else {
+                return Cell::text("");
+            };
+            cell_sitemap_url(&kit, entry, column)
+        })
+        .build(state, k),
+        SitemapView::Files => Table::new(
+            |state: &State| &state.table,
+            |state: &mut State| &mut state.table,
+            |state: &State| state.sitemap_file_visible.len(),
+            |state: &State, row| {
+                Cow::Owned(
+                    state
+                        .sitemap_file_visible
+                        .get(row)
+                        .and_then(|index| state.sitemap.files.get(*index))
+                        .map(|file| file.url.clone())
+                        .unwrap_or_default(),
+                )
+            },
+        )
+        .name("Sitemap files")
+        .style(table_style(k))
+        .zebra(false)
+        .column(
+            TableColumn::new("url", "ADDRESS")
+                .flex(2.4)
+                .min(180.0)
+                .sortable(),
+        )
+        .column(TableColumn::new("origin", "ORIGIN").width(100.0))
+        .column(TableColumn::new("state", "STATE").width(118.0).sortable())
+        .column(
+            TableColumn::new("status", "STATUS")
+                .width(90.0)
+                .align(Align::End)
+                .sortable(),
+        )
+        .column(
+            TableColumn::new("urls", "URLS")
+                .width(84.0)
+                .align(Align::End)
+                .sortable(),
+        )
+        .column(
+            TableColumn::new("issue", "ISSUE")
+                .flex(1.8)
+                .min(160.0)
+                .sortable(),
+        )
+        .on_sort(|state: &mut State, column, dir, _| {
+            state.table.set_sort(column, dir);
+            sort_sitemap(state);
+        })
+        .on_select(|state: &mut State, _id, _tx| {
+            state.details_open = true;
+        })
+        .cell(move |state: &State, row, column| {
+            let Some(file) = state
+                .sitemap_file_visible
+                .get(row)
+                .and_then(|index| state.sitemap.files.get(*index))
+            else {
+                return Cell::text("");
+            };
+            cell_sitemap_file(&kit, file, column)
+        })
+        .build(state, k),
+    }
+}
+
+fn cell_sitemap_url(k: &Kit, entry: &SitemapUrl, column: &str) -> Cell {
+    match column {
+        "url" => Cell::text(entry.url.clone()),
+        "state" => url_state_cell(k, entry.state),
+        "status" => {
+            if entry.status == 0 {
+                Cell::text("—").mono().muted()
+            } else {
+                status_cell(k, entry.status)
+            }
+        }
+        "source" => Cell::text(source_label(&entry.sources)).muted(),
+        "issue" => issue_cell(k, &entry.issue),
+        _ => Cell::text(""),
+    }
+}
+
+fn cell_sitemap_file(k: &Kit, file: &SitemapFile, column: &str) -> Cell {
+    match column {
+        "url" => Cell::text(file.url.clone()),
+        "origin" => Cell::text(file.origin.label()).muted(),
+        "state" => file_state_cell(k, file.state),
+        "status" => {
+            if file.status == 0 {
+                Cell::text("—").mono().muted()
+            } else {
+                status_cell(k, file.status)
+            }
+        }
+        "urls" => Cell::text(file.urls.to_string()).mono().muted(),
+        "issue" => issue_cell(k, &file.issue),
+        _ => Cell::text(""),
+    }
+}
+
+fn url_state_cell(k: &Kit, state: UrlState) -> Cell {
+    let color = match state {
+        UrlState::Checked => k.c.text_muted,
+        UrlState::Blocked => k.c.danger.fg,
+        UrlState::Pending | UrlState::Skipped | UrlState::NotChecked => k.c.warning.fg,
+    };
+    Cell::text(state.label()).color(color)
+}
+
+fn file_state_cell(k: &Kit, state: FileState) -> Cell {
+    let color = match state {
+        FileState::Ok => k.c.text_muted,
+        FileState::Error => k.c.danger.fg,
+        FileState::Absent | FileState::Skipped | FileState::Pending => k.c.warning.fg,
+    };
+    Cell::text(state.label()).color(color)
+}
+
+fn source_label(sources: &[String]) -> String {
+    match sources {
+        [] => "—".into(),
+        [one] => file_path(one),
+        many if many.len() == 2 => format!("2 files · {}", file_path(&many[0])),
+        many => format!("{} files", many.len()),
+    }
+}
+
+fn file_path(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    match rest.split_once('/') {
+        Some((_, path)) => format!("/{path}"),
+        None => rest.to_string(),
+    }
 }
 
 fn table_style(k: &Kit) -> TableStyle {
@@ -1779,6 +2483,9 @@ fn issue_cell(k: &Kit, issue: &str) -> Cell {
 }
 
 fn detail(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Sitemaps {
+        return sitemap_detail(k, state);
+    }
     let page = state
         .table
         .cursor()
@@ -1886,6 +2593,179 @@ fn detail(k: &Kit, state: &State) -> El {
         ))
 }
 
+fn sitemap_detail(k: &Kit, state: &State) -> El {
+    let panel = col()
+        .key("detail")
+        .w(330.0)
+        .h_full()
+        .gap(12.0)
+        .px(16.0)
+        .py(16.0)
+        .border_sides([0.0, 0.0, 0.0, 1.0], k.c.border_weak);
+    let cursor = state.table.cursor();
+
+    let url_entry = state
+        .sitemap
+        .urls
+        .iter()
+        .find(|entry| cursor == Some(entry.url.as_str()));
+    let file = state
+        .sitemap
+        .files
+        .iter()
+        .find(|file| cursor == Some(file.url.as_str()));
+
+    let (heading, selected, fields) = match state.sitemap_view {
+        SitemapView::Urls => match url_entry {
+            Some(entry) => ("Sitemap URL", entry.url.clone(), sitemap_url_fields(entry)),
+            None => match file {
+                Some(file) => ("Sitemap file", file.url.clone(), sitemap_file_fields(file)),
+                None => return sitemap_detail_empty(k, panel, "URL"),
+            },
+        },
+        SitemapView::Files => match file {
+            Some(file) => ("Sitemap file", file.url.clone(), sitemap_file_fields(file)),
+            None => match url_entry {
+                Some(entry) => ("Sitemap URL", entry.url.clone(), sitemap_url_fields(entry)),
+                None => return sitemap_detail_empty(k, panel, "file"),
+            },
+        },
+    };
+
+    let copy_url = selected.clone();
+    let open_url = selected.clone();
+    let actions = row()
+        .gap(6.0)
+        .child(
+            IconButton::new(&rune_kit::glyphs::COPY)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Copy URL")
+                .help("Copy URL")
+                .on_press_tx(move |_: &mut State, tx: &mut Tx| tx.copy(copy_url.clone()))
+                .build(k),
+        )
+        .child(
+            IconButton::new(&OPEN_LINK)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Open in browser")
+                .help("Open in browser")
+                .on_press_tx(move |_: &mut State, tx: &mut Tx| {
+                    let _ = tx.open_url(&open_url);
+                })
+                .build(k),
+        );
+    let mut body = panel
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .child(micro(k, heading))
+                .child(el().grow(1.0))
+                .child(actions),
+        )
+        .child(
+            text(selected)
+                .key("detail-url")
+                .font(k.ty.mono)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        )
+        .child(el().w_full().h(1.0).fill(k.c.border_weak));
+    for (label, value) in fields {
+        body = body.child(detail_field(k, label, &value));
+    }
+    body
+}
+
+fn sitemap_detail_empty(k: &Kit, panel: El, noun: &str) -> El {
+    panel.child(micro(k, "Sitemap details")).child(
+        text(format!("Select a sitemap {noun} to inspect it."))
+            .font(k.ty.body)
+            .color(k.c.text_muted)
+            .wrap()
+            .w_full(),
+    )
+}
+
+fn sitemap_url_fields(entry: &SitemapUrl) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("State", entry.state.label().to_string()),
+        (
+            "Status",
+            if entry.status == 0 {
+                "—".into()
+            } else {
+                entry.status.to_string()
+            },
+        ),
+        (
+            "Source",
+            if entry.sources.is_empty() {
+                "—".into()
+            } else {
+                entry.sources.join(" · ")
+            },
+        ),
+        (
+            "Finding",
+            if entry.issue.is_empty() {
+                "OK".into()
+            } else {
+                entry.issue.clone()
+            },
+        ),
+    ];
+    if !entry.redirect_to.is_empty() {
+        fields.push(("Redirect to", entry.redirect_to.clone()));
+    }
+    if !entry.canonical.is_empty() {
+        fields.push(("Canonical", entry.canonical.clone()));
+    }
+    if !entry.content_type.is_empty() {
+        fields.push(("Content type", mime(&entry.content_type)));
+    }
+    if !entry.error.is_empty() {
+        fields.push(("Error", entry.error.clone()));
+    }
+    fields
+}
+
+fn sitemap_file_fields(file: &SitemapFile) -> Vec<(&'static str, String)> {
+    vec![
+        ("Origin", file.origin.label().to_string()),
+        ("State", file.state.label().to_string()),
+        (
+            "HTTP status",
+            if file.status == 0 {
+                "—".into()
+            } else {
+                file.status.to_string()
+            },
+        ),
+        ("Document", sitemap_kind_label(file.kind).to_string()),
+        ("Depth", file.depth.to_string()),
+        ("Entries", file.entries.to_string()),
+        ("Page URLs", file.urls.to_string()),
+        (
+            "Issue",
+            if file.issue.is_empty() {
+                "OK".into()
+            } else {
+                file.issue.clone()
+            },
+        ),
+    ]
+}
+
+fn sitemap_kind_label(kind: SitemapKind) -> &'static str {
+    match kind {
+        SitemapKind::Unknown => "—",
+        SitemapKind::Urlset => "URL set",
+        SitemapKind::Index => "Index",
+    }
+}
+
 fn detail_field(k: &Kit, label: &str, value: &str) -> El {
     col()
         .w_full()
@@ -1949,11 +2829,20 @@ fn status_line(k: &Kit, state: &State) -> El {
         .center_y()
         .gap(9.0)
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
-        .child(dot(color))
         .child(
-            text(message)
-                .font(TextStyle::new(10.5, 400.0).mono().lh(15.0).tracking(0.2))
-                .color(k.c.text_muted),
+            if !state.crawling
+                && state.pages.is_empty()
+                && state.export_notice.is_none()
+                && state.message.starts_with("Ready")
+            {
+                row()
+            } else {
+                row().center_y().gap(9.0).child(dot(color)).child(
+                    text(message)
+                        .font(TextStyle::new(10.5, 400.0).mono().lh(15.0).tracking(0.2))
+                        .color(k.c.text_muted),
+                )
+            },
         )
         .child(el().grow(1.0))
         .child(
@@ -2038,6 +2927,17 @@ fn scene_links(state: &mut State) {
     load_sample(state);
     state.tab = Tab::Links;
 }
+fn scene_sitemaps(state: &mut State) {
+    load_sample(state);
+    state.tab = Tab::Sitemaps;
+    state.table.set_sort("url", SortDir::Ascending);
+    sort_pages(state);
+}
+fn scene_sitemap_files(state: &mut State) {
+    scene_sitemaps(state);
+    state.sitemap_view = SitemapView::Files;
+    sort_sitemap(state);
+}
 fn scene_title_issues(state: &mut State) {
     load_sample(state);
     state.tab = Tab::Titles;
@@ -2119,6 +3019,8 @@ fn main() {
             ("canonical", scene_canonical),
             ("images", scene_images),
             ("links", scene_links),
+            ("sitemaps", scene_sitemaps),
+            ("sitemap-files", scene_sitemap_files),
             ("title-issues", scene_title_issues),
             ("error", scene_error),
             ("crawling", scene_crawling),
@@ -2263,5 +3165,159 @@ mod tests {
         state.crawling = false;
         state.update = UpdateUi::Idle;
         assert!(!can_install(&state));
+    }
+
+    #[test]
+    fn sitemaps_tab_switches_views_filters_and_exports() {
+        let mut state = init();
+        load_sample(&mut state);
+        let mut rt = Runtime::new(
+            state,
+            view,
+            (1180.0, 740.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.016);
+
+        let (x, y) = rt.find("tab-sitemaps").expect("sitemaps tab");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.016);
+        assert_eq!(rt.state.tab, Tab::Sitemaps);
+        assert_eq!(rt.state.sitemap_view, SitemapView::Urls);
+        assert_eq!(rt.state.sitemap_visible.len(), rt.state.sitemap.urls.len());
+        assert!(rt.find("sitemap-files").is_some(), "file view toggle");
+
+        let (x, y) = rt.find("issues").expect("issues-only checkbox");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.016);
+        assert!(rt.state.issues_only);
+        assert!(!rt.state.sitemap_visible.is_empty());
+        assert!(
+            rt.state
+                .sitemap_visible
+                .iter()
+                .all(|index| rt.state.sitemap.urls[*index].needs_attention())
+        );
+
+        let (x, y) = rt.find("sitemap-files").expect("file view toggle");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.016);
+        assert_eq!(rt.state.sitemap_view, SitemapView::Files);
+        assert!(
+            rt.state
+                .sitemap_file_visible
+                .iter()
+                .all(|index| rt.state.sitemap.files[*index].needs_attention())
+        );
+
+        assert_eq!(
+            sitemap_export_headers(rt.state.sitemap_view),
+            &["ADDRESS", "ORIGIN", "STATE", "STATUS", "URLS", "ISSUE"]
+        );
+        let rows = rt
+            .state
+            .sitemap_file_visible
+            .iter()
+            .map(|index| sitemap_file_row(&rt.state.sitemap.files[*index]))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), rt.state.sitemap_file_visible.len());
+        assert!(rows.iter().all(|row| row.len() == 6));
+    }
+
+    #[test]
+    fn the_sample_sitemaps_show_mixed_truthful_outcomes() {
+        let mut state = init();
+        load_sample(&mut state);
+        let summary = state.sitemap.summary();
+        assert!(summary.files >= 5);
+        assert!(summary.listed >= 8);
+        assert!(summary.checked >= 4);
+        assert!(summary.blocked >= 1);
+        assert!(summary.skipped >= 1);
+        assert!(summary.not_checked >= 1);
+        assert!(summary.file_errors >= 2);
+        assert!(state.sitemap.partial.is_some());
+        assert!(state.sitemap.files.iter().any(|file| file.origin
+            == calmtoad::sitemap::SitemapOrigin::Guessed
+            && file.state == FileState::Absent));
+
+        state.tab = Tab::Sitemaps;
+        sort_pages(&mut state);
+        assert_eq!(state.sitemap_visible.len(), state.sitemap.urls.len());
+        state.issues_only = true;
+        refresh_visible(&mut state);
+        assert!(state.sitemap_visible.len() < state.sitemap.urls.len());
+    }
+
+    #[test]
+    fn file_errors_are_explained_when_no_sitemap_urls_were_read() {
+        let mut state = init();
+        state.sitemap.discovery_done = true;
+        state.sitemap.insert_file(SitemapFile {
+            url: "https://example.com/sitemap.xml".into(),
+            origin: calmtoad::sitemap::SitemapOrigin::Guessed,
+            state: FileState::Error,
+            status: 500,
+            issue: "HTTP 500".into(),
+            ..SitemapFile::default()
+        });
+        let (title, copy) = sitemap_empty(&state);
+        assert_eq!(title, "No URLs listed");
+        assert!(copy.contains("1 sitemap file failed"), "{copy}");
+        assert!(copy.contains("Switch to Files"), "{copy}");
+    }
+
+    #[test]
+    fn a_stopped_sitemap_read_is_not_reported_as_missing() {
+        let mut state = init();
+        state.sitemap.discovery_done = true;
+        state.sitemap.partial = Some("Stopped".into());
+        assert_eq!(sitemap_summary(&state), "Sitemaps incomplete · Stopped");
+        let (title, copy) = sitemap_empty(&state);
+        assert_eq!(title, "Sitemaps stopped");
+        assert!(copy.contains("Stopped"), "{copy}");
+    }
+
+    #[test]
+    fn an_unread_sitemap_report_does_not_claim_discovery_is_running() {
+        let mut state = init();
+        assert!(state.use_sitemaps);
+        assert!(!state.sitemap.discovery_done);
+        assert_eq!(sitemap_summary(&state), "Sitemaps not read");
+
+        state.crawling = true;
+        assert_eq!(sitemap_summary(&state), "Reading sitemaps");
+
+        state.crawling = false;
+        state.use_sitemaps = false;
+        state.sitemap.discovery_done = true;
+        assert_eq!(sitemap_summary(&state), "Sitemaps are off");
+    }
+
+    #[test]
+    fn the_use_sitemaps_checkbox_drives_the_next_crawl_option() {
+        let state = init();
+        assert!(state.use_sitemaps);
+        let mut rt = Runtime::new(
+            state,
+            view,
+            (1180.0, 740.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.016);
+        let (x, y) = rt.find("use-sitemaps").expect("use sitemaps checkbox");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.016);
+        assert!(!rt.state.use_sitemaps);
     }
 }

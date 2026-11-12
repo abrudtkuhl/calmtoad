@@ -46,7 +46,11 @@ Updates…** from the app menu at any time.
 
 To try it, open Calm Toad, enter `https://pmprompt.com/`, and press **Crawl**.
 
-Use **Export CSV** above the results to save the current tab. The file includes the columns and rows currently shown, so the active sort and **Issues only** filter are applied.
+Leave **Use sitemaps** on and Calm Toad also reads the site's sitemaps while it crawls. It uses the `Sitemap:` declarations in robots.txt; if there are none, it tries `/sitemap.xml` and then `/sitemap_index.xml`. A guessed file that is missing is not reported as a problem, but a declared sitemap that fails is. URLs from a sitemap join the crawl as entry points and share its page limit, so a large sitemap does not quietly crawl forever.
+
+The **Sitemaps** tab shows the URLs the sitemaps list and the files that were read. Switch between **URLs** and **Files** above the table. Each URL says whether it was checked, blocked by robots.txt, skipped, or left by the page limit, and checked URLs carry the same response, canonical, and noindex findings as the other tabs. **Issues only** narrows either view to rows that need attention.
+
+Use **Export CSV** above the results to save the active tab or Sitemaps view. The file includes the columns and rows currently shown, so the active sort and **Issues only** filter are applied.
 
 ## Building or improving Calm Toad
 

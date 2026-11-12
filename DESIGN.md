@@ -167,10 +167,10 @@ A two-ground system: carbon black or warm off-white, with a narrow neutral ladde
 
 The window is one column, top to bottom, with no outer container and no page margin beyond a 20px gutter.
 
-1. **Top bar** — 52px: eight tabs, then the crawl state at the far right. The tab row starts after the platform's titlebar inset so the macOS traffic lights never overlap a control; in full screen the inset is zero and the tabs return to the gutter. A hairline closes the bar.
+1. **Top bar** — 52px: nine tabs, then the crawl state at the far right. The tab row starts after the platform's titlebar inset so the macOS traffic lights never overlap a control; in full screen the inset is zero and the tabs return to the gutter. A hairline closes the bar.
 2. **Progress line** — 2px, only while crawling: a hairline track with an ink fill for pages found against the cap.
-3. **Command bar** — 14px vertical padding around a 40px strip: URL field, a vertical hairline, Pages, a vertical hairline, Depth, and the CRAWL/STOP action. The strip is one continuous outlined field group, not four separate inputs.
-4. **Section header** — 12px top and 14px bottom: the tab's name in mono, a plain-language summary, and Issues only at the right.
+3. **Command bar** — 14px vertical padding around a 40px strip: URL field, a vertical hairline, Pages, a vertical hairline, Depth, a vertical hairline, the Use sitemaps checkbox, and the CRAWL/STOP action. The strip is one continuous outlined field group, not five separate inputs.
+4. **Section header** — 12px top and 14px bottom: the tab's name in mono, a plain-language summary, and Issues only at the right. On Sitemaps, a URLs/Files view toggle joins the header before Export CSV; the summary states files read, URLs listed, checked, blocked, skipped, not checked, pending, file errors, and any partial reason.
 5. **Results** — grows to fill the window: a full-bleed table, then a four-column detail strip pinned under it.
 6. **Status footer** — 34px: one status dot, the crawl message in mono, and SAME HOST ONLY at the right.
 
@@ -220,7 +220,9 @@ Not used. The command bar is the only enclosed rectangle, and it is a control gr
 - **Placeholder:** faint ink at reading contrast, never lighter than necessary.
 
 ### Navigation
-Eight tabs in one row: Internal, Titles, Meta, H1, Response, Canonical, Images, Links. Each is a ghost button containing an uppercase mono label and a separate muted count with a 6px gap. The active tab alone gets a 2px-radius neutral fill. Tabs never wrap; at narrow widths the row compresses rather than becoming a menu. Tab labels are authored in normal case and uppercased visually.
+Nine tabs in one row: Internal, Titles, Meta, H1, Response, Canonical, Images, Links, and Sitemaps. Each is a ghost button containing an uppercase mono label and a separate muted count with a 6px gap. The active tab alone gets a 2px-radius neutral fill. Tabs never wrap; at narrow widths the row compresses rather than becoming a menu. Tab labels are authored in normal case and uppercased visually.
+
+Sitemaps carries URLs and Files views in the section header rather than as extra tabs. The URLs view lists each address, its state, status, source file, and issue; the Files view lists each document, its origin (robots.txt, index, or guessed), state, status, URL count, and issue. Both use the same table geometry, sorting, selection, Issues only filter, and CSV export as the other tabs.
 
 ### Table
 - **Header:** 32px tall, 10px mono uppercase labels in muted ink, sortable with an arrow on the active column.
@@ -229,7 +231,7 @@ Eight tabs in one row: Internal, Titles, Meta, H1, Response, Canonical, Images, 
 - **Issues:** empty issues read "OK" in muted ink; hard failures are red; soft issues are amber. A non-auditable page shows a faint em dash, because a 404 has no title to judge.
 
 ### Page Details Drawer
-The drawer sits to the right of the results table and starts hidden. Selecting a result opens it; the page-details icon in the results header toggles it. The header shows the selected URL with copy and open-in-browser icon buttons. Title, Meta description, H1, Canonical, status, word count, content type, and image alt counts appear below. Missing values are an em dash in faint ink.
+The drawer sits to the right of the results table and starts hidden. Selecting a result opens it; the page-details icon in the results header toggles it. The header shows the selected URL with copy and open-in-browser icon buttons. Title, Meta description, H1, Canonical, status, word count, content type, and image alt counts appear below. Missing values are an em dash in faint ink. On Sitemaps, the drawer shows the selected URL's state, status, source files, finding, redirect, canonical, and content type, or the selected file's origin, state, status, document kind, depth, entry counts, and issue.
 
 ### Status Footer
 34px tall, hairline above. A 5px dot carries the state; the message is 10.5px mono at muted ink; SAME HOST ONLY is the right-hand 10px mono label. The footer is the only place the crawl result is stated in full, including when the page cap stopped it.

@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use scraper::{ElementRef, Html, Node};
 use url::Url;
 
+use crate::sitemap;
+
 /// A small, dependency-free hasher for the crawl's hot maps.
 ///
 /// The default SipHash is a poor fit for short URL and title keys that never leave the
@@ -67,6 +69,8 @@ impl std::hash::Hasher for FastHasher {
 
 type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 type FastSet<T> = HashSet<T, BuildHasherDefault<FastHasher>>;
+type SitemapFetcher<'a> =
+    dyn Fn(&str, &dyn Fn() -> bool, &dyn Fn(u64)) -> sitemap::FetchedBytes + Sync + 'a;
 
 fn fast_set<T: std::hash::Hash + Eq>(capacity: usize) -> FastSet<T> {
     let mut set = FastSet::default();
@@ -167,10 +171,38 @@ pub struct Outcome {
     pub message: String,
 }
 
+/// Per-crawl choices. Links-only callers keep the old behavior with the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrawlOptions {
+    /// Read the seed origin's sitemaps and schedule the URLs they list.
+    pub sitemaps: bool,
+}
+
+/// Everything the window streams while a crawl runs.
+#[derive(Clone, Debug)]
+pub enum CrawlEvent {
+    Page(Page),
+    SitemapFile(sitemap::SitemapFile),
+    SitemapUrl(sitemap::SitemapUrl),
+    SitemapPartial(String),
+    /// Discovery finished; page fetches for the listed URLs may still be running.
+    SitemapDone,
+}
+
+/// The whole result of one crawl, including the sitemap report.
+#[derive(Clone, Debug, Default)]
+pub struct CrawlResult {
+    pub pages: Vec<Page>,
+    pub message: String,
+    pub sitemap: sitemap::SitemapReport,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Robots {
     rules: Vec<RobotsRule>,
     crawl_delay_ms: u64,
+    /// `Sitemap:` declarations, which are independent of user-agent groups.
+    sitemaps: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +224,7 @@ impl Robots {
         let mut groups: Vec<Group> = Vec::new();
         let mut current: Option<Group> = None;
         let mut after_agent = false;
+        let mut sitemaps: Vec<String> = Vec::new();
         for raw in body.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
             let Some((field, value)) = line.split_once(':') else {
@@ -199,6 +232,12 @@ impl Robots {
             };
             let field = field.trim();
             let value = value.trim();
+            if field.eq_ignore_ascii_case("sitemap") {
+                if !value.is_empty() && !sitemaps.iter().any(|seen| seen == value) {
+                    sitemaps.push(value.to_string());
+                }
+                continue;
+            }
             if field.eq_ignore_ascii_case("user-agent") {
                 if !after_agent {
                     if let Some(group) = current.take() {
@@ -276,6 +315,7 @@ impl Robots {
         Self {
             rules,
             crawl_delay_ms,
+            sitemaps,
         }
     }
 
@@ -782,14 +822,20 @@ pub fn normalize_seed(raw: &str) -> Result<String, String> {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn crawl_site(seed: &str) -> Outcome {
-    crawl_engine(
+    let result = crawl_engine(
         seed,
         Limits::default(),
         |url| fetch(agent(), url),
+        |url, before, backoff| fetch_sitemap(agent(), url, None, before, backoff),
         true,
+        CrawlOptions::default(),
         None,
-        |_| {},
-    )
+        &mut |_| {},
+    );
+    Outcome {
+        pages: result.pages,
+        message: result.message,
+    }
 }
 
 /// Crawl while reporting every page as soon as it lands. `cancel` is polled between pages so
@@ -800,13 +846,44 @@ pub fn crawl_site_stream(
     cancel: &AtomicBool,
     on_page: impl FnMut(&Page),
 ) -> Outcome {
+    let mut on_page = on_page;
+    let result = crawl_engine(
+        seed,
+        limits,
+        |url| fetch(agent(), url),
+        |url, before, backoff| fetch_sitemap(agent(), url, Some(cancel), before, backoff),
+        true,
+        CrawlOptions::default(),
+        Some(cancel),
+        &mut |event| {
+            if let CrawlEvent::Page(page) = event {
+                on_page(&page);
+            }
+        },
+    );
+    Outcome {
+        pages: result.pages,
+        message: result.message,
+    }
+}
+
+/// Crawl with sitemap discovery and stream every update as it happens.
+pub fn crawl_site_with(
+    seed: &str,
+    limits: Limits,
+    options: CrawlOptions,
+    cancel: &AtomicBool,
+    mut on_event: impl FnMut(CrawlEvent),
+) -> CrawlResult {
     crawl_engine(
         seed,
         limits,
         |url| fetch(agent(), url),
+        |url, before, backoff| fetch_sitemap(agent(), url, Some(cancel), before, backoff),
         true,
+        options,
         Some(cancel),
-        on_page,
+        &mut on_event,
     )
 }
 
@@ -832,6 +909,16 @@ struct FetchedPage {
     depth: u8,
     fetched: Fetched,
     parsed: Option<Parsed>,
+}
+
+/// Page results and sitemap discovery share one channel so the loop can end only after
+/// both kinds of work report completion.
+enum EngineEvent {
+    Page(FetchedPage),
+    SitemapFile(sitemap::SitemapFile),
+    SitemapUrl(sitemap::SitemapUrl),
+    SitemapPartial(String),
+    SitemapDone,
 }
 
 /// Shared work queue for the fetch workers.
@@ -864,35 +951,123 @@ impl Drop for Finish<'_> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn crawl_with(seed: &str, limits: Limits, fetch: impl Fn(&str) -> Fetched + Sync) -> Outcome {
-    crawl_engine(seed, limits, fetch, false, None, |_| {})
+/// Claim the next origin-wide request start, shared by page workers and sitemap reads.
+fn reserve_request_slot(shared: &Mutex<Work>, wake: &Condvar, cancel: &AtomicBool) -> bool {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut work = shared.lock().unwrap_or_else(|error| error.into_inner());
+        if work.done {
+            return false;
+        }
+        let now = Instant::now();
+        let mut available = now;
+        if let Some(until) = work.pause_until {
+            if until > available {
+                available = until;
+            } else {
+                work.pause_until = None;
+            }
+        }
+        if let Some(next_start) = work.next_start
+            && next_start > available
+        {
+            available = next_start;
+        }
+        if available > now {
+            let wait = (available - now).min(Duration::from_millis(50));
+            let (guard, _) = wake
+                .wait_timeout(work, wait)
+                .unwrap_or_else(|error| error.into_inner());
+            drop(guard);
+            continue;
+        }
+        if let Some(delay) = work.crawl_delay {
+            // Crawl-delay is untrusted robots.txt input. Keep a pathological value from
+            // overflowing Instant while still applying a long, visible wait.
+            work.next_start = Some(
+                now.checked_add(delay)
+                    .unwrap_or_else(|| now + Duration::from_secs(86_400)),
+            );
+        }
+        return true;
+    }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn crawl_with(seed: &str, limits: Limits, fetch: impl Fn(&str) -> Fetched + Sync) -> Outcome {
+    let result = crawl_engine(
+        seed,
+        limits,
+        fetch,
+        |_, _before, _backoff| sitemap::FetchedBytes::default(),
+        false,
+        CrawlOptions::default(),
+        None,
+        &mut |_| {},
+    );
+    Outcome {
+        pages: result.pages,
+        message: result.message,
+    }
+}
+
+/// Deterministic seam for sitemap integration tests. Production callers use
+/// [`crawl_site_with`], which fetches both kinds of body over the shared agent.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn crawl_with_options(
+    seed: &str,
+    limits: Limits,
+    options: CrawlOptions,
+    fetch: impl Fn(&str) -> Fetched + Sync,
+    fetch_sitemap: impl Fn(&str) -> sitemap::FetchedBytes + Sync,
+    cancel: Option<&AtomicBool>,
+    mut on_event: impl FnMut(CrawlEvent),
+) -> CrawlResult {
+    crawl_engine(
+        seed,
+        limits,
+        fetch,
+        |url, _before, _backoff| fetch_sitemap(url),
+        false,
+        options,
+        cancel,
+        &mut on_event,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn crawl_engine(
     seed: &str,
     limits: Limits,
     fetch: impl Fn(&str) -> Fetched + Sync,
+    fetch_sitemap: impl Fn(&str, &dyn Fn() -> bool, &dyn Fn(u64)) -> sitemap::FetchedBytes + Sync,
     cache_robots: bool,
+    options: CrawlOptions,
     cancel: Option<&AtomicBool>,
-    mut on_page: impl FnMut(&Page),
-) -> Outcome {
-    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    on_event: &mut dyn FnMut(CrawlEvent),
+) -> CrawlResult {
+    let no_cancel = AtomicBool::new(false);
+    let cancel = cancel.unwrap_or(&no_cancel);
+    let cancelled = || cancel.load(Ordering::Relaxed);
     let seed = match normalize_seed(seed) {
         Ok(seed) => seed,
         Err(message) => {
-            return Outcome {
+            return CrawlResult {
                 message,
-                ..Outcome::default()
+                ..CrawlResult::default()
             };
         }
     };
     let host = host_of(&seed).unwrap_or_default();
 
     if limits.max_pages == 0 {
-        return Outcome {
+        return CrawlResult {
             pages: Vec::new(),
             message: format!("0 pages on {host}"),
+            ..CrawlResult::default()
         };
     }
 
@@ -904,9 +1079,10 @@ fn crawl_engine(
     if let (Some(seed_url), Some(robots)) = (seed_url.as_ref(), robots.as_ref())
         && !robots.allows(&request_path(seed_url))
     {
-        return Outcome {
+        return CrawlResult {
             pages: Vec::new(),
             message: format!("Blocked by robots.txt · {host}"),
+            ..CrawlResult::default()
         };
     }
 
@@ -914,7 +1090,8 @@ fn crawl_engine(
     // allocating the full crawl budget before discovering any URLs is wasteful.
     let mut seen: FastSet<String> = fast_set(limits.max_pages.min(256).saturating_mul(4).max(16));
     seen.insert(seed.clone());
-    let mut pages = Vec::with_capacity(limits.max_pages.min(256));
+    let mut pages: Vec<Page> = Vec::with_capacity(limits.max_pages.min(256));
+    let mut page_index: FastMap<String, usize> = fast_map(limits.max_pages.min(256));
     let mut committed = 1_usize;
     let mut over_cap = false;
     let mut stopped_early = false;
@@ -926,9 +1103,12 @@ fn crawl_engine(
     });
     let wake = Condvar::new();
     let workers = limits.max_pages.min(PARALLEL_REQUESTS);
+    let mut discovery_done = !options.sitemaps;
+    let mut sitemap_report = sitemap::SitemapReport::default();
+    sitemap_report.discovery_done = discovery_done;
 
     std::thread::scope(|scope| {
-        let (tx, rx) = mpsc::channel::<FetchedPage>();
+        let (tx, rx) = mpsc::channel::<EngineEvent>();
 
         for _ in 0..workers {
             let tx = tx.clone();
@@ -943,36 +1123,15 @@ fn crawl_engine(
                             if work.done {
                                 return;
                             }
-                            let now = Instant::now();
-                            // A 429/503 pauses the whole pool, not just one worker.
-                            if let Some(until) = work.pause_until {
-                                if until > now {
-                                    let (guard, _) = wake.wait_timeout(work, until - now).unwrap();
-                                    work = guard;
-                                    continue;
-                                }
-                                work.pause_until = None;
-                            }
-                            // Crawl-delay is a minimum spacing between request starts.
-                            if let Some(next_start) = work.next_start {
-                                let now = Instant::now();
-                                if next_start > now {
-                                    let (guard, _) =
-                                        wake.wait_timeout(work, next_start - now).unwrap();
-                                    work = guard;
-                                    continue;
-                                }
-                            }
                             if let Some(job) = work.queue.pop_front() {
-                                if let Some(delay) = work.crawl_delay {
-                                    let start = work.next_start.map_or(now, |next| next.max(now));
-                                    work.next_start = Some(start + delay);
-                                }
                                 break job;
                             }
                             work = wake.wait(work).unwrap();
                         }
                     };
+                    if !reserve_request_slot(shared, wake, cancel) {
+                        return;
+                    }
                     // A panicking fetcher must still produce a result, or the crawl loop would
                     // wait forever for this URL.
                     let (fetched, parsed) = catch_unwind(AssertUnwindSafe(|| {
@@ -1011,18 +1170,81 @@ fn crawl_engine(
                         wake.notify_all();
                     }
                     if tx
-                        .send(FetchedPage {
+                        .send(EngineEvent::Page(FetchedPage {
                             url,
                             depth,
                             fetched,
                             parsed,
-                        })
+                        }))
                         .is_err()
                     {
                         return;
                     }
                 }
             });
+        }
+
+        if let (true, Some(seed_url)) = (options.sitemaps, seed_url.clone()) {
+            let tx_sitemap = tx.clone();
+            let shared_work = &shared;
+            let wake_condvar = &wake;
+            let fetch_sitemap: &SitemapFetcher<'_> = &fetch_sitemap;
+            let declared = robots
+                .as_ref()
+                .map(|robots| robots.sitemaps.clone())
+                .unwrap_or_default();
+            let robots_for_discovery = robots.clone();
+            scope.spawn(move || {
+                let allows = |url: &Url| {
+                    robots_for_discovery
+                        .as_ref()
+                        .is_none_or(|robots| robots.allows(&request_path(url)))
+                };
+                let before_request = || reserve_request_slot(shared_work, wake_condvar, cancel);
+                let note_backoff = |milliseconds: u64| {
+                    let mut work = shared_work
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let until = Instant::now() + Duration::from_millis(milliseconds);
+                    if work.pause_until.is_none_or(|current| until > current) {
+                        work.pause_until = Some(until);
+                    }
+                    drop(work);
+                    wake_condvar.notify_all();
+                };
+                let fetch_with_delay =
+                    |url: &str| fetch_sitemap(url, &before_request, &note_backoff);
+                let mut send = |event: sitemap::DiscoveryEvent| {
+                    let event = match event {
+                        sitemap::DiscoveryEvent::File(file) => EngineEvent::SitemapFile(file),
+                        sitemap::DiscoveryEvent::Url(url) => EngineEvent::SitemapUrl(url),
+                        sitemap::DiscoveryEvent::Partial(reason) => {
+                            EngineEvent::SitemapPartial(reason)
+                        }
+                        sitemap::DiscoveryEvent::Done => EngineEvent::SitemapDone,
+                    };
+                    let _ = tx_sitemap.send(event);
+                };
+                let panic_tx = tx_sitemap.clone();
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    sitemap::discover(
+                        &seed_url,
+                        declared,
+                        &allows,
+                        &fetch_with_delay,
+                        cancel,
+                        &mut send,
+                    )
+                }));
+                if result.is_err() {
+                    let _ = panic_tx.send(EngineEvent::SitemapPartial(
+                        "Sitemap discovery failed".into(),
+                    ));
+                    let _ = panic_tx.send(EngineEvent::SitemapDone);
+                }
+            });
+        } else if options.sitemaps {
+            discovery_done = true;
         }
         drop(tx);
         let _finish = Finish {
@@ -1031,18 +1253,75 @@ fn crawl_engine(
         };
 
         let mut pending = 1_usize;
-        while pending > 0 {
+        while pending > 0 || !discovery_done {
             if cancelled() {
                 stopped_early = true;
+                // The discovery thread's final events are not drained after this break, so
+                // record the interruption here instead of letting the report read as complete.
+                if !discovery_done {
+                    sitemap_report.note_partial("Stopped");
+                }
                 break;
             }
-            let result = match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(result) => result,
+            let event = match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => event,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    discovery_done = true;
+                    break;
+                }
             };
-            pending -= 1;
-
+            let result = match event {
+                EngineEvent::Page(result) => {
+                    pending -= 1;
+                    result
+                }
+                EngineEvent::SitemapFile(file) => {
+                    sitemap_report.insert_file(file.clone());
+                    on_event(CrawlEvent::SitemapFile(file));
+                    continue;
+                }
+                EngineEvent::SitemapUrl(entry) => {
+                    let is_new = sitemap_report.insert_url(entry.clone());
+                    if is_new && entry.state == sitemap::UrlState::Pending {
+                        if seen.insert(entry.url.clone()) {
+                            if committed >= limits.max_pages {
+                                over_cap = true;
+                                if let Some(url) = sitemap_report.url_mut(&entry.url) {
+                                    url.state = sitemap::UrlState::NotChecked;
+                                    url.issue = "Page limit".into();
+                                }
+                            } else {
+                                committed += 1;
+                                {
+                                    let mut work = shared.lock().unwrap();
+                                    work.queue.push_back((entry.url.clone(), 0));
+                                }
+                                pending += 1;
+                                wake.notify_all();
+                            }
+                        } else if let Some(index) = page_index.get(&entry.url).copied()
+                            && let Some(page) = pages.get(index)
+                        {
+                            sitemap_report.observe_page(page);
+                        }
+                    }
+                    let current = sitemap_report.url(&entry.url).cloned().unwrap_or(entry);
+                    on_event(CrawlEvent::SitemapUrl(current));
+                    continue;
+                }
+                EngineEvent::SitemapPartial(reason) => {
+                    sitemap_report.note_partial(reason.clone());
+                    on_event(CrawlEvent::SitemapPartial(reason));
+                    continue;
+                }
+                EngineEvent::SitemapDone => {
+                    discovery_done = true;
+                    sitemap_report.discovery_done = true;
+                    on_event(CrawlEvent::SitemapDone);
+                    continue;
+                }
+            };
             let FetchedPage {
                 url,
                 depth,
@@ -1169,7 +1448,9 @@ fn crawl_engine(
                 images_missing_alt,
                 links: page_links,
             };
-            on_page(&page);
+            sitemap_report.observe_page(&page);
+            on_event(CrawlEvent::Page(page.clone()));
+            page_index.insert(page.url.clone(), pages.len());
             pages.push(page);
 
             if !new_jobs.is_empty() {
@@ -1203,7 +1484,19 @@ fn crawl_engine(
             .unwrap_or("no response");
         message = format!("Crawl failed · {why}");
     }
-    Outcome { pages, message }
+    sitemap_report.discovery_done = true;
+    if stopped_early {
+        sitemap_report.mark_not_checked("Stopped");
+    } else if over_cap {
+        sitemap_report.mark_not_checked("Page limit");
+    } else {
+        sitemap_report.mark_not_checked("Not fetched");
+    }
+    CrawlResult {
+        pages,
+        message,
+        sitemap: sitemap_report,
+    }
 }
 
 struct Parsed {
@@ -1464,6 +1757,139 @@ fn wants_body(content_type: &str) -> bool {
         || contains_ascii_ci(content_type, "text/plain")
 }
 
+/// Fetch a sitemap document as bounded bytes. Kept separate from the HTML path because
+/// `Fetched` stores text and the crawler must not parse `.gz` bytes as a page.
+fn fetch_sitemap(
+    agent: &ureq::Agent,
+    url: &str,
+    cancel: Option<&AtomicBool>,
+    before_attempt: &dyn Fn() -> bool,
+    note_backoff: &dyn Fn(u64),
+) -> sitemap::FetchedBytes {
+    let mut attempt = 1;
+    loop {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) || !before_attempt() {
+            return sitemap::FetchedBytes {
+                error: "Stopped".into(),
+                ..sitemap::FetchedBytes::default()
+            };
+        }
+        let fetched = fetch_sitemap_once(agent, url, cancel);
+        if matches!(fetched.status, 429 | 503) {
+            note_backoff(fetched.retry_after_ms.max(PAUSE_PUSHBACK_MS));
+        }
+        if attempt >= FETCH_ATTEMPTS || !matches!(fetched.status, 0 | 429 | 500 | 502 | 503 | 504) {
+            return fetched;
+        }
+        let wait = fetched.retry_after_ms.max(retry_wait(attempt));
+        if !sleep_cancellable(Duration::from_millis(wait), cancel) {
+            return sitemap::FetchedBytes {
+                error: "Stopped".into(),
+                ..sitemap::FetchedBytes::default()
+            };
+        }
+        attempt += 1;
+    }
+}
+
+fn fetch_sitemap_once(
+    agent: &ureq::Agent,
+    url: &str,
+    cancel: Option<&AtomicBool>,
+) -> sitemap::FetchedBytes {
+    match agent
+        .get(url)
+        .set(
+            "Accept",
+            "application/xml,text/xml,application/gzip,*/*;q=0.1",
+        )
+        .call()
+    {
+        Ok(response) => from_sitemap_response(response.status(), response, cancel),
+        Err(ureq::Error::Status(code, response)) => from_sitemap_response(code, response, cancel),
+        Err(error) => sitemap::FetchedBytes {
+            error: error.to_string(),
+            ..sitemap::FetchedBytes::default()
+        },
+    }
+}
+
+fn from_sitemap_response(
+    status: u16,
+    response: ureq::Response,
+    cancel: Option<&AtomicBool>,
+) -> sitemap::FetchedBytes {
+    let content_type = response.header("content-type").unwrap_or("").to_string();
+    let location = response.header("location").unwrap_or("").to_string();
+    let retry_after_ms = response
+        .header("retry-after")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1_000).min(10_000))
+        .unwrap_or(0);
+    let mut body = Vec::new();
+    let mut error = String::new();
+    if (200..300).contains(&status) {
+        let capacity = response
+            .header("content-length")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(sitemap::MAX_COMPRESSED_BYTES as usize);
+        body.reserve(capacity);
+        let mut reader = response.into_reader();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                body.clear();
+                error = "Stopped".into();
+                break;
+            }
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    body.extend_from_slice(&chunk[..read]);
+                    if body.len() as u64 > sitemap::MAX_COMPRESSED_BYTES {
+                        body.clear();
+                        error = "Sitemap download is larger than 16 MiB".into();
+                        break;
+                    }
+                }
+                Err(cause) => {
+                    error = cause.to_string();
+                    break;
+                }
+            }
+        }
+    } else {
+        // Keep the connection reusable even when the document is a redirect or an error.
+        let _ = std::io::copy(
+            &mut response.into_reader().take(DRAIN_BYTES),
+            &mut std::io::sink(),
+        );
+    }
+    sitemap::FetchedBytes {
+        status,
+        content_type,
+        location,
+        body,
+        error,
+        retry_after_ms,
+    }
+}
+
+fn sleep_cancellable(duration: Duration, cancel: Option<&AtomicBool>) -> bool {
+    let started = Instant::now();
+    loop {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return false;
+        }
+        let remaining = duration.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return true;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
 fn resolve(page: &Url, href: &str) -> Option<Url> {
     let href = href.trim();
     if href.is_empty()
@@ -1483,7 +1909,7 @@ fn resolve(page: &Url, href: &str) -> Option<Url> {
     Some(url)
 }
 
-fn url_key(mut url: Url) -> String {
+pub(crate) fn url_key(mut url: Url) -> String {
     url.set_fragment(None);
     if url.path() != "/" && url.path().ends_with('/') {
         let path = url.path().trim_end_matches('/').to_string();
@@ -2022,6 +2448,15 @@ mod tests {
             "the specific group replaces the wildcard"
         );
         assert!(!specific.allows("/admin"));
+
+        let sitemap_between_agents = Robots::parse(
+            "User-agent: Calmtoad\nSitemap: https://example.com/map.xml\nUser-agent: *\nDisallow: /\n",
+            USER_AGENT,
+        );
+        assert!(
+            !sitemap_between_agents.allows("/"),
+            "a Sitemap directive does not split adjacent user-agent groups"
+        );
     }
 
     #[test]
@@ -2099,9 +2534,15 @@ mod tests {
                 max_depth: 2,
             },
             fetch,
+            |_, _before, _backoff| sitemap::FetchedBytes::default(),
             false,
+            CrawlOptions::default(),
             Some(&no_stop),
-            |page| all.borrow_mut().push(page.url.clone()),
+            &mut |event| {
+                if let CrawlEvent::Page(page) = event {
+                    all.borrow_mut().push(page.url.clone());
+                }
+            },
         );
         assert_eq!(outcome.pages.len(), 6);
         let streamed = all.into_inner();
@@ -2123,11 +2564,15 @@ mod tests {
                 max_depth: 2,
             },
             fetch,
+            |_, _before, _backoff| sitemap::FetchedBytes::default(),
             false,
+            CrawlOptions::default(),
             Some(&stop_after_one),
-            |page| {
-                seen.borrow_mut().push(page.url.clone());
-                stop_after_one.store(true, Ordering::Relaxed);
+            &mut |event| {
+                if let CrawlEvent::Page(page) = event {
+                    seen.borrow_mut().push(page.url.clone());
+                    stop_after_one.store(true, Ordering::Relaxed);
+                }
             },
         );
         assert_eq!(seen.borrow().len(), 1);
@@ -2158,6 +2603,26 @@ mod tests {
         assert_eq!(retry_wait(1), 250);
         assert_eq!(retry_wait(2), 750);
         assert_eq!(retry_wait(9), 2_000, "backoff is capped");
+        let cancelled = AtomicBool::new(true);
+        assert!(!sleep_cancellable(
+            Duration::from_secs(30),
+            Some(&cancelled)
+        ));
+    }
+
+    #[test]
+    fn request_slots_share_the_robots_crawl_delay() {
+        let delay = Duration::from_millis(25);
+        let shared = Mutex::new(Work {
+            crawl_delay: Some(delay),
+            ..Work::default()
+        });
+        let wake = Condvar::new();
+        let cancel = AtomicBool::new(false);
+        assert!(reserve_request_slot(&shared, &wake, &cancel));
+        let started = Instant::now();
+        assert!(reserve_request_slot(&shared, &wake, &cancel));
+        assert!(started.elapsed() >= delay);
     }
 
     #[test]
@@ -2332,5 +2797,429 @@ mod tests {
             .unwrap();
         assert_eq!(home.title, "Local home title that is long enough");
         assert_eq!(home.h1s, vec!["Home".to_string()]);
+    }
+
+    fn sitemap_xml(locs: &[&str]) -> sitemap::FetchedBytes {
+        let urls: String = locs
+            .iter()
+            .map(|loc| format!("<url><loc>{loc}</loc></url>"))
+            .collect();
+        sitemap::FetchedBytes {
+            status: 200,
+            content_type: "application/xml".into(),
+            body: format!(
+                r#"<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>"#
+            )
+            .into_bytes(),
+            ..sitemap::FetchedBytes::default()
+        }
+    }
+
+    fn missing_sitemap(status: u16) -> sitemap::FetchedBytes {
+        sitemap::FetchedBytes {
+            status,
+            ..sitemap::FetchedBytes::default()
+        }
+    }
+
+    #[test]
+    fn sitemap_urls_are_fetched_once_alongside_the_link_crawl() {
+        let fetch = |url: &str| match url {
+            "https://example.com/robots.txt" => Fetched {
+                status: 404,
+                ..Fetched::default()
+            },
+            "https://example.com/" => {
+                html_fetch(200, "<title>Home title that is long enough</title>")
+            }
+            "https://example.com/only" => {
+                html_fetch(200, "<title>Sitemap only title that is long enough</title>")
+            }
+            "https://example.com/shared" => {
+                html_fetch(200, "<title>Shared title that is long enough</title>")
+            }
+            other => Fetched {
+                error: format!("unexpected {other}"),
+                ..Fetched::default()
+            },
+        };
+        let fetch_sitemap = |url: &str| match url {
+            "https://example.com/sitemap.xml" => sitemap_xml(&[
+                "https://example.com/only",
+                "https://example.com/shared",
+                "https://example.com/",
+            ]),
+            _ => missing_sitemap(404),
+        };
+        let result = crawl_with_options(
+            "https://example.com/",
+            Limits {
+                max_pages: 10,
+                max_depth: 0,
+            },
+            CrawlOptions { sitemaps: true },
+            fetch,
+            fetch_sitemap,
+            None,
+            |_| {},
+        );
+        let urls: Vec<_> = result.pages.iter().map(|page| page.url.as_str()).collect();
+        for expected in [
+            "https://example.com/",
+            "https://example.com/only",
+            "https://example.com/shared",
+        ] {
+            assert_eq!(
+                urls.iter().filter(|url| **url == expected).count(),
+                1,
+                "{urls:?}"
+            );
+        }
+        assert_eq!(result.sitemap.urls.len(), 3);
+        assert!(
+            result
+                .sitemap
+                .urls
+                .iter()
+                .all(|entry| entry.state == sitemap::UrlState::Checked),
+            "{:?}",
+            result.sitemap.urls
+        );
+        assert_eq!(result.sitemap.summary().checked, 3);
+        assert!(
+            result
+                .sitemap
+                .files
+                .iter()
+                .any(|file| file.origin == sitemap::SitemapOrigin::Guessed)
+        );
+    }
+
+    #[test]
+    fn robots_declarations_supply_sitemaps_and_block_listed_urls() {
+        let requested = Mutex::new(Vec::new());
+        let fetch = |url: &str| {
+            requested.lock().unwrap().push(url.to_string());
+            match url {
+                "https://example.com/robots.txt" => Fetched {
+                    status: 200,
+                    content_type: "text/plain".into(),
+                    body:
+                        "User-agent: *\nDisallow: /private\nSitemap: https://example.com/map.xml\n"
+                            .into(),
+                    ..Fetched::default()
+                },
+                "https://example.com/" => {
+                    html_fetch(200, "<title>Home title that is long enough</title>")
+                }
+                "https://example.com/a" => {
+                    html_fetch(200, "<title>Allowed title that is long enough</title>")
+                }
+                other => Fetched {
+                    error: format!("unexpected {other}"),
+                    ..Fetched::default()
+                },
+            }
+        };
+        let fetch_sitemap = |url: &str| match url {
+            "https://example.com/map.xml" => {
+                sitemap_xml(&["https://example.com/a", "https://example.com/private/b"])
+            }
+            other => panic!("unexpected sitemap fetch: {other}"),
+        };
+        let result = crawl_with_options(
+            "https://example.com/",
+            Limits {
+                max_pages: 10,
+                max_depth: 0,
+            },
+            CrawlOptions { sitemaps: true },
+            fetch,
+            fetch_sitemap,
+            None,
+            |_| {},
+        );
+        assert_eq!(result.sitemap.files.len(), 1);
+        assert_eq!(
+            result.sitemap.files[0].origin,
+            sitemap::SitemapOrigin::Robots
+        );
+        let blocked = result.sitemap.url("https://example.com/private/b").unwrap();
+        assert_eq!(blocked.state, sitemap::UrlState::Blocked);
+        let requested = requested.into_inner().unwrap();
+        assert!(
+            !requested
+                .iter()
+                .any(|url| url.contains("/private/b") || url.ends_with("/sitemap.xml")),
+            "{requested:?}"
+        );
+    }
+
+    #[test]
+    fn the_combined_page_cap_marks_unvisited_sitemap_urls_not_checked() {
+        let fetch = |url: &str| match url {
+            "https://example.com/robots.txt" => Fetched {
+                status: 404,
+                ..Fetched::default()
+            },
+            _ => html_fetch(200, "<title>A page title that is comfortably long</title>"),
+        };
+        let fetch_sitemap = |url: &str| match url {
+            "https://example.com/sitemap.xml" => sitemap_xml(&[
+                "https://example.com/a",
+                "https://example.com/b",
+                "https://example.com/c",
+            ]),
+            _ => missing_sitemap(404),
+        };
+        let result = crawl_with_options(
+            "https://example.com/",
+            Limits {
+                max_pages: 2,
+                max_depth: 0,
+            },
+            CrawlOptions { sitemaps: true },
+            fetch,
+            fetch_sitemap,
+            None,
+            |_| {},
+        );
+        assert_eq!(result.pages.len(), 2);
+        assert!(result.message.contains("stopped"), "{}", result.message);
+        let summary = result.sitemap.summary();
+        assert!(summary.not_checked >= 1, "{summary:?}");
+        assert!(
+            result
+                .sitemap
+                .urls
+                .iter()
+                .filter(|entry| entry.state == sitemap::UrlState::NotChecked)
+                .all(|entry| entry.issue == "Page limit"),
+            "{:?}",
+            result.sitemap.urls
+        );
+    }
+
+    #[test]
+    fn gzip_sitemaps_are_read_and_malformed_ones_do_not_stop_the_crawl() {
+        let fetch = |url: &str| match url {
+            "https://example.com/robots.txt" => Fetched {
+                status: 404,
+                ..Fetched::default()
+            },
+            _ => html_fetch(200, "<title>A page title that is comfortably long</title>"),
+        };
+        let gzipped = {
+            use std::io::Write;
+            let body = br#"<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.com/zipped</loc></url></urlset>"#;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(body).unwrap();
+            encoder.finish().unwrap()
+        };
+        let fetch_sitemap = move |url: &str| match url {
+            "https://example.com/sitemap.xml" => sitemap::FetchedBytes {
+                status: 200,
+                content_type: "application/gzip".into(),
+                body: gzipped.clone(),
+                ..sitemap::FetchedBytes::default()
+            },
+            _ => missing_sitemap(404),
+        };
+        let result = crawl_with_options(
+            "https://example.com/",
+            Limits {
+                max_pages: 10,
+                max_depth: 0,
+            },
+            CrawlOptions { sitemaps: true },
+            fetch,
+            fetch_sitemap,
+            None,
+            |_| {},
+        );
+        assert_eq!(result.sitemap.files[0].state, sitemap::FileState::Ok);
+        assert!(
+            result
+                .pages
+                .iter()
+                .any(|page| page.url == "https://example.com/zipped")
+        );
+
+        let broken = |url: &str| match url {
+            "https://example.com/sitemap.xml" => sitemap::FetchedBytes {
+                status: 200,
+                body: b"<urlset><url>".to_vec(),
+                ..sitemap::FetchedBytes::default()
+            },
+            _ => missing_sitemap(404),
+        };
+        let result = crawl_with_options(
+            "https://example.com/",
+            Limits {
+                max_pages: 10,
+                max_depth: 0,
+            },
+            CrawlOptions { sitemaps: true },
+            fetch,
+            broken,
+            None,
+            |_| {},
+        );
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(result.sitemap.files[0].state, sitemap::FileState::Error);
+        assert!(result.sitemap.partial.is_some());
+    }
+
+    #[test]
+    fn sitemap_entries_carry_the_pages_own_findings() {
+        let fetch = |url: &str| match url {
+            "https://example.com/robots.txt" => Fetched {
+                status: 404,
+                ..Fetched::default()
+            },
+            "https://example.com/" => {
+                html_fetch(200, "<title>Home title that is long enough</title>")
+            }
+            "https://example.com/gone" => Fetched {
+                status: 404,
+                content_type: "text/html".into(),
+                body: "missing".into(),
+                ..Fetched::default()
+            },
+            "https://example.com/noindex" => html_fetch(
+                200,
+                r#"<title>Noindex page title that is long enough</title><meta name="robots" content="noindex">"#,
+            ),
+            "https://example.com/canonical" => html_fetch(
+                200,
+                r#"<title>Canonical page title that is long enough</title><link rel="canonical" href="/elsewhere">"#,
+            ),
+            other => Fetched {
+                error: format!("unexpected {other}"),
+                ..Fetched::default()
+            },
+        };
+        let fetch_sitemap = |url: &str| match url {
+            "https://example.com/sitemap.xml" => sitemap_xml(&[
+                "https://example.com/gone",
+                "https://example.com/noindex",
+                "https://example.com/canonical",
+            ]),
+            _ => missing_sitemap(404),
+        };
+        let result = crawl_with_options(
+            "https://example.com/",
+            Limits {
+                max_pages: 10,
+                max_depth: 0,
+            },
+            CrawlOptions { sitemaps: true },
+            fetch,
+            fetch_sitemap,
+            None,
+            |_| {},
+        );
+        let entry = |url: &str| result.sitemap.url(url).unwrap();
+        assert_eq!(entry("https://example.com/gone").status, 404);
+        assert!(entry("https://example.com/gone").issue.contains("404"));
+        assert!(
+            entry("https://example.com/noindex")
+                .issue
+                .contains("Noindex")
+        );
+        assert!(
+            entry("https://example.com/canonical")
+                .issue
+                .contains("Canonical points to https://example.com/elsewhere")
+        );
+    }
+
+    #[test]
+    fn zero_page_limit_skips_all_work_even_with_sitemaps() {
+        let fetch = |_: &str| panic!("page fetch with a zero budget");
+        let fetch_sitemap = |_: &str| panic!("sitemap fetch with a zero budget");
+        let cancel = AtomicBool::new(false);
+        let result = crawl_with_options(
+            "https://example.com/",
+            Limits {
+                max_pages: 0,
+                max_depth: 2,
+            },
+            CrawlOptions { sitemaps: true },
+            fetch,
+            fetch_sitemap,
+            Some(&cancel),
+            |_| {},
+        );
+        assert!(result.pages.is_empty());
+        assert!(result.sitemap.files.is_empty());
+        assert!(result.message.contains("0 pages"));
+    }
+
+    #[test]
+    fn stopping_before_discovery_finishes_marks_the_sitemap_report_partial() {
+        let cancel = AtomicBool::new(true);
+        let fetch = |url: &str| match url {
+            "https://example.com/robots.txt" => Fetched {
+                status: 404,
+                ..Fetched::default()
+            },
+            _ => panic!("page fetch after cancellation"),
+        };
+        let fetch_sitemap = |_: &str| panic!("sitemap fetch after cancellation");
+        let result = crawl_with_options(
+            "https://example.com/",
+            Limits {
+                max_pages: 4,
+                max_depth: 0,
+            },
+            CrawlOptions { sitemaps: true },
+            fetch,
+            fetch_sitemap,
+            Some(&cancel),
+            |_| {},
+        );
+        assert!(result.message.starts_with("Stopped"));
+        assert!(result.sitemap.discovery_done);
+        assert_eq!(result.sitemap.partial.as_deref(), Some("Stopped"));
+        assert!(result.sitemap.files.is_empty());
+    }
+
+    #[test]
+    fn turning_sitemaps_off_keeps_the_crawl_links_only() {
+        let requested = Mutex::new(Vec::new());
+        let fetch = |url: &str| {
+            requested.lock().unwrap().push(url.to_string());
+            match url {
+                "https://example.com/robots.txt" => Fetched {
+                    status: 404,
+                    ..Fetched::default()
+                },
+                _ => html_fetch(200, "<title>A page title that is comfortably long</title>"),
+            }
+        };
+        let fetch_sitemap = |_: &str| panic!("sitemap fetch while disabled");
+        let result = crawl_with_options(
+            "https://example.com/",
+            Limits {
+                max_pages: 4,
+                max_depth: 0,
+            },
+            CrawlOptions::default(),
+            fetch,
+            fetch_sitemap,
+            None,
+            |_| {},
+        );
+        assert_eq!(result.pages.len(), 1);
+        assert!(result.sitemap.files.is_empty());
+        assert!(result.sitemap.urls.is_empty());
+        assert!(result.sitemap.discovery_done);
+        let requested = requested.into_inner().unwrap();
+        assert!(
+            !requested.iter().any(|url| url.ends_with("/sitemap.xml")),
+            "{requested:?}"
+        );
     }
 }

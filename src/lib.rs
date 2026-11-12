@@ -3,4 +3,5 @@
 
 pub mod crawl;
 pub mod export;
+pub mod sitemap;
 pub mod update;
