@@ -23,6 +23,9 @@ use quick_xml::reader::NsReader;
 use url::Url;
 
 use crate::crawl::{Page, url_key};
+use crate::indexability::{
+    self, Assessment, EvidenceSource, PageEvidence, ReadState, RobotsDirective,
+};
 
 /// Maximum uncompressed XML accepted for one sitemap document (50 MiB).
 pub const MAX_DOC_BYTES: u64 = 52_428_800;
@@ -178,12 +181,16 @@ pub struct SitemapUrl {
     pub canonical: String,
     pub content_type: String,
     pub error: String,
+    /// The same assessment the Internal tab and its drawer read, for checked URLs.
+    ///
+    /// Boxed so streaming this enum does not make every event carry the full assessment.
+    pub assessment: Box<Assessment>,
 }
 
 impl SitemapUrl {
     pub fn needs_attention(&self) -> bool {
         match self.state {
-            UrlState::Checked => !self.issue.is_empty(),
+            UrlState::Checked => self.assessment.needs_attention(),
             UrlState::Blocked | UrlState::Skipped | UrlState::NotChecked => true,
             UrlState::Pending => false,
         }
@@ -265,7 +272,8 @@ impl SitemapReport {
         entry.canonical = page.canonical.clone();
         entry.content_type = page.content_type.clone();
         entry.error = page.error.clone();
-        entry.issue = page_findings(page);
+        *entry.assessment = page.indexability.clone();
+        entry.issue = entry.assessment.reason_text();
     }
 
     /// Mark every URL the crawl never reached. `reason` is a fact, not a failure claim.
@@ -333,47 +341,6 @@ pub struct SitemapSummary {
     pub file_issues: usize,
     /// Listed URLs with a finding, blocked/skipped state, or an unfinished visit.
     pub issue_urls: usize,
-}
-
-/// Observed findings for a fetched page. Non-HTML responses are never called missing
-/// titles or canonicals; they are reported as their own response fact.
-fn page_findings(page: &Page) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    match page.status {
-        0 => parts.push(if page.error.is_empty() {
-            "Fetch failed".to_string()
-        } else {
-            page.error.clone()
-        }),
-        200..=299 => {}
-        300..=399 => parts.push(if page.redirect_to.is_empty() {
-            "Redirect".to_string()
-        } else {
-            format!("Redirect to {}", page.redirect_to)
-        }),
-        400..=499 => parts.push(format!("{} Client error", page.status)),
-        500..=599 => parts.push(format!("{} Server error", page.status)),
-        status => parts.push(status.to_string()),
-    }
-    if (200..=299).contains(&page.status) && !contains_ascii_ci(&page.content_type, "html") {
-        parts.push("Not HTML".to_string());
-    }
-    if page.noindex {
-        parts.push("Noindex".to_string());
-    }
-    if !page.canonical.is_empty() && page.canonical != page.url {
-        parts.push(format!("Canonical points to {}", page.canonical));
-    }
-    parts.join(" · ")
-}
-
-fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
-    let needle = needle.as_bytes();
-    haystack.len() >= needle.len()
-        && haystack
-            .as_bytes()
-            .windows(needle.len())
-            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 /// The seed's scheme, host and effective port. Sitemap documents and listed page URLs
@@ -1237,6 +1204,40 @@ pub fn sample_report() -> SitemapReport {
     ] {
         report.insert_file(file);
     }
+    let assessed = |url: &str,
+                    status: u16,
+                    content_type: &str,
+                    redirect_to: &str,
+                    noindex: bool,
+                    canonical: Option<&str>| {
+        let mut evidence = PageEvidence {
+            // Only a successful HTML response has a body this crawl reads.
+            read: if status == 200 && content_type.to_ascii_lowercase().contains("html") {
+                ReadState::Complete
+            } else {
+                ReadState::NotRead
+            },
+            ..PageEvidence::default()
+        };
+        if noindex {
+            evidence.directives.push(RobotsDirective {
+                source: EvidenceSource::Meta,
+                agent: None,
+                raw: "noindex".into(),
+                noindex: true,
+                nofollow: false,
+                truncated: false,
+            });
+        }
+        if let Some(canonical) = canonical
+            && let Ok(base) = Url::parse(url)
+        {
+            evidence
+                .canonicals
+                .push(indexability::canonical_declaration(Some(canonical), &base));
+        }
+        indexability::assess(url, status, content_type, redirect_to, "", evidence)
+    };
     for entry in [
         SitemapUrl {
             url: "https://example.com/".into(),
@@ -1246,6 +1247,15 @@ pub fn sample_report() -> SitemapReport {
             ],
             state: UrlState::Checked,
             status: 200,
+            content_type: "text/html; charset=utf-8".into(),
+            assessment: Box::new(assessed(
+                "https://example.com/",
+                200,
+                "text/html",
+                "",
+                false,
+                None,
+            )),
             ..SitemapUrl::default()
         },
         SitemapUrl {
@@ -1256,6 +1266,14 @@ pub fn sample_report() -> SitemapReport {
             canonical: "https://example.com/guide".into(),
             content_type: "text/html; charset=utf-8".into(),
             issue: "Canonical points to https://example.com/guide".into(),
+            assessment: Box::new(assessed(
+                "https://example.com/guide/",
+                200,
+                "text/html",
+                "",
+                false,
+                Some("https://example.com/guide"),
+            )),
             ..SitemapUrl::default()
         },
         SitemapUrl {
@@ -1265,6 +1283,14 @@ pub fn sample_report() -> SitemapReport {
             status: 404,
             content_type: "text/html; charset=utf-8".into(),
             issue: "404 Client error".into(),
+            assessment: Box::new(assessed(
+                "https://example.com/pricing",
+                404,
+                "text/html",
+                "",
+                false,
+                None,
+            )),
             ..SitemapUrl::default()
         },
         SitemapUrl {
@@ -1273,7 +1299,16 @@ pub fn sample_report() -> SitemapReport {
             state: UrlState::Checked,
             status: 301,
             redirect_to: "https://example.com/new-page".into(),
+            content_type: "text/html".into(),
             issue: "Redirect to https://example.com/new-page".into(),
+            assessment: Box::new(assessed(
+                "https://example.com/old-page",
+                301,
+                "text/html",
+                "https://example.com/new-page",
+                false,
+                None,
+            )),
             ..SitemapUrl::default()
         },
         SitemapUrl {
@@ -1283,6 +1318,14 @@ pub fn sample_report() -> SitemapReport {
             status: 200,
             content_type: "text/html; charset=utf-8".into(),
             issue: "Noindex".into(),
+            assessment: Box::new(assessed(
+                "https://example.com/draft",
+                200,
+                "text/html",
+                "",
+                true,
+                None,
+            )),
             ..SitemapUrl::default()
         },
         SitemapUrl {
@@ -1292,6 +1335,14 @@ pub fn sample_report() -> SitemapReport {
             status: 200,
             content_type: "application/pdf".into(),
             issue: "Not HTML".into(),
+            assessment: Box::new(assessed(
+                "https://example.com/report.pdf",
+                200,
+                "application/pdf",
+                "",
+                false,
+                None,
+            )),
             ..SitemapUrl::default()
         },
         SitemapUrl {
@@ -1317,6 +1368,11 @@ pub fn sample_report() -> SitemapReport {
         },
     ] {
         report.insert_url(entry);
+    }
+    for entry in &mut report.urls {
+        if entry.state == UrlState::Checked {
+            entry.issue = entry.assessment.reason_text();
+        }
     }
     report
 }

@@ -12,15 +12,16 @@ use std::time::{Duration, Instant};
 use calmtoad::crawl;
 use calmtoad::crawl::{
     Audit, Counts, DEFAULT_MAX_PAGES, Limits, MAX_DEPTH, Page, auditable, canonical_issue,
-    counts_with, h1_issue, image_issue, index_issue, links_issue, meta_issue, redirect_issue,
-    response_issue, title_issue,
+    counts_with, h1_issue, image_issue, links_issue, meta_issue, redirect_issue, response_issue,
+    title_issue,
 };
+use calmtoad::indexability::{Label, Severity};
 use calmtoad::sitemap::{FileState, SitemapFile, SitemapKind, SitemapReport, SitemapUrl, UrlState};
 use calmtoad::update;
 use rune::tooling::AppSpec;
 use rune::{
-    Align, Color, Cx, El, FileDialogOptions, Icon, MenuItem, TextCase, TextEdit, TextStyle, Tx,
-    Waker, col, el, icon, row, text,
+    Align, Color, Cx, El, FileDialogOptions, Icon, MenuItem, ScrollSpec, TextCase, TextEdit,
+    TextStyle, Tx, Waker, col, el, icon, row, text,
 };
 use rune_kit::{
     Button, ButtonVariant, Cell, Checkbox, ControlSize, IconButton, IconButtonVariant, Kit,
@@ -600,7 +601,16 @@ fn refresh_visible(state: &mut State) {
     let visible = pages
         .iter()
         .enumerate()
-        .filter(|(_, page)| !issues_only || !issue_for(tab, page, audit).is_empty())
+        .filter(|(_, page)| {
+            !issues_only
+                || if tab == Tab::Internal {
+                    // The Internal filter keys on severity, not on whether explanatory
+                    // context exists. A successful non-HTML page stays out of Issues only.
+                    page.indexability.needs_attention()
+                } else {
+                    !issue_for(tab, page, audit).is_empty()
+                }
+        })
         .map(|(index, _)| index)
         .collect();
     state.visible = visible;
@@ -721,6 +731,22 @@ fn load_sample(state: &mut State) {
     refresh_sitemap_visible(state);
 }
 
+fn load_indexability_sample(state: &mut State) {
+    state.url.replace_text("https://example.com/");
+    state.crawling = false;
+    state.issues_only = false;
+    state.tab = Tab::Internal;
+    state.sitemap_view = SitemapView::Urls;
+    state.sitemap_discovering = false;
+    state.sitemap = calmtoad::sitemap::sample_report();
+    let pages = crawl::indexability_sample_pages();
+    let message = format!("{} pages on example.com", pages.len());
+    set_pages(state, pages, message);
+    state.table.set_sort("indexability", SortDir::Ascending);
+    sort_pages(state);
+    refresh_sitemap_visible(state);
+}
+
 fn sort_pages(state: &mut State) {
     if state.tab == Tab::Sitemaps {
         sort_sitemap(state);
@@ -740,11 +766,27 @@ fn sort_pages(state: &mut State) {
     refresh_visible(state);
 }
 
+/// Hard blockers first, then advisories, then unknowns, then clean pages.
+fn label_rank(label: Label) -> u8 {
+    match label {
+        Label::FetchFailed => 0,
+        Label::HttpError => 1,
+        Label::Noindex => 2,
+        Label::Redirect => 3,
+        Label::ReviewCanonical => 4,
+        Label::CanonicalElsewhere => 5,
+        Label::NotAssessed => 6,
+        Label::NoBlockFound => 7,
+    }
+}
+
 fn compare(a: &Page, b: &Page, tab: Tab, column: &str, audit: &Audit) -> std::cmp::Ordering {
     match (tab, column) {
         (_, "url") => a.url.cmp(&b.url),
         (Tab::Internal | Tab::Response, "status") => a.status.cmp(&b.status),
-        (Tab::Internal, "indexable") => index_issue(a).cmp(index_issue(b)),
+        (Tab::Internal, "indexability") => label_rank(a.indexability.label)
+            .cmp(&label_rank(b.indexability.label))
+            .then_with(|| a.indexability.label.text().cmp(b.indexability.label.text())),
         (Tab::Internal, "words") => a.words.cmp(&b.words),
         (Tab::Titles, "title") => a.title.cmp(&b.title),
         (Tab::Titles, "len") => a.title.chars().count().cmp(&b.title.chars().count()),
@@ -789,7 +831,7 @@ fn visible_len(state: &State) -> usize {
 
 fn issue_for(tab: Tab, page: &Page, audit: &Audit) -> String {
     match tab {
-        Tab::Internal => index_issue(page).to_string(),
+        Tab::Internal => page.indexability.reason_text(),
         Tab::Titles => title_issue(page, audit),
         Tab::Meta => meta_issue(page, audit),
         Tab::H1 => h1_issue(page, audit),
@@ -1682,7 +1724,14 @@ fn tab_slug(tab: Tab) -> &'static str {
 
 fn export_headers(tab: Tab) -> &'static [&'static str] {
     match tab {
-        Tab::Internal => &["ADDRESS", "STATUS", "INDEXABLE", "WORDS"],
+        Tab::Internal => &[
+            "ADDRESS",
+            "STATUS",
+            "INDEXABILITY",
+            "WORDS",
+            "REASONS",
+            "EVIDENCE",
+        ],
         Tab::Titles => &["ADDRESS", "TITLE", "LENGTH", "ISSUE"],
         Tab::Meta => &["ADDRESS", "META DESCRIPTION", "LENGTH", "ISSUE"],
         Tab::H1 => &["ADDRESS", "H1", "COUNT", "ISSUE"],
@@ -1766,13 +1815,15 @@ fn export_row(tab: Tab, page: &Page, audit: &Audit) -> Vec<String> {
             } else {
                 page.status.to_string()
             });
-            let index = index_issue(page);
-            row.push(if index.is_empty() {
-                "Yes".into()
-            } else {
-                index.into()
-            });
+            row.push(page.indexability.label.text().to_string());
             row.push(page.words.to_string());
+            let reasons = page.indexability.all_reasons_text();
+            row.push(if reasons.is_empty() {
+                "—".into()
+            } else {
+                reasons
+            });
+            row.push(page.indexability.evidence_text());
         }
         Tab::Titles => {
             row.push(dash(&page.title));
@@ -2005,8 +2056,8 @@ fn table(k: &Kit, state: &State) -> El {
                     .sortable(),
             )
             .column(
-                TableColumn::new("indexable", "INDEXABLE")
-                    .width(150.0)
+                TableColumn::new("indexability", "INDEXABILITY")
+                    .width(168.0)
                     .sortable(),
             )
             .column(
@@ -2317,7 +2368,18 @@ fn cell_sitemap_url(k: &Kit, entry: &SitemapUrl, column: &str) -> Cell {
             }
         }
         "source" => Cell::text(source_label(&entry.sources)).muted(),
-        "issue" => issue_cell(k, &entry.issue),
+        "issue" => {
+            if entry.state == UrlState::Checked
+                && !entry.issue.is_empty()
+                && !entry.assessment.needs_attention()
+            {
+                // Informational context, such as a successful non-HTML response. It stays
+                // readable but muted because it is not an issue.
+                Cell::text(entry.issue.clone()).muted()
+            } else {
+                issue_cell(k, &entry.issue)
+            }
+        }
         _ => Cell::text(""),
     }
 }
@@ -2396,14 +2458,8 @@ fn cell(k: &Kit, tab: Tab, page: &Page, audit: &Audit, column: &str) -> Cell {
     match (tab, column) {
         (_, "url") => Cell::text(page.url.clone()),
         (_, "status") => status_cell(k, page.status),
-        (Tab::Internal, "indexable") => {
-            let issue = index_issue(page);
-            if issue.is_empty() {
-                Cell::text("Yes").muted()
-            } else {
-                Cell::text(issue).color(k.c.danger.fg)
-            }
-        }
+        (Tab::Internal, "indexability") => Cell::text(page.indexability.label.text())
+            .color(label_color(k, page.indexability.label)),
         (Tab::Internal, "words") => Cell::text(page.words.to_string()).mono().muted(),
         (Tab::Titles, "title") => Cell::text(dash(&page.title)),
         (Tab::Titles, "len") => len_cell(
@@ -2431,6 +2487,8 @@ fn cell(k: &Kit, tab: Tab, page: &Page, audit: &Audit, column: &str) -> Cell {
             ) && !auditable(page)
             {
                 Cell::text("—").muted()
+            } else if tab == Tab::Canonical {
+                canonical_issue_cell(k, &canonical_issue(page))
             } else {
                 issue_cell(k, &issue_for(tab, page, audit))
             }
@@ -2462,6 +2520,25 @@ fn status_cell(k: &Kit, status: u16) -> Cell {
         )
     } else {
         Cell::text(label).mono().muted()
+    }
+}
+
+fn label_color(k: &Kit, label: Label) -> Color {
+    match label {
+        Label::FetchFailed | Label::HttpError | Label::Noindex => k.c.danger.fg,
+        Label::Redirect | Label::ReviewCanonical | Label::CanonicalElsewhere => k.c.warning.fg,
+        Label::NotAssessed => k.c.text_muted,
+        Label::NoBlockFound => k.c.success.fg,
+    }
+}
+
+fn canonical_issue_cell(k: &Kit, issue: &str) -> Cell {
+    if issue.is_empty() {
+        Cell::text("OK").muted()
+    } else {
+        // Missing, repeated, malformed and elsewhere canonicals are all preferences or
+        // absences, not proof that a URL cannot be indexed.
+        Cell::text(issue).color(k.c.warning.fg)
     }
 }
 
@@ -2536,24 +2613,11 @@ fn detail(k: &Kit, state: &State) -> El {
                 })
                 .build(k),
         );
-    panel
-        .child(
-            row()
-                .w_full()
-                .center_y()
-                .child(micro(k, "Selected page"))
-                .child(el().grow(1.0))
-                .child(actions),
-        )
-        .child(
-            text(page.url.clone())
-                .key("detail-url")
-                .font(k.ty.mono)
-                .color(k.c.text_muted)
-                .wrap()
-                .w_full(),
-        )
-        .child(el().w_full().h(1.0).fill(k.c.border_weak))
+    let fields = col()
+        .w_full()
+        .min_w(0.0)
+        .gap(12.0)
+        .child(micro(k, "Page fields"))
         .child(detail_field(k, "Title", &dash(&page.title)))
         .child(detail_field(
             k,
@@ -2590,7 +2654,200 @@ fn detail(k: &Kit, state: &State) -> El {
             k,
             "Images · missing alt",
             &format!("{} · {}", page.images, page.images_missing_alt),
-        ))
+        ));
+    let body = col()
+        .key("detail-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(12.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(assessment_detail(k, page, &state.pages))
+        .child(el().w_full().h(1.0).fill(k.c.border_weak))
+        .child(fields);
+    panel
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .child(micro(k, "Selected page"))
+                .child(el().grow(1.0))
+                .child(actions),
+        )
+        .child(
+            text(page.url.clone())
+                .key("detail-url")
+                .font(k.ty.mono)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        )
+        .child(el().w_full().h(1.0).fill(k.c.border_weak))
+        .child(body)
+}
+
+fn severity_color(k: &Kit, severity: Severity) -> Color {
+    match severity {
+        Severity::Issue => k.c.danger.fg,
+        Severity::Advisory => k.c.warning.fg,
+        Severity::Info => k.c.text_muted,
+    }
+}
+
+fn muted_note(k: &Kit, value: impl Into<String>) -> El {
+    text(value.into())
+        .font(k.ty.small)
+        .color(k.c.text_muted)
+        .wrap()
+        .w_full()
+}
+
+fn assessment_detail(k: &Kit, page: &Page, pages: &[Page]) -> El {
+    let assessment = &page.indexability;
+    let mut block = col()
+        .w_full()
+        .min_w(0.0)
+        .gap(8.0)
+        .child(micro(k, "Indexability"))
+        .child(
+            text(assessment.label.text().to_string())
+                .font(k.ty.body)
+                .color(label_color(k, assessment.label))
+                .wrap()
+                .w_full(),
+        )
+        .child(muted_note(
+            k,
+            "Observed in this crawl. This is not a claim that Google has indexed the URL or chosen its canonical.",
+        ));
+
+    let mut findings = col().w_full().min_w(0.0).gap(6.0);
+    if assessment.findings.is_empty() {
+        findings = findings.child(muted_note(k, "No supporting findings recorded."));
+    } else {
+        for finding in &assessment.findings {
+            let mut item = col().w_full().min_w(0.0).gap(2.0).child(
+                text(format!("{} · {}", finding.severity.label(), finding.text))
+                    .font(k.ty.small)
+                    .color(severity_color(k, finding.severity))
+                    .wrap()
+                    .w_full(),
+            );
+            if !finding.guidance.is_empty() {
+                item = item.child(muted_note(k, finding.guidance.clone()));
+            }
+            findings = findings.child(item);
+        }
+    }
+    block = block.child(findings);
+
+    let mut canonical = col()
+        .w_full()
+        .min_w(0.0)
+        .gap(4.0)
+        .child(micro(k, "Canonical declarations"));
+    if assessment.evidence.canonicals.is_empty() {
+        canonical = canonical.child(muted_note(k, "Not observed"));
+    } else {
+        for declaration in &assessment.evidence.canonicals {
+            let line = match declaration.state {
+                calmtoad::indexability::CanonicalState::Valid => format!(
+                    "{} → {}",
+                    declaration.raw,
+                    declaration.resolved.as_deref().unwrap_or("")
+                ),
+                calmtoad::indexability::CanonicalState::Empty => "Empty href".to_string(),
+                calmtoad::indexability::CanonicalState::Invalid => {
+                    format!("Invalid href: {}", declaration.raw)
+                }
+            };
+            canonical = canonical.child(
+                text(line)
+                    .font(k.ty.small)
+                    .color(k.c.text_base)
+                    .wrap()
+                    .w_full(),
+            );
+            if declaration.resolved.is_some() {
+                let check = if declaration.matches_url(&page.url) {
+                    "Self · this URL was fetched".to_string()
+                } else if let Some(other) = pages
+                    .iter()
+                    .find(|other| declaration.matches_url(&other.url))
+                {
+                    format!(
+                        "Target fetched · HTTP {} · {}",
+                        other.status,
+                        other.indexability.label.text()
+                    )
+                } else {
+                    "Target not checked in this crawl".to_string()
+                };
+                canonical = canonical.child(muted_note(
+                    k,
+                    if declaration.truncated {
+                        format!("{check} · target text truncated")
+                    } else {
+                        check
+                    },
+                ));
+            }
+        }
+    }
+    block = block.child(canonical);
+
+    let mut robots = col()
+        .w_full()
+        .min_w(0.0)
+        .gap(4.0)
+        .child(micro(k, "Robots directives"));
+    if assessment.evidence.directives.is_empty() {
+        robots = robots.child(muted_note(k, "Not observed"));
+    } else {
+        for directive in &assessment.evidence.directives {
+            let applies = directive.applies_to_google();
+            let color = if applies && directive.noindex {
+                k.c.danger.fg
+            } else if !applies {
+                k.c.text_muted
+            } else {
+                k.c.text_base
+            };
+            robots = robots.child(
+                text(format!("{} · {}", directive.source_label(), directive.raw))
+                    .font(k.ty.small)
+                    .color(color)
+                    .wrap()
+                    .w_full(),
+            );
+            if !applies {
+                robots = robots.child(muted_note(
+                    k,
+                    format!(
+                        "Scoped to {} · not applied to Google Web Search",
+                        directive.agent.as_deref().unwrap_or("another agent")
+                    ),
+                ));
+            } else if directive.nofollow && !directive.noindex {
+                robots = robots.child(muted_note(
+                    k,
+                    "nofollow does not by itself prevent indexing.",
+                ));
+            }
+        }
+    }
+    block = block.child(robots);
+
+    let status = if page.status == 0 {
+        "No response".to_string()
+    } else {
+        page.status.to_string()
+    };
+    block
+        .child(detail_field(k, "Read", assessment.read_label()))
+        .child(detail_field(k, "HTTP status", &status))
 }
 
 fn sitemap_detail(k: &Kit, state: &State) -> El {
@@ -2617,7 +2874,11 @@ fn sitemap_detail(k: &Kit, state: &State) -> El {
 
     let (heading, selected, fields) = match state.sitemap_view {
         SitemapView::Urls => match url_entry {
-            Some(entry) => ("Sitemap URL", entry.url.clone(), sitemap_url_fields(entry)),
+            Some(entry) => (
+                "Sitemap URL",
+                entry.url.clone(),
+                sitemap_url_fields(entry, &state.pages),
+            ),
             None => match file {
                 Some(file) => ("Sitemap file", file.url.clone(), sitemap_file_fields(file)),
                 None => return sitemap_detail_empty(k, panel, "URL"),
@@ -2626,7 +2887,11 @@ fn sitemap_detail(k: &Kit, state: &State) -> El {
         SitemapView::Files => match file {
             Some(file) => ("Sitemap file", file.url.clone(), sitemap_file_fields(file)),
             None => match url_entry {
-                Some(entry) => ("Sitemap URL", entry.url.clone(), sitemap_url_fields(entry)),
+                Some(entry) => (
+                    "Sitemap URL",
+                    entry.url.clone(),
+                    sitemap_url_fields(entry, &state.pages),
+                ),
                 None => return sitemap_detail_empty(k, panel, "file"),
             },
         },
@@ -2688,7 +2953,7 @@ fn sitemap_detail_empty(k: &Kit, panel: El, noun: &str) -> El {
     )
 }
 
-fn sitemap_url_fields(entry: &SitemapUrl) -> Vec<(&'static str, String)> {
+fn sitemap_url_fields(entry: &SitemapUrl, pages: &[Page]) -> Vec<(&'static str, String)> {
     let mut fields = vec![
         ("State", entry.state.label().to_string()),
         (
@@ -2716,6 +2981,59 @@ fn sitemap_url_fields(entry: &SitemapUrl) -> Vec<(&'static str, String)> {
             },
         ),
     ];
+    if entry.state == UrlState::Checked {
+        fields.push(("Indexability", entry.assessment.label.text().to_string()));
+        let reasons = entry.assessment.all_reasons_text();
+        fields.push((
+            "Reasons",
+            if reasons.is_empty() {
+                "—".into()
+            } else {
+                reasons
+            },
+        ));
+        fields.push(("Evidence", entry.assessment.evidence_text()));
+        fields.push(("Read", entry.assessment.read_label().to_string()));
+        let mut seen_targets = Vec::new();
+        for declaration in &entry.assessment.evidence.canonicals {
+            let Some(target) = declaration.resolved.as_deref() else {
+                continue;
+            };
+            if declaration.state != calmtoad::indexability::CanonicalState::Valid {
+                continue;
+            }
+            let Some(hash) = declaration.resolved_hash else {
+                continue;
+            };
+            if seen_targets.contains(&hash) {
+                continue;
+            }
+            seen_targets.push(hash);
+            let check = if declaration.matches_url(&entry.url) {
+                "Self · fetched".to_string()
+            } else if let Some(other) = pages.iter().find(|page| declaration.matches_url(&page.url))
+            {
+                format!(
+                    "Fetched · HTTP {} · {}",
+                    other.status,
+                    other.indexability.label.text()
+                )
+            } else {
+                "Not checked in this crawl".to_string()
+            };
+            fields.push((
+                "Canonical target",
+                format!(
+                    "{target} · {check}{}",
+                    if declaration.truncated {
+                        " · target text truncated"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+    }
     if !entry.redirect_to.is_empty() {
         fields.push(("Redirect to", entry.redirect_to.clone()));
     }
@@ -2938,6 +3256,14 @@ fn scene_sitemap_files(state: &mut State) {
     state.sitemap_view = SitemapView::Files;
     sort_sitemap(state);
 }
+fn scene_indexability(state: &mut State) {
+    load_indexability_sample(state);
+}
+fn scene_indexability_details(state: &mut State) {
+    load_indexability_sample(state);
+    state.table.select("https://example.com/wholesale");
+    state.details_open = true;
+}
 fn scene_title_issues(state: &mut State) {
     load_sample(state);
     state.tab = Tab::Titles;
@@ -3021,6 +3347,8 @@ fn main() {
             ("links", scene_links),
             ("sitemaps", scene_sitemaps),
             ("sitemap-files", scene_sitemap_files),
+            ("indexability", scene_indexability),
+            ("indexability-details", scene_indexability_details),
             ("title-issues", scene_title_issues),
             ("error", scene_error),
             ("crawling", scene_crawling),
@@ -3298,6 +3626,124 @@ mod tests {
         state.use_sitemaps = false;
         state.sitemap.discovery_done = true;
         assert_eq!(sitemap_summary(&state), "Sitemaps are off");
+    }
+
+    #[test]
+    fn indexability_drives_filtering_sorting_and_csv_columns() {
+        let mut state = init();
+        load_indexability_sample(&mut state);
+        let clean = state
+            .pages
+            .iter()
+            .position(|page| page.indexability.label == Label::NoBlockFound)
+            .expect("the mixed fixture keeps a clean page");
+        state.issues_only = true;
+        refresh_visible(&mut state);
+        assert!(!state.visible.contains(&clean));
+        assert!(state.visible.len() < state.pages.len());
+        assert!(
+            state
+                .visible
+                .iter()
+                .all(|index| state.pages[*index].indexability.needs_attention())
+        );
+
+        state.issues_only = false;
+        state.table.set_sort("indexability", SortDir::Ascending);
+        sort_pages(&mut state);
+        let ranks: Vec<u8> = state
+            .visible
+            .iter()
+            .map(|index| label_rank(state.pages[*index].indexability.label))
+            .collect();
+        assert!(ranks.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        assert_eq!(
+            export_headers(Tab::Internal),
+            &[
+                "ADDRESS",
+                "STATUS",
+                "INDEXABILITY",
+                "WORDS",
+                "REASONS",
+                "EVIDENCE",
+            ]
+        );
+        let wholesale = state
+            .pages
+            .iter()
+            .find(|page| page.url.ends_with("/wholesale"))
+            .expect("wholesale fixture");
+        let row = export_row(Tab::Internal, wholesale, &state.audit);
+        assert_eq!(row[2], "Noindex");
+        assert!(row[4].contains("noindex"));
+        assert!(
+            row[5].contains("Googlebot meta") && row[5].contains("Bingbot meta"),
+            "{}",
+            row[5]
+        );
+    }
+
+    #[test]
+    fn non_html_is_context_not_an_issue_in_rows_csv_sitemaps_or_counts() {
+        let mut state = init();
+        load_indexability_sample(&mut state);
+
+        let pdf_index = state
+            .pages
+            .iter()
+            .position(|page| page.url.ends_with("/report-2026.pdf"))
+            .expect("PDF fixture");
+        {
+            let pdf = &state.pages[pdf_index];
+            assert_eq!(pdf.indexability.label, Label::NotAssessed);
+            assert!(!pdf.indexability.needs_attention());
+            assert!(!pdf.indexability.has_confirmed_issue());
+        }
+
+        // Issues only excludes it even though its context is still readable.
+        state.issues_only = true;
+        refresh_visible(&mut state);
+        assert!(!state.visible.contains(&pdf_index));
+        assert!(
+            state
+                .visible
+                .iter()
+                .all(|index| state.pages[*index].indexability.needs_attention())
+        );
+
+        // CSV keeps the Not assessed label and explains it.
+        let row = export_row(Tab::Internal, &state.pages[pdf_index], &state.audit);
+        assert_eq!(row[2], "Not assessed");
+        assert!(row[4].contains("Non-HTML content"), "{}", row[4]);
+
+        // Sitemaps use the same severity: the row still explains itself, but it is not an
+        // issue row and does not inflate the issue count.
+        let entry = state
+            .sitemap
+            .url("https://example.com/report.pdf")
+            .expect("sitemap PDF entry");
+        assert_eq!(entry.state, UrlState::Checked);
+        assert!(!entry.needs_attention());
+        assert!(entry.issue.contains("Non-HTML content"), "{}", entry.issue);
+        let summary = state.sitemap.summary();
+        let issue_count = state
+            .sitemap
+            .urls
+            .iter()
+            .filter(|entry| entry.needs_attention())
+            .count();
+        assert_eq!(summary.issue_urls, issue_count);
+
+        // Confirmed-error counts exclude it too.
+        let blocked = counts_with(&state.pages, &state.audit).blocked;
+        let confirmed = state
+            .pages
+            .iter()
+            .filter(|page| page.indexability.has_confirmed_issue())
+            .count();
+        assert_eq!(blocked, confirmed);
+        assert!(confirmed > 0);
     }
 
     #[test]

@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 use scraper::{ElementRef, Html, Node};
 use url::Url;
 
+use crate::indexability::{
+    self, Assessment, CanonicalDeclaration, OmittedEvidence, PageEvidence, ReadState,
+    RobotsDirective,
+};
 use crate::sitemap;
 
 /// A small, dependency-free hasher for the crawl's hot maps.
@@ -111,24 +115,25 @@ pub struct Page {
     pub title: String,
     pub meta_description: String,
     pub h1s: Vec<String>,
+    /// Compatibility derivative of the assessment: an applicable generic or Googlebot rule.
+    /// The authoritative object is [`Page::indexability`].
     pub noindex: bool,
     pub words: usize,
     pub redirect_to: String,
     pub error: String,
     pub depth: u8,
-    /// Absolute canonical URL, normalized like `url`, when the page declares one.
+    /// Compatibility derivative: the first valid HTML canonical target, normalized like `url`.
+    /// The authoritative evidence is [`Page::indexability`].
     pub canonical: String,
     pub images: usize,
     pub images_missing_alt: usize,
     /// Same-host links found on the page, normalized like `url`.
     pub links: Vec<String>,
+    /// The one evidence-backed indexability assessment every view reads.
+    pub indexability: Assessment,
 }
 
 impl Page {
-    pub fn indexable(&self) -> bool {
-        auditable(self) && !self.noindex
-    }
-
     pub fn h1(&self) -> String {
         self.h1s.join(" · ")
     }
@@ -158,8 +163,14 @@ pub struct Fetched {
     pub error: String,
     /// `Retry-After` in milliseconds, when a rate-limited server sent one.
     pub retry_after_ms: u64,
-    /// `X-Robots-Tag: noindex`, which can come from the server as well as the markup.
-    pub header_noindex: bool,
+    /// Every bounded `X-Robots-Tag` directive, including agent scopes.
+    pub header_directives: Vec<RobotsDirective>,
+    /// More header directives were present than the evidence cap retained.
+    pub header_truncated: bool,
+    /// Effective restrictions from header directives beyond the retained cap.
+    pub header_omitted: OmittedEvidence,
+    /// Whether the body was read completely, truncated at the crawl limit, or not read.
+    pub read: ReadState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -615,7 +626,7 @@ pub fn counts_with(pages: &[Page], audit: &Audit) -> Counts {
         counts.h1 += h1_has_issue(page, auditable, audit, &mut buffer) as usize;
         // `response_issue` is empty only for a 2xx response.
         counts.response += (!(200..=299).contains(&page.status)) as usize;
-        counts.blocked += (!(auditable && !page.noindex)) as usize;
+        counts.blocked += page.indexability.has_confirmed_issue() as usize;
         counts.canonical += canonical_has_issue(page, auditable) as usize;
         counts.images += (auditable && page.images_missing_alt > 0) as usize;
         counts.links +=
@@ -668,11 +679,17 @@ fn h1_has_issue(page: &Page, auditable: bool, audit: &Audit, buffer: &mut String
 }
 
 fn canonical_has_issue(page: &Page, auditable: bool) -> bool {
-    auditable && (page.canonical.is_empty() || page.canonical != page.url)
+    auditable && page.indexability.canonical_needs_attention()
 }
 
 pub fn auditable(page: &Page) -> bool {
-    page.status == 200 && is_html(&page.content_type, "") && page.error.is_empty()
+    page.status == 200
+        && is_html(&page.content_type, "")
+        && page.error.is_empty()
+        && !matches!(
+            page.indexability.evidence.read,
+            ReadState::Failed | ReadState::Truncated | ReadState::NotRead
+        )
 }
 
 pub fn title_issue(page: &Page, audit: &Audit) -> String {
@@ -706,14 +723,7 @@ pub fn canonical_issue(page: &Page) -> String {
     if !auditable(page) {
         return String::new();
     }
-    if page.canonical.is_empty() {
-        return "Missing".into();
-    }
-    if page.canonical == page.url {
-        String::new()
-    } else {
-        format!("Points to {}", short_target(&page.canonical))
-    }
+    page.indexability.canonical_issue_text()
 }
 
 pub fn image_issue(page: &Page) -> String {
@@ -784,18 +794,6 @@ pub fn response_issue(page: &Page) -> String {
         400..=499 => format!("{} Client error", page.status),
         500..=599 => format!("{} Server error", page.status),
         status => format!("{status}"),
-    }
-}
-
-pub fn index_issue(page: &Page) -> &'static str {
-    if page.indexable() {
-        ""
-    } else if page.noindex {
-        "Noindex"
-    } else if page.status != 200 {
-        "Not indexable"
-    } else {
-        "Not HTML"
     }
 }
 
@@ -1335,7 +1333,7 @@ fn crawl_engine(
             };
             let mut new_jobs: Vec<(String, u8)> = Vec::new();
             let mut page_links: Vec<String> = Vec::new();
-            let mut canonical = String::new();
+            let mut canonicals: Vec<CanonicalDeclaration> = Vec::new();
 
             if let (Some(parsed), Some(page_url)) = (parsed.as_ref(), page_url.as_ref()) {
                 let link_base = parsed
@@ -1343,12 +1341,12 @@ fn crawl_engine(
                     .as_deref()
                     .and_then(|href| resolve(page_url, href))
                     .unwrap_or_else(|| page_url.clone());
-                canonical = parsed
-                    .canonical
-                    .as_deref()
-                    .and_then(|href| resolve(&link_base, href))
-                    .map(url_key)
-                    .unwrap_or_default();
+                for raw in &parsed.canonicals {
+                    canonicals.push(indexability::canonical_declaration(
+                        raw.as_deref(),
+                        &link_base,
+                    ));
+                }
                 for href in &parsed.links {
                     let Some(next) = resolve(&link_base, href) else {
                         continue;
@@ -1405,32 +1403,48 @@ fn crawl_engine(
             }
 
             let had_html = parsed.is_some();
-            let (title, meta_description, h1s, noindex, words, images, images_missing_alt) =
+            let (title, meta_description, h1s, words, images, images_missing_alt, mut directives) =
                 match parsed {
                     Some(parsed) => (
                         parsed.title,
                         parsed.meta,
                         parsed.h1s,
-                        parsed.noindex || fetched.header_noindex,
                         parsed.words,
                         parsed.images,
                         parsed.images_missing_alt,
+                        parsed.robots_directives,
                     ),
                     None => (
                         String::new(),
                         String::new(),
                         Vec::new(),
-                        fetched.header_noindex,
                         0,
                         0,
                         0,
+                        Vec::new(),
                     ),
                 };
+            directives.extend(fetched.header_directives);
             let content_type = if fetched.content_type.is_empty() && had_html {
                 "text/html".into()
             } else {
                 fetched.content_type
             };
+            let evidence = PageEvidence {
+                directives,
+                canonicals,
+                read: fetched.read,
+                truncated: fetched.header_truncated,
+                omitted: fetched.header_omitted,
+            };
+            let indexability = indexability::assess(
+                &url,
+                fetched.status,
+                &content_type,
+                &redirect_to,
+                &fetched.error,
+                evidence,
+            );
             let page = Page {
                 url,
                 status: fetched.status,
@@ -1438,15 +1452,19 @@ fn crawl_engine(
                 title,
                 meta_description,
                 h1s,
-                noindex,
+                noindex: indexability.has_noindex(),
                 words,
                 redirect_to,
                 error: fetched.error,
                 depth,
-                canonical,
+                canonical: indexability
+                    .first_valid_canonical()
+                    .unwrap_or_default()
+                    .to_string(),
                 images,
                 images_missing_alt,
                 links: page_links,
+                indexability,
             };
             sitemap_report.observe_page(&page);
             on_event(CrawlEvent::Page(page.clone()));
@@ -1503,12 +1521,14 @@ struct Parsed {
     title: String,
     meta: String,
     h1s: Vec<String>,
-    noindex: bool,
     words: usize,
     links: Vec<String>,
     /// `<base href>`, resolved by the crawler against the page URL before joining links.
     base: Option<String>,
-    canonical: Option<String>,
+    /// Every robots meta declaration, in document order, including agent scopes.
+    robots_directives: Vec<RobotsDirective>,
+    /// Every canonical href, in document order. `None` means the element had no href.
+    canonicals: Vec<Option<String>>,
     images: usize,
     images_missing_alt: usize,
 }
@@ -1559,15 +1579,12 @@ fn parse_html(body: &str) -> Parsed {
 
     let mut title: Option<String> = None;
     let mut meta = String::new();
-    let mut noindex = false;
     let mut saw_description = false;
-    let mut saw_robots = false;
-    let mut saw_googlebot = false;
     let mut h1s = Vec::new();
     let mut links = Vec::new();
     let mut base: Option<String> = None;
-    let mut canonical: Option<String> = None;
-    let mut saw_canonical = false;
+    let mut robots_directives: Vec<RobotsDirective> = Vec::new();
+    let mut canonicals: Vec<Option<String>> = Vec::new();
     let mut images = 0_usize;
     let mut images_missing_alt = 0_usize;
     let mut words = 0_usize;
@@ -1581,18 +1598,16 @@ fn parse_html(body: &str) -> Parsed {
                     }
                 }
                 "meta" => {
-                    if !(saw_description && saw_robots && saw_googlebot) {
-                        let name = element.attr("name").unwrap_or("");
-                        if !saw_description && name.eq_ignore_ascii_case("description") {
-                            saw_description = true;
-                            meta = element.attr("content").map(clean).unwrap_or_default();
-                        } else if !saw_robots && name.eq_ignore_ascii_case("robots") {
-                            saw_robots = true;
-                            noindex = element.attr("content").is_some_and(is_noindex);
-                        } else if !saw_googlebot && name.eq_ignore_ascii_case("googlebot") {
-                            saw_googlebot = true;
-                            noindex |= element.attr("content").is_some_and(is_noindex);
-                        }
+                    let name = element.attr("name").unwrap_or("");
+                    if !saw_description && name.eq_ignore_ascii_case("description") {
+                        saw_description = true;
+                        meta = element.attr("content").map(clean).unwrap_or_default();
+                    }
+                    if let Some(directive) = element
+                        .attr("content")
+                        .and_then(|content| indexability::parse_meta_directive(name, content))
+                    {
+                        robots_directives.push(directive);
                     }
                 }
                 "h1" => {
@@ -1614,14 +1629,11 @@ fn parse_html(body: &str) -> Parsed {
                     }
                 }
                 "link" => {
-                    if !saw_canonical
-                        && element.attr("rel").is_some_and(|rel| {
-                            rel.split_whitespace()
-                                .any(|token| token.eq_ignore_ascii_case("canonical"))
-                        })
-                    {
-                        saw_canonical = true;
-                        canonical = element.attr("href").map(str::to_string);
+                    if element.attr("rel").is_some_and(|rel| {
+                        rel.split_whitespace()
+                            .any(|token| token.eq_ignore_ascii_case("canonical"))
+                    }) {
+                        canonicals.push(element.attr("href").map(str::to_string));
                     }
                 }
                 "img" => {
@@ -1655,11 +1667,11 @@ fn parse_html(body: &str) -> Parsed {
         title: title.unwrap_or_default(),
         meta,
         h1s,
-        noindex,
         words,
         links,
         base,
-        canonical,
+        robots_directives,
+        canonicals,
         images,
         images_missing_alt,
     }
@@ -1710,8 +1722,10 @@ fn from_response(status: u16, response: ureq::Response) -> Fetched {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(|seconds| seconds.saturating_mul(1_000).min(10_000))
         .unwrap_or(0);
-    let header_noindex = response.header("x-robots-tag").is_some_and(has_noindex);
+    let (header_directives, header_truncated, header_omitted) =
+        indexability::parse_x_robots_tag(&response.all("x-robots-tag"));
     let mut body = String::new();
+    let mut read = ReadState::NotRead;
     // Only a 200 is parsed, so downloading the body of a redirect or an error page is wasted
     // bandwidth and time.
     if status == 200 && wants_body(&content_type) {
@@ -1721,17 +1735,26 @@ fn from_response(status: u16, response: ureq::Response) -> Fetched {
             .unwrap_or(0)
             .min(MAX_BODY_BYTES as usize);
         let mut bytes = Vec::with_capacity(capacity);
-        if response
+        // Read one byte past the cap so a body that exactly fills it is still complete.
+        match response
             .into_reader()
-            .take(MAX_BODY_BYTES)
+            .take(MAX_BODY_BYTES + 1)
             .read_to_end(&mut bytes)
-            .is_ok()
         {
-            body = match String::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
-            };
+            Ok(_) => {
+                if bytes.len() as u64 > MAX_BODY_BYTES {
+                    bytes.truncate(MAX_BODY_BYTES as usize);
+                    read = ReadState::Truncated;
+                } else {
+                    read = ReadState::Complete;
+                }
+            }
+            Err(_) => read = ReadState::Failed,
         }
+        body = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        };
     } else if status != 200 {
         // A redirect or an error page still has a body on many servers. Consume a little of it
         // so ureq can return the socket to the pool and the next request skips a handshake.
@@ -1747,7 +1770,10 @@ fn from_response(status: u16, response: ureq::Response) -> Fetched {
         body,
         error: String::new(),
         retry_after_ms,
-        header_noindex,
+        header_directives,
+        header_truncated,
+        header_omitted,
+        read,
     }
 }
 
@@ -2039,20 +2065,6 @@ fn norm_into<'a>(value: &str, buffer: &'a mut String) -> &'a str {
     buffer.as_str()
 }
 
-fn is_noindex(content: &str) -> bool {
-    content
-        .split(',')
-        .any(|part| part.trim().eq_ignore_ascii_case("noindex"))
-}
-
-/// `X-Robots-Tag` may be a comma-separated list, optionally prefixed with a crawler name
-/// (`googlebot: noindex`).
-fn has_noindex(value: &str) -> bool {
-    value
-        .split(',')
-        .any(|part| is_noindex(part.rsplit(':').next().unwrap_or(part).trim()))
-}
-
 fn short_target(url: &str) -> String {
     Url::parse(url)
         .map(|url| url.path().to_string())
@@ -2095,6 +2107,7 @@ pub fn sample_pages() -> Vec<Page> {
         images: 0,
         images_missing_alt: 0,
         links: Vec::new(),
+        indexability: Assessment::default(),
     };
     let ok_meta =
         "A short field guide to the pages, titles and links that decide whether a page gets found.";
@@ -2185,7 +2198,213 @@ pub fn sample_pages() -> Vec<Page> {
         "https://example.com/blog/notes".into(),
         "https://example.com/guides/launch".into(),
     ];
+    for page in &mut pages {
+        page.indexability = sample_assessment(page);
+        page.noindex = page.indexability.has_noindex();
+        page.canonical = page
+            .indexability
+            .first_valid_canonical()
+            .unwrap_or_default()
+            .to_string();
+    }
     pages
+}
+
+/// The nine-page sample plus mixed indexability states for offline review scenes.
+pub fn indexability_sample_pages() -> Vec<Page> {
+    let mut pages = sample_pages();
+    let page = |url: &str| Page {
+        url: url.into(),
+        status: 200,
+        content_type: "text/html; charset=utf-8".into(),
+        title: String::new(),
+        meta_description: String::new(),
+        h1s: Vec::new(),
+        noindex: false,
+        words: 0,
+        redirect_to: String::new(),
+        error: String::new(),
+        depth: 1,
+        canonical: String::new(),
+        images: 0,
+        images_missing_alt: 0,
+        links: Vec::new(),
+        indexability: Assessment::default(),
+    };
+    let generic = |raw: &str| indexability::parse_meta_directive("robots", raw).unwrap();
+    let google = |raw: &str| indexability::parse_meta_directive("googlebot", raw).unwrap();
+    let bing = |raw: &str| indexability::parse_meta_directive("bingbot", raw).unwrap();
+    let mut push =
+        |mut page: Page, directives: Vec<RobotsDirective>, canonicals: &[&str], read: ReadState| {
+            let base = Url::parse(&page.url).unwrap();
+            let evidence = PageEvidence {
+                directives,
+                canonicals: canonicals
+                    .iter()
+                    .map(|raw| indexability::canonical_declaration(Some(raw), &base))
+                    .collect(),
+                read,
+                truncated: false,
+                ..PageEvidence::default()
+            };
+            page.indexability = indexability::assess(
+                &page.url,
+                page.status,
+                &page.content_type,
+                &page.redirect_to,
+                &page.error,
+                evidence,
+            );
+            page.noindex = page.indexability.has_noindex();
+            page.canonical = page
+                .indexability
+                .first_valid_canonical()
+                .unwrap_or_default()
+                .to_string();
+            pages.push(page);
+        };
+
+    push(
+        Page {
+            title: "Wholesale enquiry notes for the spring range".into(),
+            meta_description:
+                "How the wholesale range is planned, packed and shipped to stockists each season."
+                    .into(),
+            h1s: vec!["Wholesale notes".into()],
+            words: 132,
+            ..page("https://example.com/wholesale")
+        },
+        vec![
+            generic("noindex"),
+            google("noindex, nofollow"),
+            bing("noindex"),
+        ],
+        &["https://example.com/blog/calm", "/wholesale"],
+        ReadState::Complete,
+    );
+    push(
+        Page {
+            title: "Spring campaign landing page".into(),
+            meta_description:
+                "A campaign page with two competing canonical declarations for the review scene."
+                    .into(),
+            h1s: vec!["Spring campaign".into()],
+            words: 118,
+            ..page("https://example.com/campaign")
+        },
+        Vec::new(),
+        &["/campaign", "/spring"],
+        ReadState::Complete,
+    );
+    push(
+        Page {
+            title: "Seasonal report 2026".into(),
+            meta_description: "A PDF report linked from the blog.".into(),
+            words: 0,
+            content_type: "application/pdf".into(),
+            ..page("https://example.com/report-2026.pdf")
+        },
+        Vec::new(),
+        &[],
+        ReadState::NotRead,
+    );
+    push(
+        Page {
+            title: "Old guide".into(),
+            redirect_to: "https://example.com/pricing".into(),
+            status: 301,
+            ..page("https://example.com/legacy")
+        },
+        Vec::new(),
+        &[],
+        ReadState::NotRead,
+    );
+    push(
+        Page {
+            title: "Long feed page".into(),
+            words: 340,
+            ..page("https://example.com/feed")
+        },
+        Vec::new(),
+        &["/feed"],
+        ReadState::Truncated,
+    );
+    push(
+        Page {
+            title: "Status page".into(),
+            status: 503,
+            ..page("https://example.com/status")
+        },
+        Vec::new(),
+        &[],
+        ReadState::NotRead,
+    );
+    push(
+        Page {
+            error: "connection reset by peer".into(),
+            status: 0,
+            content_type: String::new(),
+            ..page("https://example.com/offline")
+        },
+        Vec::new(),
+        &[],
+        ReadState::Failed,
+    );
+    push(
+        Page {
+            title: "Quiet notes page".into(),
+            meta_description:
+                "A nofollow page that still has no noindex rule and no canonical declaration."
+                    .into(),
+            h1s: vec!["Quiet notes".into()],
+            words: 96,
+            ..page("https://example.com/nofollow")
+        },
+        vec![generic("nofollow")],
+        &[],
+        ReadState::Complete,
+    );
+    pages
+}
+
+fn sample_assessment(page: &Page) -> Assessment {
+    let mut evidence = PageEvidence {
+        // Mirror the transport: only a 200 HTML response has a body to read.
+        read: if page.status == 200 && page.content_type.to_ascii_lowercase().contains("html") {
+            ReadState::Complete
+        } else {
+            ReadState::NotRead
+        },
+        ..PageEvidence::default()
+    };
+    if page.noindex {
+        evidence.directives.push(RobotsDirective {
+            source: indexability::EvidenceSource::Meta,
+            agent: None,
+            raw: "noindex".into(),
+            noindex: true,
+            nofollow: false,
+            truncated: false,
+        });
+    }
+    if !page.canonical.is_empty()
+        && let Ok(url) = Url::parse(&page.url)
+    {
+        evidence
+            .canonicals
+            .push(indexability::canonical_declaration(
+                Some(&page.canonical),
+                &url,
+            ));
+    }
+    indexability::assess(
+        &page.url,
+        page.status,
+        &page.content_type,
+        &page.redirect_to,
+        &page.error,
+        evidence,
+    )
 }
 
 #[cfg(test)]
@@ -2200,6 +2419,7 @@ mod tests {
             status,
             content_type: "text/html; charset=utf-8".into(),
             body: body.into(),
+            read: ReadState::Complete,
             ..Fetched::default()
         }
     }
@@ -2244,8 +2464,13 @@ mod tests {
         assert_eq!(parsed.title, "Hello there");
         assert_eq!(parsed.meta, "A description.");
         assert_eq!(parsed.h1s, vec!["Welcome".to_string(), "Again".to_string()]);
-        assert!(parsed.noindex);
-        assert_eq!(parsed.canonical.as_deref(), Some("/canonical"));
+        assert!(
+            parsed
+                .robots_directives
+                .iter()
+                .any(|directive| directive.noindex)
+        );
+        assert_eq!(parsed.canonicals, vec![Some("/canonical".to_string())]);
         assert_eq!(parsed.images, 3);
         assert_eq!(parsed.images_missing_alt, 2);
         assert!(parsed.links.contains(&"/pricing".to_string()));
@@ -2386,7 +2611,7 @@ mod tests {
         assert_eq!(h1_issue(&pages[1], &audit), "Missing");
         assert_eq!(h1_issue(&pages[2], &audit), "Multiple");
         assert_eq!(h1_issue(&pages[4], &audit), "Duplicate");
-        assert_eq!(index_issue(&pages[5]), "Noindex");
+        assert_eq!(pages[5].indexability.label.text(), "Noindex");
         assert!(
             title_issue(&pages[6], &audit).is_empty(),
             "redirects are not missing-title issues"
@@ -2611,6 +2836,17 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_html_bodies_are_not_used_for_content_audits() {
+        let mut page = sample_pages().remove(0);
+        page.indexability.evidence.read = ReadState::Failed;
+        assert!(!auditable(&page));
+        page.indexability.evidence.read = ReadState::Truncated;
+        assert!(!auditable(&page));
+        page.indexability.evidence.read = ReadState::Complete;
+        assert!(auditable(&page));
+    }
+
+    #[test]
     fn request_slots_share_the_robots_crawl_delay() {
         let delay = Duration::from_millis(25);
         let shared = Mutex::new(Work {
@@ -2682,11 +2918,6 @@ mod tests {
             "",
             "a single redirect is not a chain"
         );
-
-        assert!(has_noindex("noindex"));
-        assert!(has_noindex("googlebot: noindex"));
-        assert!(has_noindex("noindex, nofollow"));
-        assert!(!has_noindex("index, follow"));
     }
 
     #[test]
@@ -2797,6 +3028,194 @@ mod tests {
             .unwrap();
         assert_eq!(home.title, "Local home title that is long enough");
         assert_eq!(home.h1s, vec!["Home".to_string()]);
+    }
+
+    #[test]
+    fn repeated_header_directives_and_body_truncation_are_reported() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0_u8; 2048];
+                let _ = sock.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf);
+                let path = req
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/");
+                let (extra, body) = match path {
+                    "/headers" => (
+                        "X-Robots-Tag: googlebot: noindex\r\nX-Robots-Tag: noindex\r\n",
+                        r#"<!doctype html><html><head><title>Header evidence</title><meta name="robots" content="nofollow"></head><body><p>ok</p></body></html>"#.to_string(),
+                    ),
+                    "/cap" => {
+                        let metas: String = (0..indexability::MAX_EVIDENCE_ITEMS)
+                            .map(|_| r#"<meta name="robots" content="index">"#)
+                            .collect();
+                        (
+                            "X-Robots-Tag: noindex\r\n",
+                            format!(
+                                "<!doctype html><html><head><title>Cap evidence</title>{metas}</head><body><p>ok</p></body></html>"
+                            ),
+                        )
+                    }
+                    "/big" => {
+                        let mut body = String::from(
+                            "<!doctype html><html><head><title>Big body</title></head><body>",
+                        );
+                        body.push_str(&"x".repeat(MAX_BODY_BYTES as usize));
+                        body.push_str("</body></html>");
+                        ("", body)
+                    }
+                    "/partial" => (
+                        "X-Robots-Tag: noindex\r\n",
+                        "<!doctype html><html><head><title>Partial page title</title></head>"
+                            .to_string(),
+                    ),
+                    _ => ("", String::new()),
+                };
+                let content_length = if path == "/partial" {
+                    body.len() + 64
+                } else {
+                    body.len()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    content_length
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+
+        let headers = fetch(agent(), &format!("http://{addr}/headers"));
+        assert_eq!(headers.read, ReadState::Complete);
+        assert_eq!(headers.header_directives.len(), 2);
+        assert!(
+            headers
+                .header_directives
+                .iter()
+                .all(|directive| directive.noindex)
+        );
+        assert_eq!(
+            headers.header_directives[0].agent.as_deref(),
+            Some("googlebot")
+        );
+        assert_eq!(headers.header_directives[1].agent, None);
+        let parsed = parse_html(&headers.body);
+        let mut directives = parsed.robots_directives.clone();
+        directives.extend(headers.header_directives.clone());
+        let assessment = indexability::assess(
+            &format!("http://{addr}/headers"),
+            headers.status,
+            &headers.content_type,
+            "",
+            "",
+            PageEvidence {
+                directives,
+                ..PageEvidence::default()
+            },
+        );
+        assert_eq!(assessment.label, indexability::Label::Noindex);
+        assert!(
+            assessment
+                .evidence
+                .directives
+                .iter()
+                .any(|directive| directive.nofollow && directive.agent.is_none())
+        );
+
+        let big = fetch(agent(), &format!("http://{addr}/big"));
+        assert_eq!(big.read, ReadState::Truncated);
+        assert_eq!(big.body.len(), MAX_BODY_BYTES as usize);
+        let assessment = indexability::assess(
+            &format!("http://{addr}/big"),
+            big.status,
+            &big.content_type,
+            "",
+            "",
+            PageEvidence {
+                read: big.read,
+                ..PageEvidence::default()
+            },
+        );
+        assert_eq!(assessment.label, indexability::Label::NotAssessed);
+        assert!(assessment.reason_text().contains("truncated"));
+
+        // The engine appends header directives after every meta tag. A noindex header that
+        // lands just past the retained cap must still win the assessment.
+        let cap = fetch(agent(), &format!("http://{addr}/cap"));
+        let parsed = parse_html(&cap.body);
+        assert_eq!(
+            parsed.robots_directives.len(),
+            indexability::MAX_EVIDENCE_ITEMS
+        );
+        let mut directives = parsed.robots_directives.clone();
+        directives.extend(cap.header_directives.clone());
+        let assessment = indexability::assess(
+            &format!("http://{addr}/cap"),
+            cap.status,
+            &cap.content_type,
+            "",
+            "",
+            PageEvidence {
+                directives,
+                truncated: cap.header_truncated,
+                omitted: cap.header_omitted,
+                ..PageEvidence::default()
+            },
+        );
+        assert_eq!(assessment.label, indexability::Label::Noindex);
+        assert!(assessment.has_noindex());
+        assert!(assessment.has_confirmed_issue());
+        assert!(assessment.evidence.truncated);
+        assert!(assessment.evidence.omitted.applicable_noindex);
+        assert!(
+            assessment
+                .evidence_text()
+                .contains("among directives not retained")
+        );
+
+        let partial = fetch(agent(), &format!("http://{addr}/partial"));
+        assert_eq!(partial.status, 200);
+        assert_eq!(partial.read, ReadState::Failed);
+        assert!(partial.body.contains("Partial page title"));
+        let parsed = parse_html(&partial.body);
+        let assessment = indexability::assess(
+            &format!("http://{addr}/partial"),
+            partial.status,
+            &partial.content_type,
+            "",
+            &partial.error,
+            PageEvidence {
+                directives: partial.header_directives.clone(),
+                read: partial.read,
+                truncated: partial.header_truncated,
+                omitted: partial.header_omitted,
+                ..PageEvidence::default()
+            },
+        );
+        assert_eq!(assessment.label, indexability::Label::FetchFailed);
+        assert!(assessment.has_noindex());
+        assert!(
+            assessment
+                .findings
+                .iter()
+                .any(|finding| finding.code == indexability::FindingCode::Noindex)
+        );
+        let mut incomplete_page = sample_pages().remove(0);
+        incomplete_page.status = partial.status;
+        incomplete_page.content_type = partial.content_type;
+        incomplete_page.title = parsed.title;
+        incomplete_page.error = partial.error;
+        incomplete_page.indexability = assessment;
+        assert!(!auditable(&incomplete_page));
+        assert!(title_issue(&incomplete_page, &Audit::default()).is_empty());
     }
 
     fn sitemap_xml(locs: &[&str]) -> sitemap::FetchedBytes {
@@ -3126,13 +3545,36 @@ mod tests {
         assert!(
             entry("https://example.com/noindex")
                 .issue
-                .contains("Noindex")
+                .contains("Meta robots: noindex")
         );
         assert!(
             entry("https://example.com/canonical")
                 .issue
-                .contains("Canonical points to https://example.com/elsewhere")
+                .contains("Canonical points to /elsewhere")
         );
+        assert_eq!(
+            entry("https://example.com/noindex").assessment.label,
+            crate::indexability::Label::Noindex
+        );
+        assert_eq!(
+            entry("https://example.com/canonical").assessment.label,
+            crate::indexability::Label::CanonicalElsewhere
+        );
+        for page in &result.pages {
+            if let Some(entry) = result.sitemap.url(&page.url) {
+                assert_eq!(
+                    *entry.assessment, page.indexability,
+                    "sitemap and page assessment disagree for {}",
+                    page.url
+                );
+                assert_eq!(
+                    entry.issue,
+                    page.indexability.reason_text(),
+                    "sitemap reason disagrees for {}",
+                    page.url
+                );
+            }
+        }
     }
 
     #[test]
