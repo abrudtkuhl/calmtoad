@@ -1222,6 +1222,7 @@ pub fn sample_report() -> SitemapReport {
         if noindex {
             evidence.directives.push(RobotsDirective {
                 source: EvidenceSource::Meta,
+                stage: indexability::EvidenceStage::Document,
                 agent: None,
                 raw: "noindex".into(),
                 noindex: true,
@@ -1236,7 +1237,15 @@ pub fn sample_report() -> SitemapReport {
                 .canonicals
                 .push(indexability::canonical_declaration(Some(canonical), &base));
         }
-        indexability::assess(url, status, content_type, redirect_to, "", evidence)
+        indexability::assess(
+            url,
+            status,
+            content_type,
+            redirect_to,
+            "",
+            evidence,
+            indexability::CaptureInfo::html(),
+        )
     };
     for entry in [
         SitemapUrl {
@@ -2003,6 +2012,82 @@ mod tests {
                 .urls
                 .iter()
                 .any(|entry| entry.state == UrlState::NotChecked)
+        );
+    }
+
+    #[test]
+    fn an_incomplete_browser_capture_is_not_a_clean_sitemap_issue() {
+        use crate::crawl::Page;
+        use crate::indexability::{
+            CaptureInfo, CaptureMode, Label, PageEvidence, ReadState, RenderSummary,
+        };
+        use crate::render::{RenderState, SourceState};
+
+        let url = "https://example.com/page".to_string();
+        let mut report = SitemapReport::default();
+        assert!(report.insert_url(SitemapUrl {
+            url: url.clone(),
+            sources: vec!["https://example.com/sitemap.xml".into()],
+            state: UrlState::Pending,
+            assessment: Box::default(),
+            ..SitemapUrl::default()
+        }));
+        let assessment = crate::indexability::assess(
+            &url,
+            200,
+            "text/html",
+            "",
+            "",
+            PageEvidence {
+                read: ReadState::Complete,
+                ..PageEvidence::default()
+            },
+            CaptureInfo {
+                mode: CaptureMode::Browser,
+                render: Some(RenderSummary {
+                    state: RenderState::TimedOut,
+                    reason: "The page did not finish before the deadline".into(),
+                    browser: "Chrome/test".into(),
+                    observed_url: url.clone(),
+                    source_captured: false,
+                    source_state: SourceState::Unavailable,
+                    source_note: String::new(),
+                    rendered_captured: false,
+                    rendered_truncated: false,
+                    resource_failures: Vec::new(),
+                    navigation_to: String::new(),
+                    elapsed_ms: 15_000,
+                    requests: 3,
+                }),
+            },
+        );
+        let page = Page {
+            url: url.clone(),
+            status: 200,
+            content_type: "text/html".into(),
+            title: String::new(),
+            meta_description: String::new(),
+            h1s: Vec::new(),
+            noindex: assessment.has_noindex(),
+            words: 0,
+            redirect_to: String::new(),
+            error: String::new(),
+            depth: 0,
+            canonical: String::new(),
+            images: 0,
+            images_missing_alt: 0,
+            links: Vec::new(),
+            indexability: assessment,
+        };
+        report.observe_page(&page);
+        let entry = &report.urls[0];
+        assert_eq!(entry.state, UrlState::Checked);
+        assert_eq!(entry.assessment.label, Label::NotAssessed);
+        assert!(entry.needs_attention());
+        assert!(
+            !entry.issue.is_empty() && !entry.issue.contains("No noindex"),
+            "the sitemap keeps the incomplete reason: {}",
+            entry.issue
         );
     }
 }

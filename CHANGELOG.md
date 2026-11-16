@@ -3,13 +3,35 @@
 User-facing changes are recorded here as work ships. Versions without a release
 date are being prepared for release.
 
-## [Unreleased]
+## [0.5.0] - 2026-11-16
+
+### Added
+
+- **Crawl JavaScript sites.** Choose Browser to render pages in your installed Chrome or Chromium before checking titles, descriptions, headings, links, images, and indexing directives. HTML remains the default and needs no browser.
+- **See what the browser captured.** Inspect source and rendered evidence, capture status, browser version, and script-changed robots or canonical declarations. Incomplete captures stay distinct from clean results.
+- **Search and focus your results.** Switch between All, Findings, and Incomplete, with separate search, sort, and selection settings for each view. CSV export and Copy visible URLs follow the rows and order on screen.
+- **Follow findings to their source.** Inspect duplicate peers, multiple headings, incoming links, outgoing targets, and redirect chains. Navigate to related results or copy a full relation list.
+- **Review the run.** Open Run for the crawl's saved settings, coverage, and completion, stop, or limit reason. Use Cmd/Ctrl+F for search and Cmd/Ctrl+L for the site URL.
+
+### Improved
+
+- Make the desktop interface more compact, with less repeated text, simpler browser setup, and expandable evidence and capture details.
+- Keep large result sets responsive with bounded event processing, cached relation data, and paged inspector lists. Every retained relation remains accessible.
+- Run Browser crawls in an isolated temporary profile, with bounded page rendering and the same host, robots.txt, page, and depth limits as HTML crawls. Calm Toad does not download a browser or use your everyday profile.
+- Include capture status in the Internal and Sitemaps URLs CSV exports. Unknown content measurements remain blank instead of appearing as zero or healthy.
+
+### Fixed
+
+- Keep completed-run coverage and stop reasons accurate when settings for the next crawl change or fail validation.
+- Preserve confirmed findings on incomplete captures and show skipped sitemap files in Findings.
+- Preserve result selection and sorting as pages arrive, and reset inspector paging when changing results or starting a new crawl.
+- Clean up owned browser processes on cancellation, startup failure, and app close without signalling an already-collected process.
 
 ## [0.4.0] - 2026-11-12
 
 ### Added
 
-- Replace the Internal tab's yes/no indexability answer with an evidence-backed assessment: Fetch failed, HTTP error, Redirect, Noindex, Review canonical, Canonical elsewhere, Not assessed, or No block found.
+- Replace the Internal tab's yes/no indexability answer with an evidence-backed assessment: Fetch failed, HTTP error, Redirect, Noindex, Review canonical, Canonical elsewhere, Not assessed, or No indexing block detected.
 - Show every applicable robots meta and `X-Robots-Tag` declaration, including repeated and agent-scoped rules, in the page details drawer.
 - Show every HTML canonical declaration with its resolved target and whether that target was fetched or left unchecked. Missing, self, repeated, malformed, and conflicting canonicals stay distinct.
 - Report a body-read failure or a body truncated at the crawl size limit as an incomplete assessment instead of a clean result.

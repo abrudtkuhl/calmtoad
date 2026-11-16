@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::crawl::url_key;
+use crate::render::SourceState;
 
 /// Most directive or canonical declarations retained for one page.
 pub const MAX_EVIDENCE_ITEMS: usize = 16;
@@ -53,10 +54,31 @@ pub enum EvidenceSource {
     Header,
 }
 
+/// Which capture produced a piece of evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EvidenceStage {
+    /// The HTML response body, or the browser's pre-script source capture.
+    #[default]
+    Document,
+    /// The browser's post-script rendered DOM.
+    Rendered,
+}
+
+impl EvidenceStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Document => "Source HTML",
+            Self::Rendered => "Rendered DOM",
+        }
+    }
+}
+
 /// One observed robots meta tag or X-Robots-Tag header line, with its scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RobotsDirective {
     pub source: EvidenceSource,
+    /// The capture stage that produced this declaration.
+    pub stage: EvidenceStage,
     /// `None` means the generic rule. `Some("googlebot")` is Google's crawler.
     pub agent: Option<String>,
     /// The bounded raw directive text.
@@ -89,7 +111,11 @@ impl RobotsDirective {
     }
 
     pub fn finding_text(&self) -> String {
-        format!("{}: {}", self.source_label(), self.raw)
+        if self.stage == EvidenceStage::Rendered {
+            format!("{} (rendered DOM): {}", self.source_label(), self.raw)
+        } else {
+            format!("{}: {}", self.source_label(), self.raw)
+        }
     }
 }
 
@@ -115,6 +141,8 @@ impl CanonicalState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalDeclaration {
     pub raw: String,
+    /// The capture stage that produced this declaration.
+    pub stage: EvidenceStage,
     /// The normalized absolute target when the declaration is valid.
     pub resolved: Option<String>,
     /// Digest of the full normalized target, retained when the display value is clipped.
@@ -140,6 +168,158 @@ impl CanonicalDeclaration {
             (CanonicalState::Valid, Some(resolved)) => resolved.clone(),
             (CanonicalState::Valid, None) => self.raw.clone(),
             (_, _) => self.state.label().to_string(),
+        }
+    }
+}
+
+/// Which capture produced a page's facts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// The plain HTTP fetch, which is fast and needs no browser.
+    #[default]
+    Html,
+    /// A local headless browser that executed the page's scripts.
+    Browser,
+}
+
+impl CaptureMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Html => "HTML",
+            Self::Browser => "Browser",
+        }
+    }
+}
+
+/// How a browser capture finished, kept on the page for the drawer and CSV.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderSummary {
+    pub state: crate::render::RenderState,
+    /// Why the capture stopped short or failed, when it did.
+    pub reason: String,
+    pub browser: String,
+    /// The URL the browser actually showed, which can differ after script URL changes.
+    pub observed_url: String,
+    /// The pre-script response body was captured.
+    pub source_captured: bool,
+    /// Whether the source stage is fully known; never inferred from the note prose.
+    pub source_state: SourceState,
+    /// Why a source body is missing or incomplete, when it is.
+    pub source_note: String,
+    /// The rendered DOM was captured.
+    pub rendered_captured: bool,
+    /// The rendered DOM reached the evidence cap.
+    pub rendered_truncated: bool,
+    /// Required scripts that failed to load or returned an HTTP error.
+    pub resource_failures: Vec<crate::render::ResourceFailure>,
+    /// A later document navigation that was handed to the crawl queue.
+    pub navigation_to: String,
+    pub elapsed_ms: u64,
+    pub requests: usize,
+}
+
+/// Capture provenance shared by the drawer, findings and CSV export.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CaptureInfo {
+    pub mode: CaptureMode,
+    pub render: Option<RenderSummary>,
+}
+
+impl CaptureInfo {
+    pub fn html() -> Self {
+        Self::default()
+    }
+
+    pub fn browser(capture: &crate::render::Capture) -> Self {
+        Self {
+            mode: CaptureMode::Browser,
+            render: Some(RenderSummary {
+                state: capture.state,
+                reason: capture.reason.clone(),
+                browser: capture.browser.clone(),
+                observed_url: capture.observed_url.clone(),
+                source_captured: capture.source_html.is_some(),
+                source_state: capture.source_state,
+                source_note: capture.source_note.clone(),
+                rendered_captured: capture.rendered_html.is_some(),
+                rendered_truncated: capture.rendered_truncated,
+                resource_failures: capture.resource_failures.clone(),
+                navigation_to: capture.navigation_to.clone(),
+                elapsed_ms: capture.elapsed_ms,
+                requests: capture.requests,
+            }),
+        }
+    }
+
+    /// State plus the renderer's stop reason, for exports that have room for the detail.
+    pub fn csv_label(&self) -> String {
+        let label = self.state_label();
+        match &self.render {
+            Some(render)
+                if render.state != crate::render::RenderState::Captured
+                    && !render.reason.trim().is_empty() =>
+            {
+                format!("{label} — {}", render.reason.trim())
+            }
+            _ => label,
+        }
+    }
+
+    /// True when the page was fully captured at the selected stage.
+    pub fn is_complete(&self) -> bool {
+        match &self.render {
+            Some(render) => {
+                render.state == crate::render::RenderState::Captured
+                    && render.rendered_captured
+                    && !render.rendered_truncated
+                    && render.resource_failures.is_empty()
+                    && render.source_state.is_complete()
+            }
+            None => true,
+        }
+    }
+
+    /// The stage whose declarations are being assessed. Rendered facts win when the rendered
+    /// DOM was captured; otherwise the document stage is all that is known.
+    pub fn evidence_stage(&self) -> EvidenceStage {
+        match &self.render {
+            Some(render) if render.rendered_captured => EvidenceStage::Rendered,
+            _ => EvidenceStage::Document,
+        }
+    }
+
+    /// A short, honest description of the capture for the drawer and CSV.
+    ///
+    /// A capture whose render finished but whose source or DOM stage is incomplete must not
+    /// read as a plain rendered capture in exports, so the missing stage is named here.
+    pub fn state_label(&self) -> String {
+        match &self.render {
+            Some(render) if render.state != crate::render::RenderState::Captured => {
+                format!("{} · {}", self.mode.label(), render.state.label())
+            }
+            Some(render) if !self.is_complete() => {
+                let mut parts = vec![self.mode.label().to_string(), "incomplete".to_string()];
+                if !render.rendered_captured {
+                    parts.push("DOM missing".into());
+                } else if render.rendered_truncated {
+                    parts.push("DOM capped".into());
+                }
+                if !render.source_state.is_complete() {
+                    parts.push(format!(
+                        "source {}",
+                        render.source_state.label().to_lowercase()
+                    ));
+                }
+                if !render.resource_failures.is_empty() {
+                    parts.push(match render.resource_failures.len() {
+                        1 => "script failed".to_string(),
+                        count => format!("{count} script failures"),
+                    });
+                }
+                parts.join(" · ")
+            }
+            Some(_) => format!("{} · rendered", self.mode.label()),
+            None => self.mode.label().to_string(),
         }
     }
 }
@@ -278,6 +458,8 @@ pub enum FindingCode {
     CanonicalInvalid,
     CanonicalConflict,
     NonHtml,
+    CaptureIncomplete,
+    CanonicalChanged,
     NoBlockFound,
 }
 
@@ -331,7 +513,7 @@ impl Label {
             Self::ReviewCanonical => "Review canonical",
             Self::CanonicalElsewhere => "Canonical elsewhere",
             Self::NotAssessed => "Not assessed",
-            Self::NoBlockFound => "No block found",
+            Self::NoBlockFound => "No indexing block detected",
         }
     }
 
@@ -356,6 +538,8 @@ pub struct Assessment {
     pub label: Label,
     pub findings: Vec<Finding>,
     pub evidence: PageEvidence,
+    /// Which capture produced the facts and how complete it was.
+    pub capture: CaptureInfo,
     /// Cached severity summary so filters and counts do not rescan findings per repaint.
     pub attention: bool,
     pub confirmed_issue: bool,
@@ -376,11 +560,17 @@ impl Assessment {
     }
 
     pub fn first_valid_canonical(&self) -> Option<&str> {
+        self.current_canonicals()
+            .find(|declaration| declaration.state == CanonicalState::Valid)
+            .and_then(|declaration| declaration.resolved.as_deref())
+    }
+
+    fn current_canonicals(&self) -> impl Iterator<Item = &CanonicalDeclaration> {
+        let stage = self.capture.evidence_stage();
         self.evidence
             .canonicals
             .iter()
-            .find(|declaration| declaration.state == CanonicalState::Valid)
-            .and_then(|declaration| declaration.resolved.as_deref())
+            .filter(move |declaration| declaration.stage == stage)
     }
 
     /// Findings worth showing under Issues only. No block found stays clean.
@@ -443,6 +633,11 @@ impl Assessment {
                     format!("canonical {} (invalid)", declaration.raw)
                 }
             };
+            let evidence = if self.capture.mode == CaptureMode::Browser {
+                format!("{evidence} [{}]", declaration.stage.label())
+            } else {
+                evidence
+            };
             parts.push(if declaration.truncated {
                 format!("{evidence} (truncated)")
             } else {
@@ -470,7 +665,8 @@ impl Assessment {
 
     /// The Canonical tab's wording, derived from the same declarations as the assessment.
     pub fn canonical_issue_text(&self) -> String {
-        if self.evidence.canonicals.is_empty() {
+        let current: Vec<&CanonicalDeclaration> = self.current_canonicals().collect();
+        if current.is_empty() {
             return "Missing".to_string();
         }
         if self.canonical_review_required() {
@@ -478,9 +674,7 @@ impl Assessment {
         }
         match self.unique_canonical_targets().first() {
             Some(target)
-                if !self
-                    .evidence
-                    .canonicals
+                if !current
                     .iter()
                     .find(|declaration| declaration.state == CanonicalState::Valid)
                     .is_some_and(|declaration| declaration.matches_url(&self.page_url)) =>
@@ -501,18 +695,16 @@ impl Assessment {
     }
 
     fn canonical_review_required(&self) -> bool {
-        self.evidence
-            .canonicals
-            .iter()
+        self.current_canonicals()
             .any(|declaration| declaration.state != CanonicalState::Valid)
             || self.unique_canonical_targets().len() > 1
     }
 
-    /// Every distinct valid canonical target, in declaration order.
+    /// Every distinct valid canonical target at the current stage, in declaration order.
     pub fn unique_canonical_targets(&self) -> Vec<&str> {
         let mut hashes: Vec<[u8; 32]> = Vec::new();
         let mut targets: Vec<&str> = Vec::new();
-        for declaration in &self.evidence.canonicals {
+        for declaration in self.current_canonicals() {
             if declaration.state != CanonicalState::Valid {
                 continue;
             }
@@ -532,6 +724,15 @@ impl Assessment {
 }
 
 /// Build the one assessment every view reads.
+/// Turn a renderer's stop reason into a sentence fragment for guidance text.
+fn reason_sentence(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return String::new();
+    }
+    format!(" {}.", reason.trim_end_matches('.'))
+}
+
 pub fn assess(
     page_url: &str,
     status: u16,
@@ -539,10 +740,12 @@ pub fn assess(
     redirect_to: &str,
     error: &str,
     evidence: PageEvidence,
+    capture: CaptureInfo,
 ) -> Assessment {
     let mut assessment = Assessment {
         page_url: page_url.to_string(),
         evidence,
+        capture,
         ..Assessment::default()
     };
     assessment.evidence.bound();
@@ -551,7 +754,7 @@ pub fn assess(
     let canonical = canonical_findings(&assessment);
     let mut findings: Vec<Finding> = Vec::new();
 
-    let label = if !error.trim().is_empty() {
+    let mut label = if !error.trim().is_empty() {
         findings.push(Finding::new(
             FindingCode::FetchFailed,
             Severity::Issue,
@@ -707,12 +910,126 @@ pub fn assess(
             findings.push(Finding::new(
                 FindingCode::NoBlockFound,
                 Severity::Info,
-                "No noindex or canonical concern found in the supported checks",
-                "This is not confirmation that Google has indexed the URL.",
+                "No noindex directive or canonical issue detected in supported checks",
+                "Google may still choose a different canonical or leave the URL out of its index.",
             ));
         }
         label
     };
+
+    // Capture completeness is reported for every response status, not only a 200 page: a
+    // timed-out or blocked browser must not look like a clean HTML check.
+    let mut capture_findings: Vec<Finding> = Vec::new();
+    if let Some(render) = assessment.capture.render.as_ref() {
+        let reason = reason_sentence(&render.reason);
+        if render.state != crate::render::RenderState::Captured {
+            capture_findings.push(Finding::new(
+                FindingCode::CaptureIncomplete,
+                Severity::Advisory,
+                format!(
+                    "Browser capture {}: {}",
+                    render.state.label().to_lowercase(),
+                    if render.rendered_captured {
+                        "the rendered document was captured, but loading did not finish"
+                    } else {
+                        "the rendered document was not captured"
+                    }
+                ),
+                format!(
+                    "Facts shown may be incomplete because the page never finished rendering.{reason} This is not proof that a rule is absent."
+                ),
+            ));
+            if label == Label::NoBlockFound {
+                label = Label::NotAssessed;
+            }
+        } else if render.rendered_truncated {
+            capture_findings.push(Finding::new(
+                FindingCode::BodyTruncated,
+                Severity::Advisory,
+                "The rendered DOM was truncated at the evidence cap",
+                format!(
+                    "Later directives, canonicals or links may not have been seen.{reason} The assessment is incomplete."
+                ),
+            ));
+            if label == Label::NoBlockFound {
+                label = Label::NotAssessed;
+            }
+        } else if !render.source_state.is_complete() {
+            // A missing or capped source body hides any restriction that scripts removed. It
+            // must never be presented as a clean result, even when the rendered DOM is whole.
+            let source_reason = reason_sentence(&render.source_note);
+            capture_findings.push(Finding::new(
+                FindingCode::CaptureIncomplete,
+                Severity::Advisory,
+                if render.source_state == SourceState::Unavailable {
+                    "The pre-script source body was not captured".to_string()
+                } else {
+                    format!(
+                        "The pre-script source body was {}",
+                        render.source_state.label().to_lowercase()
+                    )
+                },
+                format!(
+                    "A noindex or canonical that scripts removed could have been missed.{source_reason} This is not proof that a rule is absent."
+                ),
+            ));
+            if label == Label::NoBlockFound {
+                label = Label::NotAssessed;
+            }
+        } else if !render.resource_failures.is_empty() {
+            // A failed script can leave the application shell unhydrated. The document loaded,
+            // but content the script would have added is missing.
+            let first = &render.resource_failures[0];
+            let more = render.resource_failures.len().saturating_sub(1);
+            capture_findings.push(Finding::new(
+                FindingCode::CaptureIncomplete,
+                Severity::Advisory,
+                format!("A required script failed: {}", first.url),
+                format!(
+                    "The rendered page may be missing content that this script would have added ({}: {}){}. This is not proof that a rule is absent.",
+                    first.resource_type,
+                    first.error,
+                    if more == 0 {
+                        String::new()
+                    } else {
+                        format!(" and {more} more")
+                    }
+                ),
+            ));
+            if label == Label::NoBlockFound {
+                label = Label::NotAssessed;
+            }
+        }
+        if assessment.capture.mode == CaptureMode::Browser
+            && render.rendered_captured
+            && render.source_state == SourceState::Captured
+            && !assessment.evidence.truncated
+        {
+            let rendered: Vec<CanonicalDeclaration> = assessment
+                .evidence
+                .canonicals
+                .iter()
+                .filter(|declaration| declaration.stage == EvidenceStage::Rendered)
+                .cloned()
+                .collect();
+            let source: Vec<CanonicalDeclaration> = assessment
+                .evidence
+                .canonicals
+                .iter()
+                .filter(|declaration| declaration.stage == EvidenceStage::Document)
+                .cloned()
+                .collect();
+            if canonical_changed(&rendered, &source) {
+                capture_findings.push(Finding::new(
+                    FindingCode::CanonicalChanged,
+                    Severity::Advisory,
+                    "Scripts changed the canonical declaration",
+                    "The source HTML and the rendered DOM declared different canonicals. The rendered document is assessed; the source declaration is kept as historical evidence.",
+                ));
+            }
+        }
+    }
+    findings.append(&mut capture_findings);
 
     // Keep header evidence visible even when a response fact wins the primary label.
     if label != Label::Noindex {
@@ -769,7 +1086,7 @@ pub fn assess(
         .iter()
         .any(|finding| finding.severity == Severity::Issue);
     assessment.canonical_attention =
-        assessment.evidence.canonicals.is_empty() || canonical.review || canonical.elsewhere;
+        assessment.current_canonicals().next().is_none() || canonical.review || canonical.elsewhere;
     assessment
 }
 
@@ -780,7 +1097,7 @@ struct CanonicalFindings {
 }
 
 fn canonical_findings(assessment: &Assessment) -> CanonicalFindings {
-    let declarations = &assessment.evidence.canonicals;
+    let declarations: Vec<&CanonicalDeclaration> = assessment.current_canonicals().collect();
     let mut findings = Vec::new();
     let mut review = false;
     let mut elsewhere = false;
@@ -964,6 +1281,15 @@ fn title_case(value: &str) -> String {
 
 /// Parse a `<meta name="robots">` or agent-specific robots meta tag.
 pub fn parse_meta_directive(name: &str, content: &str) -> Option<RobotsDirective> {
+    parse_meta_directive_staged(name, content, EvidenceStage::Document)
+}
+
+/// Parse one robots meta tag, recording which capture produced it.
+pub fn parse_meta_directive_staged(
+    name: &str,
+    content: &str,
+    stage: EvidenceStage,
+) -> Option<RobotsDirective> {
     let name = name.trim();
     let content = content.trim();
     let generic = name.eq_ignore_ascii_case("robots");
@@ -983,6 +1309,7 @@ pub fn parse_meta_directive(name: &str, content: &str) -> Option<RobotsDirective
     let tokens = directive_tokens(content);
     Some(RobotsDirective {
         source: EvidenceSource::Meta,
+        stage,
         agent,
         noindex: tokens
             .iter()
@@ -1044,6 +1371,7 @@ pub fn parse_x_robots_tag(values: &[&str]) -> (Vec<RobotsDirective>, bool, Omitt
             truncated |= cut || agent_cut;
             directives.push(RobotsDirective {
                 source: EvidenceSource::Header,
+                stage: EvidenceStage::Document,
                 agent,
                 noindex,
                 nofollow,
@@ -1057,10 +1385,20 @@ pub fn parse_x_robots_tag(values: &[&str]) -> (Vec<RobotsDirective>, bool, Omitt
 
 /// Resolve one canonical href against the page's base URL.
 pub fn canonical_declaration(raw: Option<&str>, base: &Url) -> CanonicalDeclaration {
+    canonical_declaration_staged(raw, base, EvidenceStage::Document)
+}
+
+/// Resolve one canonical href and record which capture produced it.
+pub fn canonical_declaration_staged(
+    raw: Option<&str>,
+    base: &Url,
+    stage: EvidenceStage,
+) -> CanonicalDeclaration {
     let raw_value = raw.unwrap_or("").trim();
     if raw_value.is_empty() {
         return CanonicalDeclaration {
             raw: String::new(),
+            stage,
             resolved: None,
             resolved_hash: None,
             state: CanonicalState::Empty,
@@ -1075,6 +1413,7 @@ pub fn canonical_declaration(raw: Option<&str>, base: &Url) -> CanonicalDeclarat
             let (resolved, target_truncated) = truncate(&target, MAX_EVIDENCE_CHARS);
             CanonicalDeclaration {
                 raw,
+                stage,
                 resolved: Some(resolved),
                 resolved_hash,
                 state: CanonicalState::Valid,
@@ -1083,12 +1422,101 @@ pub fn canonical_declaration(raw: Option<&str>, base: &Url) -> CanonicalDeclarat
         }
         _ => CanonicalDeclaration {
             raw,
+            stage,
             resolved: None,
             resolved_hash: None,
             state: CanonicalState::Invalid,
             truncated: raw_truncated,
         },
     }
+}
+
+/// Append source-stage declarations that the rendered DOM no longer contains, keeping a
+/// restriction scripts removed visible in the evidence. Identical declarations are not
+/// repeated.
+pub fn merge_directives(primary: &mut Vec<RobotsDirective>, secondary: Vec<RobotsDirective>) {
+    for directive in secondary {
+        let duplicate = primary.iter().any(|existing| {
+            existing.source == directive.source
+                && existing
+                    .raw
+                    .trim()
+                    .eq_ignore_ascii_case(directive.raw.trim())
+                && match (existing.agent.as_deref(), directive.agent.as_deref()) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    _ => false,
+                }
+        });
+        if !duplicate {
+            primary.push(directive);
+        }
+    }
+}
+
+/// Keep a canonical that existed in the source HTML but was replaced by scripts.
+pub fn merge_canonicals(
+    primary: &mut Vec<CanonicalDeclaration>,
+    secondary: Vec<CanonicalDeclaration>,
+) {
+    for declaration in secondary {
+        // Only fold a declaration that repeats the same stage. An identical declaration in
+        // another stage is a separate observation: dropping it would make an unchanged
+        // canonical look like a cross-stage removal.
+        let duplicate = primary.iter().any(|existing| {
+            existing.stage == declaration.stage
+                && existing.state == declaration.state
+                && existing.resolved_hash == declaration.resolved_hash
+                && existing
+                    .raw
+                    .trim()
+                    .eq_ignore_ascii_case(declaration.raw.trim())
+        });
+        if !duplicate {
+            primary.push(declaration);
+        }
+    }
+}
+
+/// Whether scripts changed the canonical declarations relative to the source HTML.
+///
+/// A replacement is a change across captures, not two simultaneous declarations. Comparing
+/// stages as sets covers replacement, removal, addition and malformed-to-valid changes without
+/// inventing a conflict inside either capture.
+pub fn canonical_changed(
+    rendered: &[CanonicalDeclaration],
+    source: &[CanonicalDeclaration],
+) -> bool {
+    if rendered.is_empty() && source.is_empty() {
+        return false;
+    }
+    canonical_signature(rendered) != canonical_signature(source)
+}
+
+type CanonicalSignature = (Vec<[u8; 32]>, usize, Vec<String>);
+
+fn canonical_signature(declarations: &[CanonicalDeclaration]) -> CanonicalSignature {
+    let mut valid: Vec<[u8; 32]> = Vec::new();
+    let mut empty = 0_usize;
+    let mut invalid: Vec<String> = Vec::new();
+    for declaration in declarations {
+        match declaration.state {
+            CanonicalState::Valid => {
+                if let Some(hash) = declaration.resolved_hash {
+                    valid.push(hash);
+                }
+            }
+            CanonicalState::Empty => empty += 1,
+            CanonicalState::Invalid => {
+                invalid.push(declaration.raw.trim().to_ascii_lowercase());
+            }
+        }
+    }
+    valid.sort_unstable();
+    valid.dedup();
+    invalid.sort();
+    invalid.dedup();
+    (valid, empty, invalid)
 }
 
 fn directive_tokens(content: &str) -> Vec<String> {
@@ -1160,6 +1588,7 @@ mod tests {
     fn meta(agent: Option<&str>, raw: &str) -> RobotsDirective {
         let tokens = directive_tokens(raw);
         RobotsDirective {
+            stage: EvidenceStage::Document,
             source: EvidenceSource::Meta,
             agent: agent.map(str::to_string),
             raw: raw.to_string(),
@@ -1175,6 +1604,7 @@ mod tests {
 
     fn canonical(raw: &str, target: &str) -> CanonicalDeclaration {
         CanonicalDeclaration {
+            stage: EvidenceStage::Document,
             raw: raw.to_string(),
             resolved: Some(target.to_string()),
             resolved_hash: Some(target_hash(target)),
@@ -1184,7 +1614,15 @@ mod tests {
     }
 
     fn html200(evidence: PageEvidence) -> Assessment {
-        assess(PAGE, 200, "text/html; charset=utf-8", "", "", evidence)
+        assess(
+            PAGE,
+            200,
+            "text/html; charset=utf-8",
+            "",
+            "",
+            evidence,
+            CaptureInfo::default(),
+        )
     }
 
     #[test]
@@ -1224,6 +1662,7 @@ mod tests {
 
         let empty = html200(PageEvidence {
             canonicals: vec![CanonicalDeclaration {
+                stage: EvidenceStage::Document,
                 raw: String::new(),
                 resolved: None,
                 resolved_hash: None,
@@ -1237,6 +1676,7 @@ mod tests {
 
         let invalid = html200(PageEvidence {
             canonicals: vec![CanonicalDeclaration {
+                stage: EvidenceStage::Document,
                 raw: "mailto:x@example.com".into(),
                 resolved: None,
                 resolved_hash: None,
@@ -1349,6 +1789,7 @@ mod tests {
                 canonicals: vec![declaration],
                 ..evidence()
             },
+            CaptureInfo::default(),
         );
         assert_eq!(assessment.label, Label::NotAssessed);
         assert_eq!(assessment.canonical_issue_text(), "");
@@ -1504,6 +1945,7 @@ mod tests {
             "",
             "",
             evidence(),
+            CaptureInfo::default(),
         );
         assert_eq!(plain.label, Label::NotAssessed);
         // A successful non-HTML response is outside this HTML check, not an SEO defect.
@@ -1526,6 +1968,7 @@ mod tests {
             "",
             PageEvidence {
                 directives: vec![RobotsDirective {
+                    stage: EvidenceStage::Document,
                     source: EvidenceSource::Header,
                     agent: None,
                     raw: "noindex".into(),
@@ -1535,6 +1978,7 @@ mod tests {
                 }],
                 ..evidence()
             },
+            CaptureInfo::default(),
         );
         assert_eq!(blocked.label, Label::Noindex);
         assert!(blocked.has_confirmed_issue());
@@ -1549,6 +1993,7 @@ mod tests {
             "https://example.com/new",
             "",
             evidence(),
+            CaptureInfo::default(),
         );
         assert_eq!(redirect.label, Label::Redirect);
         assert!(redirect.reason_text().contains("Redirect to"));
@@ -1560,11 +2005,20 @@ mod tests {
             "",
             "",
             evidence(),
+            CaptureInfo::default(),
         );
         assert_eq!(no_target.label, Label::NotAssessed);
         assert!(no_target.reason_text().contains("302"));
 
-        let not_modified = assess("https://example.com/page", 304, "", "", "", evidence());
+        let not_modified = assess(
+            "https://example.com/page",
+            304,
+            "",
+            "",
+            "",
+            evidence(),
+            CaptureInfo::default(),
+        );
         assert_eq!(not_modified.label, Label::NotAssessed);
         assert!(!not_modified.needs_attention());
         assert!(not_modified.reason_text().contains("304"));
@@ -1577,6 +2031,7 @@ mod tests {
                 "",
                 "",
                 evidence(),
+                CaptureInfo::default(),
             );
             assert_eq!(assessment.label, Label::HttpError, "{status}");
             assert!(assessment.has_confirmed_issue(), "{status}");
@@ -1597,6 +2052,7 @@ mod tests {
                 read: ReadState::Failed,
                 ..evidence()
             },
+            CaptureInfo::default(),
         );
         assert_eq!(failed.label, Label::FetchFailed);
 
@@ -1610,6 +2066,7 @@ mod tests {
                 read: ReadState::Truncated,
                 ..evidence()
             },
+            CaptureInfo::default(),
         );
         assert_eq!(truncated.label, Label::NotAssessed);
         assert!(truncated.reason_text().contains("truncated"));
@@ -1624,6 +2081,7 @@ mod tests {
                 read: ReadState::NotRead,
                 ..evidence()
             },
+            CaptureInfo::default(),
         );
         assert_eq!(unread.label, Label::NotAssessed);
         assert!(unread.needs_attention());
@@ -1649,6 +2107,7 @@ mod tests {
     fn evidence_cap_keeps_applicable_restrictions_from_omitted_entries() {
         let index = meta(None, "index");
         let noindex_header = RobotsDirective {
+            stage: EvidenceStage::Document,
             source: EvidenceSource::Header,
             agent: None,
             raw: "noindex".into(),
@@ -1723,6 +2182,7 @@ mod tests {
                 directives: vec![
                     meta(None, "noindex"),
                     RobotsDirective {
+                        stage: EvidenceStage::Document,
                         source: EvidenceSource::Header,
                         agent: Some("googlebot".into()),
                         raw: "noindex".into(),
@@ -1734,6 +2194,7 @@ mod tests {
                 canonicals: vec![canonical("/other", "https://example.com/other")],
                 ..evidence()
             },
+            CaptureInfo::default(),
         );
         assert_eq!(
             assessment.reason_text(),
@@ -1744,5 +2205,325 @@ mod tests {
                 .evidence_text()
                 .contains("canonical /other → https://example.com/other")
         );
+    }
+
+    #[test]
+    fn missing_or_capped_source_evidence_never_reports_no_block_found() {
+        for source_state in [
+            SourceState::Unavailable,
+            SourceState::TooLarge,
+            SourceState::Truncated,
+        ] {
+            let assessment = assess(
+                PAGE,
+                200,
+                "text/html",
+                "",
+                "",
+                evidence(),
+                browser_capture(crate::render::RenderState::Captured, true, source_state),
+            );
+            assert_eq!(assessment.label, Label::NotAssessed, "{source_state:?}");
+            assert!(!assessment.capture.is_complete());
+            assert!(
+                assessment
+                    .findings
+                    .iter()
+                    .any(|finding| finding.code == FindingCode::CaptureIncomplete),
+                "{source_state:?} keeps an explicit incomplete finding"
+            );
+            assert!(
+                assessment.capture.state_label().contains("incomplete"),
+                "{source_state:?} never exports as a plain rendered capture: {}",
+                assessment.capture.state_label()
+            );
+        }
+
+        // A complete source still permits a clean result.
+        let complete = assess(
+            PAGE,
+            200,
+            "text/html",
+            "",
+            "",
+            evidence(),
+            browser_capture(
+                crate::render::RenderState::Captured,
+                true,
+                SourceState::Captured,
+            ),
+        );
+        assert_eq!(complete.label, Label::NoBlockFound);
+        assert!(complete.capture.is_complete());
+    }
+
+    #[test]
+    fn staged_canonicals_are_assessed_per_capture_not_as_conflicts() {
+        // Replacement.
+        let mut source_old = canonical("/old", "https://example.com/old");
+        source_old.stage = EvidenceStage::Document;
+        let mut rendered_new = canonical("/new", "https://example.com/new");
+        rendered_new.stage = EvidenceStage::Rendered;
+        let replacement = assess(
+            PAGE,
+            200,
+            "text/html",
+            "",
+            "",
+            PageEvidence {
+                canonicals: vec![source_old.clone(), rendered_new.clone()],
+                ..evidence()
+            },
+            browser_capture(
+                crate::render::RenderState::Captured,
+                true,
+                SourceState::Captured,
+            ),
+        );
+        assert_eq!(replacement.label, Label::CanonicalElsewhere);
+        assert_eq!(
+            replacement.first_valid_canonical(),
+            Some("https://example.com/new")
+        );
+        assert_eq!(replacement.canonical_issue_text(), "Points to /new");
+        assert!(
+            replacement
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalChanged)
+        );
+        assert!(
+            !replacement
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalConflict),
+            "a replacement is not two simultaneous declarations"
+        );
+        assert!(
+            replacement
+                .evidence
+                .canonicals
+                .iter()
+                .any(|declaration| declaration.stage == EvidenceStage::Document
+                    && declaration.resolved.as_deref() == Some("https://example.com/old")),
+            "source evidence is preserved"
+        );
+
+        // Removal.
+        let removal = assess(
+            PAGE,
+            200,
+            "text/html",
+            "",
+            "",
+            PageEvidence {
+                canonicals: vec![source_old.clone()],
+                ..evidence()
+            },
+            browser_capture(
+                crate::render::RenderState::Captured,
+                true,
+                SourceState::Captured,
+            ),
+        );
+        assert_eq!(removal.first_valid_canonical(), None);
+        assert_eq!(removal.canonical_issue_text(), "Missing");
+        assert!(
+            removal
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalChanged)
+        );
+        assert!(
+            !removal
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalConflict)
+        );
+
+        // Addition.
+        let addition = assess(
+            PAGE,
+            200,
+            "text/html",
+            "",
+            "",
+            PageEvidence {
+                canonicals: vec![rendered_new.clone()],
+                ..evidence()
+            },
+            browser_capture(
+                crate::render::RenderState::Captured,
+                true,
+                SourceState::Captured,
+            ),
+        );
+        assert_eq!(
+            addition.first_valid_canonical(),
+            Some("https://example.com/new")
+        );
+        assert!(
+            addition
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalChanged)
+        );
+        assert!(
+            !addition
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalConflict)
+        );
+
+        // Malformed source replaced by a valid rendered declaration.
+        let mut malformed = canonical("mailto:x@example.com", "https://example.com/old");
+        malformed.stage = EvidenceStage::Document;
+        malformed.state = CanonicalState::Invalid;
+        malformed.resolved = None;
+        malformed.resolved_hash = None;
+        let fixed = assess(
+            PAGE,
+            200,
+            "text/html",
+            "",
+            "",
+            PageEvidence {
+                canonicals: vec![malformed, rendered_new],
+                ..evidence()
+            },
+            browser_capture(
+                crate::render::RenderState::Captured,
+                true,
+                SourceState::Captured,
+            ),
+        );
+        assert_eq!(
+            fixed.first_valid_canonical(),
+            Some("https://example.com/new")
+        );
+        assert!(
+            fixed
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalChanged)
+        );
+        assert!(
+            !fixed
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalConflict)
+        );
+    }
+
+    #[test]
+    fn production_merging_keeps_an_unchanged_canonical_clean() {
+        let base = Url::parse(PAGE).unwrap();
+        let rendered = canonical_declaration_staged(Some("/page"), &base, EvidenceStage::Rendered);
+        let source = canonical_declaration_staged(Some("/page"), &base, EvidenceStage::Document);
+        let mut merged = vec![rendered];
+        merge_canonicals(&mut merged, vec![source]);
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "identical declarations in different stages are separate observations"
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|declaration| declaration.stage == EvidenceStage::Document),
+            "the source observation is preserved"
+        );
+
+        let assessment = assess(
+            PAGE,
+            200,
+            "text/html",
+            "",
+            "",
+            PageEvidence {
+                canonicals: merged,
+                ..evidence()
+            },
+            browser_capture(
+                crate::render::RenderState::Captured,
+                true,
+                SourceState::Captured,
+            ),
+        );
+        assert_eq!(assessment.label, Label::NoBlockFound);
+        assert!(
+            !assessment
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalChanged),
+            "{:?}",
+            assessment.findings
+        );
+        assert!(
+            !assessment
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CanonicalConflict),
+            "{:?}",
+            assessment.findings
+        );
+    }
+
+    #[test]
+    fn a_failed_essential_script_makes_a_captured_render_incomplete() {
+        let mut capture = browser_capture(
+            crate::render::RenderState::Captured,
+            true,
+            SourceState::Captured,
+        );
+        if let Some(render) = capture.render.as_mut() {
+            render.resource_failures = vec![crate::render::ResourceFailure {
+                url: "https://example.com/app.js".into(),
+                resource_type: "Script".into(),
+                error: "net::ERR_CONTENT_LENGTH_MISMATCH".into(),
+            }];
+        }
+        assert!(!capture.is_complete());
+        let assessment = assess(PAGE, 200, "text/html", "", "", evidence(), capture);
+        assert_eq!(assessment.label, Label::NotAssessed);
+        assert!(
+            assessment
+                .findings
+                .iter()
+                .any(|finding| finding.code == FindingCode::CaptureIncomplete),
+            "{:?}",
+            assessment.findings
+        );
+        assert!(
+            assessment.capture.state_label().contains("script failed"),
+            "{}",
+            assessment.capture.state_label()
+        );
+    }
+
+    fn browser_capture(
+        state: crate::render::RenderState,
+        rendered: bool,
+        source_state: SourceState,
+    ) -> CaptureInfo {
+        CaptureInfo {
+            mode: CaptureMode::Browser,
+            render: Some(RenderSummary {
+                state,
+                reason: String::new(),
+                browser: "Chrome/test".into(),
+                observed_url: PAGE.into(),
+                source_captured: source_state == SourceState::Captured,
+                source_state,
+                source_note: String::new(),
+                rendered_captured: rendered,
+                rendered_truncated: false,
+                resource_failures: Vec::new(),
+                navigation_to: String::new(),
+                elapsed_ms: 1,
+                requests: 1,
+            }),
+        }
     }
 }

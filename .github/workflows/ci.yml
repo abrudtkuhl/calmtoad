@@ -48,4 +48,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Tests
+        # Browser mode is optional for users but not silently skippable in CI: the real-browser
+        # suite fails rather than skipping when the runner has no Chrome/Chromium.
+        env:
+          CALMTOAD_REQUIRE_BROWSER: "1"
         run: cargo test

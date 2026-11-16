@@ -34,6 +34,18 @@ scripts/perf-gate.sh
 
 The benchmark uses a synthetic site and does not make network requests. CI runs formatting, Clippy, and tests on Ubuntu, macOS, and Windows. Benchmarks run locally and do not block CI or releases.
 
+Browser mode has a real-browser integration suite against loopback fixtures:
+
+```sh
+cargo test --test browser_render -- --nocapture
+```
+
+It launches a locally installed Chrome or Chromium, never downloads one, and reports a skip when no supported browser is found. Keep these tests on loopback fixtures; do not point them at a live site.
+
+The app finds a browser from the usual per-platform locations. Set `CALMTOAD_BROWSER_PATH` to point at a specific executable or app bundle when the browser lives elsewhere. An explicit path chosen in the app is used exactly and is never silently replaced.
+
+CI sets `CALMTOAD_REQUIRE_BROWSER=1`, which turns the suite's skip into a failure if no browser can launch. The GitHub runner images provide Chrome; if a runner image stops doing so, install Chrome there or set `CALMTOAD_BROWSER_PATH` for that job. Set the variable locally when you want to verify that the real-browser tests actually ran.
+
 ## Performance
 
 The harness reports the median time per page (or per parse) for each scenario, and can emit JSON or compare against the committed baseline:
@@ -67,6 +79,20 @@ The `sample` scene is an offline fixture and can render a local screenshot:
 ```sh
 cargo run -- --scene sample --snap shots/sample.png --size 1180x740 --scale 1 --theme dark --at 0.4
 ```
+
+The `browser`, `browser-details`, `browser-evidence` (expanded details), and `browser-unavailable` scenes show Browser capture provenance, staged evidence, incomplete renders, and a machine without a usable browser. They need no network or browser.
+
+The workflow scenes are offline. `filter-empty`, `filter-findings` and `filter-incomplete` cover search/check-state outcomes; `titles-duplicate`, `h1-multiple`, `links-detail`, `response-redirect`, `canonical-detail` and `images-detail` open the contextual inspectors; `run-details`, `invalid-input`, `preparing`, `stopping`, `limited` and `failed` show run/setup state. `update-with-results` and `update-ready-with-results` keep an update strip over a populated table. Render the nine tabs plus Sitemap Files at 880x560 and 1180x740 in both themes, e.g.:
+
+```sh
+for size in 880x560 1180x740; do for theme in light dark; do
+  for scene in sample titles meta h1 response canonical images links sitemaps sitemap-files; do
+    cargo run -- --scene "$scene" --snap "shots/${scene}-${size}-${theme}.png" --size "$size" --theme "$theme"
+  done
+done; done
+```
+
+Keyboard: `Cmd/Ctrl+F` focuses result search, `Cmd/Ctrl+L` focuses the site URL, and Escape closes the inspector or an open disclosure. Table arrow keys move the visible selection. The `Run` button opens the current run's seed, limits, capture mode and coverage.
 
 The `pmprompt` scene runs a live crawl and regenerates the README screenshot (requires network access):
 

@@ -63,11 +63,11 @@ spacing:
   gutter: "20px"
   xl: "24px"
   xxl: "28px"
-  topbar: "52px"
+  topbar: "44px"
   command: "40px"
   table-row: "30px"
   table-header: "32px"
-  footer: "34px"
+  footer: "30px"
 components:
   command-bar:
     backgroundColor: "{colors.field}"
@@ -167,14 +167,14 @@ A two-ground system: carbon black or warm off-white, with a narrow neutral ladde
 
 The window is one column, top to bottom, with no outer container and no page margin beyond a 20px gutter.
 
-1. **Top bar** — 52px: nine tabs, then the crawl state at the far right. The tab row starts after the platform's titlebar inset so the macOS traffic lights never overlap a control; in full screen the inset is zero and the tabs return to the gutter. A hairline closes the bar.
+1. **Top bar** — 44px: the existing small toad mark and nine tabs, after the platform titlebar inset. Crawl and update status stay in the footer or update strip rather than competing with the tabs. A hairline closes the bar.
 2. **Progress line** — 2px, only while crawling: a hairline track with an ink fill for pages found against the cap.
-3. **Command bar** — 14px vertical padding around a 40px strip: URL field, a vertical hairline, Pages, a vertical hairline, Depth, a vertical hairline, the Use sitemaps checkbox, and the CRAWL/STOP action. The strip is one continuous outlined field group, not five separate inputs.
-4. **Section header** — 12px top and 14px bottom: the tab's name in mono, a plain-language summary, and Issues only at the right. On Sitemaps, a URLs/Files view toggle joins the header before Export CSV; the summary states files read, URLs listed, checked, blocked, skipped, not checked, pending, file errors, and any partial reason.
-5. **Results** — grows to fill the window: a full-bleed table, then a four-column detail strip pinned under it.
-6. **Status footer** — 34px: one status dot, the crawl message in mono, and SAME HOST ONLY at the right.
+3. **Command bar** — 12px above and 8px below a 40px strip: URL, Pages, Depth, HTML/Browser, Sitemaps and CRAWL/STOP. Numeric fields are compact so the URL stays readable at 880px. In Browser mode a quiet line names the detected browser and offers **Choose browser…**. The exact version/path are available on hover; an unavailable browser shows its actual error below the line. Settings remain disabled during a crawl.
+4. **Results toolbar** — 40px: one visible-versus-total count with findings and incomplete checks, a compact search field, All/Findings/Incomplete filters, **Run** details, Export, Copy visible URLs and the details toggle. Do not repeat the active tab as a second heading. Sitemaps adds compact URLs/Files controls; the full sitemap coverage breakdown and filter basis are available on hover, and Partial stays visible. Search and filter state is stored per tab and per Sitemaps view.
+5. **Results** — grows to fill the window: a full-bleed table and optional 320px details drawer. Both page and sitemap details have a bounded scroll region.
+6. **Status footer** — 30px: the crawl outcome and elapsed time, update status and version. Preserve the actual stopped/limit/error reason; truncate long text with the complete message available on hover. Do not replace coverage information with a generic completion message.
 
-Tables never sit inside a padded card. Header and cell text begin on the same 20px gutter as the section header, so every region shares one left edge. Columns use flex for content and fixed widths (96–180px) for counts and statuses; numeric columns are right-aligned. Row height is 30px, header height 32px. At 880×560 the layout holds: the table scrolls under the fixed detail strip rather than reflowing into cards.
+Tables never sit inside a padded card. Header and cell text begin on the same 20px gutter as the section header, so every region shares one left edge. Columns use flex for content and fixed widths for counts and statuses; numeric columns are right-aligned. Row height is 30px, header height 32px. At 880×560 the layout holds: results and details scroll independently rather than reflowing into cards.
 
 ### Named Rules
 **The Nameless Header Rule.** The header begins with the first tab after the traffic-light inset. No logo, wordmark, or product name sits in the window, so the name can change without touching the layout.
@@ -207,6 +207,11 @@ There is no logo, wordmark, or monogram. The first element in the header is the 
 - **Idle tab:** transparent ground, muted label and count, no ring until hover.
 - **Hover / Focus:** a 1px ring in hairline or hairline strong. No glow, no lift, no scale.
 
+### Rendering Picker
+A two-segment HTML/Browser control inside the command strip, fitted to its labels rather than filling the bar. The selected segment is a raised hairline surface in the field tone; the other is transparent muted ink. It sits between Depth and Sitemaps and carries the accessible name "Page rendering". It is visible in both modes, so HTML stays the obvious default and Browser is one click away. While a crawl runs it is disabled, because the run's capture mode was fixed when Crawl was pressed.
+
+### Browser Setup Strip
+Only in Browser mode, directly under the command bar: a small neutral dot, a readable short browser name/version and **Choose browser…** at the right. No LOCAL BROWSER label or permanently displayed filesystem path. The exact version and path remain in hover help. Checking says “Finding a browser…”. Unavailable says “Chrome or Chromium required” and displays the actual probe/path error in readable secondary text; the disabled Crawl action and empty-state recovery point to choosing a browser or using HTML. There is no install wizard or repeated disclaimer.
 ### Chips
 Not used. Status is a dot plus a mono code, not a badge.
 
@@ -216,33 +221,51 @@ Not used. The command bar is the only enclosed rectangle, and it is a control gr
 ### Inputs / Fields
 - **Style:** transparent within the 40px command strip, 12.5px sans for the URL and 11.5px mono for the numeric limits. The group carries the 1px hairline and 4px radius.
 - **Focus:** a 1px ring on the whole command bar (focus-within), not a glow on the individual field.
-- **Disabled:** the text dims to muted while crawling; the strip keeps its geometry.
+- **Disabled:** the text dims to muted while preparing, crawling or stopping; the strip keeps its geometry.
+- **Validation:** URL, Pages and Depth are validated together by the shared start action, including keyboard submit. Invalid values mark the field, show one concise line beneath the strip and keep the previous results; the first invalid field takes focus. Intermediate text is allowed while editing.
 - **Placeholder:** faint ink at reading contrast, never lighter than necessary.
 
 ### Navigation
 Nine tabs in one row: Internal, Titles, Meta, H1, Response, Canonical, Images, Links, and Sitemaps. Each is a ghost button containing an uppercase mono label and a separate muted count with a 6px gap. The active tab alone gets a 2px-radius neutral fill. Tabs never wrap; at narrow widths the row compresses rather than becoming a menu. Tab labels are authored in normal case and uppercased visually.
 
-Sitemaps carries URLs and Files views in the section header rather than as extra tabs. The URLs view lists each address, its state, status, source file, and issue; the Files view lists each document, its origin (robots.txt, index, or guessed), state, status, URL count, and issue. Both use the same table geometry, sorting, selection, Issues only filter, and CSV export as the other tabs.
+Sitemaps carries URLs and Files views in the section header rather than as extra tabs. The URLs view lists each address, its state, status, source file, and issue; the Files view lists each document, its origin (robots.txt, index, or guessed), state, status, URL count, and issue. Both use the same table geometry, sorting, selection, per-view search and All/Findings/Incomplete filter, and CSV export as the other tabs.
 
-Internal uses an **INDEXABILITY** column instead of a yes/no answer. The primary label is one of Fetch failed, HTTP error, Redirect, Noindex, Review canonical, Canonical elsewhere, Not assessed, or No block found. The full reasons and raw evidence live in the drawer and the Internal CSV; the row keeps only the label so the address stays readable at 880px.
+Internal uses an **INDEXABILITY** column instead of a yes/no answer. The primary label is one of Fetch failed, HTTP error, Redirect, Noindex, Review canonical, Canonical elsewhere, Not assessed, or No indexing block detected. The full reasons and raw evidence live in the drawer and the Internal CSV; the row keeps only the label so the address stays readable at 880px. The Internal CSV adds **CAPTURE** after **INDEXABILITY**, and the Sitemaps URLs CSV adds **CAPTURE** after **SOURCE**, using the drawer's state wording and appending the renderer's stop reason when a Browser capture is incomplete.
 
 ### Table
 - **Header:** 32px tall, 10px mono uppercase labels in muted ink, sortable with an arrow on the active column.
 - **Rows:** 30px, no zebra striping, a hairline rule between rows only. The selected row uses an 8% ink wash in dark mode and 6% in light.
 - **Cells:** sans for content, mono and right-aligned for status codes and counts. Long URLs and titles truncate with an ellipsis rather than wrapping.
-- **Issues:** empty issues read "OK" in muted ink; hard failures are red; soft issues are amber. A non-auditable page shows a faint em dash, because a 404 has no title to judge. Indexability follows the same three-level signal: Fetch failed, HTTP error, and Noindex are red; Redirect, Review canonical, and Canonical elsewhere are amber; Not assessed is muted; No block found is green. Missing canonicals and other informational absences stay amber or muted, never red. A successful non-HTML response is informational context: it reads Not assessed in muted ink and does not join Issues only or sitemap issue counts.
+- **Default order:** Internal sorts by indexability severity, with fetch failures, HTTP errors, and noindex first. Other tabs sort rows with findings first, incomplete checks next, and clean rows last; sortable headers let users choose a different order.
+- **Issues:** empty issues read "OK" in muted ink; hard failures are red; soft issues are amber. Findings may include a confirmed noindex, error or broken link even when the same row is also incomplete; completed content checks remain withheld. A non-auditable page shows a faint em dash, because a 404 has no title to judge. Indexability follows the same three-level signal: Fetch failed, HTTP error, and Noindex are red; Redirect, Review canonical, and Canonical elsewhere are amber; Not assessed is muted; No indexing block detected is green. Missing canonicals and other informational absences stay amber or muted, never red. A successful non-HTML response is informational context: it reads Not assessed in muted ink and does not join Findings or sitemap issue counts.
 
-### Page Details Drawer
-The drawer sits to the right of the results table and starts hidden. Selecting a result opens it; the page-details icon in the results header toggles it. The header shows the selected URL with copy and open-in-browser icon buttons. The scrollable body leads with the indexability label, every finding with its severity and conditional guidance, each canonical declaration and whether its target was fetched or left unchecked, every robots meta and `X-Robots-Tag` declaration with its scope, whether evidence was capped, and the read state. An applicable restriction found beyond the retained evidence cap is still named, with a note that its raw declaration was not captured. The ordinary page fields follow below a hairline: Title, Meta description, H1, Canonical, status, word count, content type, and image alt counts. Missing values are an em dash in faint ink. On Sitemaps, the drawer shows the selected URL's state, status, source files, finding, indexability reasons and evidence, redirect, canonical targets, and content type, or the selected file's origin, state, status, document kind, depth, entry counts, and issue.
+### Contextual Inspector
+The 320px inspector starts hidden and opens when a visible result is selected or the details control is pressed. Its fixed header names the active view, with Previous/Next visible-result controls, a close control, and copy/open actions for the selected URL. The scrollable body leads with the selected tab's finding, not generic indexability:
+
+- Internal leads with the evidence-backed assessment and its primary reason, keeping staged evidence and capture provenance in disclosures.
+- Titles and Meta show the full value, measured character count, the existing Duplicate/Too long/Too short result, and clickable duplicate peers. The length ranges are named as this tool's heuristic.
+- H1 lists every captured H1 in order and duplicate peers; a Multiple finding is never reduced to the joined row text.
+- Response shows the actual status or error, redirect destination and known chain, with fetched targets inspectable and unchecked targets openable/copyable.
+- Canonical shows the assessed declaration, staged changes, and the target's observed status when fetched.
+- Images shows observed counts only when the capture completed; element-level image data is explicitly left for a future data change.
+- Links lists observed incoming sources, outgoing targets and broken targets/statuses, bounded with totals and labeled as crawl-observed rather than a site-wide backlink map.
+- Sitemaps keeps state/reason and next actions first: inspect the fetched page, inspect the source sitemap, or open/copy the target.
+
+Related in-dataset URLs are selected in the table and update the inspector without a network request; if the active search or filter would hide one, the inspector clears only the conflicting state and says so. Previous/Next follow the same visible order as the table and CSV. Long H1, duplicate and inbound/outbound relation lists mount only one 25-row window at a time, with Previous/Show next controls and a visible Showing X–Y of N label; every retained item remains reachable without cumulative mounting. Outgoing targets keep broken destinations first, and full-value copy actions remain available. Each new selection starts at the top of the inspector. Full values and evidence have copy actions; a disclosure collapsed with the triangle can also be closed with Escape, but Escape never stops a crawl. Ordinary page fields follow below one hairline, with an em dash for unknown counts rather than an invented zero. Sitemaps keeps its state, source, response, evidence and target fields in a separate bounded scroll region.
+Completed-run reporting reads the saved run snapshot, not the next-run controls: changing Sitemaps, URL or limits, or rejecting a next-run start, never rewrites the coverage, settings, units or terminal reason of the results already shown.
+
+**The Honest Capture Rule.** A browser capture that did not finish never reads as a clean page. Its capture state, missing document, and reason stay visible in the drawer, row label, sitemap entry, and CSV, and a timed-out or blocked render is Not assessed rather than “No indexing block detected”. A source restriction removed by script remains visible as source evidence; a rule still present after rendering is labeled rendered. A required script that fails to load also makes the capture incomplete: the shell may be valid HTML while the content that script would have hydrated is missing.
 
 ### Status Footer
-34px tall, hairline above. A 5px dot carries the state; the message is 10.5px mono at muted ink; SAME HOST ONLY is the right-hand 10px mono label. The footer is the only place the crawl result is stated in full, including when the page cap stopped it.
-
+30px tall with a hairline above. The 5px status dot and 10.5px mono message stay quiet. The actual crawl outcome, including a stop or page-limit reason, remains beside elapsed time. Long messages truncate with full hover help. Update status and the installed version sit at the right; neither is repeated in the tab bar.
 ### Empty State
-Centered in the results area. A 13px uppercase mono title ("Crawl a site", "Fetching pages", "Couldn't crawl") over one line of 12.5px sans copy. No illustration, no oversized icon.
+Centered in the results area. A 13px uppercase mono title ("Crawl a site", "Preparing", "Fetching pages", "Couldn't crawl", "Blocked", "Page limit", "Stopped", "No matches", "No findings in this view") over one line of 12.5px sans copy. Filtered-empty states offer Clear search and Show all. No illustration, no oversized icon. Zero findings is described as this view's result, not proof that the site is clean.
 
 ### Progress
-A 2px full-width track in hairline weak with an ink fill for pages found against the cap. It appears only while crawling and disappears without animation when the crawl ends.
+A 2px full-width track in hairline weak with an ink fill for pages found against the cap. It appears only while preparing, crawling or stopping and disappears without animation when the crawl ends.
+
+### Keyboard
+`Cmd/Ctrl+F` focuses the results search, `Cmd/Ctrl+L` focuses the site URL, and Escape closes the inspector, run details or an open evidence disclosure. `Cmd/Ctrl+F` and `Cmd/Ctrl+L` are menu equivalents marked keys-first so typing and text editing keep their normal behavior. Table arrow keys move the visible selection and the inspector follows it.
 
 ## Do's and Don'ts
 

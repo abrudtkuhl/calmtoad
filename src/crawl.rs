@@ -8,17 +8,19 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use scraper::{ElementRef, Html, Node};
 use url::Url;
 
 use crate::indexability::{
-    self, Assessment, CanonicalDeclaration, OmittedEvidence, PageEvidence, ReadState,
-    RobotsDirective,
+    self, Assessment, CanonicalDeclaration, CaptureInfo, CaptureMode, EvidenceStage,
+    OmittedEvidence, PageEvidence, ReadState, RobotsDirective,
 };
+use crate::render::{self, BrowserRenderer, Capture, RenderMode, RenderState, SourceState};
 use crate::sitemap;
 
 /// A small, dependency-free hasher for the crawl's hot maps.
@@ -95,7 +97,7 @@ pub const TITLE_MAX: usize = 60;
 pub const META_MIN: usize = 70;
 pub const META_MAX: usize = 160;
 
-const USER_AGENT: &str = "Calmtoad/0.1 (SEO spider; +https://example.com/calmtoad)";
+pub const USER_AGENT: &str = "Calmtoad/0.1 (SEO spider; +https://example.com/calmtoad)";
 /// Fetches run in parallel because almost all of a crawl is spent waiting on the network.
 /// The cap keeps us fast without hammering a small site.
 const PARALLEL_REQUESTS: usize = 16;
@@ -139,7 +141,7 @@ impl Page {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_pages: usize,
     pub max_depth: u8,
@@ -183,16 +185,21 @@ pub struct Outcome {
 }
 
 /// Per-crawl choices. Links-only callers keep the old behavior with the default.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CrawlOptions {
     /// Read the seed origin's sitemaps and schedule the URLs they list.
     pub sitemaps: bool,
+    /// Capture pages with the fast HTTP fetch or a local headless browser.
+    pub rendering: RenderMode,
+    /// An explicit Chrome/Chromium for Browser mode. `None` discovers one.
+    pub browser_path: Option<PathBuf>,
 }
 
 /// Everything the window streams while a crawl runs.
 #[derive(Clone, Debug)]
 pub enum CrawlEvent {
-    Page(Page),
+    /// Boxed because a fully assessed page is much larger than the sitemap variants.
+    Page(Box<Page>),
     SitemapFile(sitemap::SitemapFile),
     SitemapUrl(sitemap::SitemapUrl),
     SitemapPartial(String),
@@ -206,6 +213,23 @@ pub struct CrawlResult {
     pub pages: Vec<Page>,
     pub message: String,
     pub sitemap: sitemap::SitemapReport,
+    /// Why the crawl ended, as a typed fact rather than a presentation string.
+    pub outcome: CrawlOutcome,
+}
+
+/// How a crawl ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CrawlOutcome {
+    #[default]
+    Completed,
+    /// The user stopped it.
+    Stopped,
+    /// The crawl reached its page budget.
+    Limited,
+    /// No page could be checked, or startup failed.
+    Failed,
+    /// robots.txt refused the seed before any page work started.
+    Blocked,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -438,6 +462,13 @@ pub struct Audit {
     scratch: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuplicateField {
+    Title,
+    Meta,
+    H1,
+}
+
 impl Audit {
     pub fn from_pages(pages: &[Page]) -> Self {
         let mut audit = Self {
@@ -588,6 +619,121 @@ impl Audit {
     pub fn inbound(&self, page: &Page) -> usize {
         self.inbound.get(&page.url).copied().unwrap_or(0)
     }
+
+    /// Whether these rows would show a broken-link finding.
+    pub fn has_broken_links(&self, page: &Page) -> bool {
+        self.broken_links.contains_key(&page.url)
+    }
+
+    /// Other auditable pages whose title normalizes to this page's title.
+    pub fn title_duplicate_peers<'a>(&self, pages: &'a [Page], page: &Page) -> Vec<&'a Page> {
+        self.duplicate_peers(
+            pages,
+            page,
+            &page.title,
+            &self.title_dups,
+            DuplicateField::Title,
+        )
+    }
+
+    /// Other auditable pages whose meta description normalizes to this page's.
+    pub fn meta_duplicate_peers<'a>(&self, pages: &'a [Page], page: &Page) -> Vec<&'a Page> {
+        self.duplicate_peers(
+            pages,
+            page,
+            &page.meta_description,
+            &self.meta_dups,
+            DuplicateField::Meta,
+        )
+    }
+
+    /// Other auditable pages whose single H1 normalizes to this page's single H1.
+    pub fn h1_duplicate_peers<'a>(&self, pages: &'a [Page], page: &Page) -> Vec<&'a Page> {
+        if page.h1s.len() != 1 {
+            return Vec::new();
+        }
+        self.duplicate_peers(pages, page, &page.h1s[0], &self.h1_dups, DuplicateField::H1)
+    }
+
+    fn duplicate_peers<'a>(
+        &self,
+        pages: &'a [Page],
+        page: &Page,
+        value: &str,
+        dups: &FastSet<String>,
+        field: DuplicateField,
+    ) -> Vec<&'a Page> {
+        let key = norm(value);
+        if key.is_empty() || !dups.contains(&key) {
+            return Vec::new();
+        }
+        pages
+            .iter()
+            .filter(|other| other.url != page.url && auditable(other))
+            .filter(|other| {
+                let other_value = match field {
+                    DuplicateField::Title => &other.title,
+                    DuplicateField::Meta => &other.meta_description,
+                    DuplicateField::H1 => {
+                        if other.h1s.len() != 1 {
+                            return false;
+                        }
+                        &other.h1s[0]
+                    }
+                };
+                norm(other_value) == key
+            })
+            .collect()
+    }
+
+    /// Pages that contain an observed link to this page.
+    pub fn inbound_sources<'a>(&self, pages: &'a [Page], page: &Page) -> Vec<&'a Page> {
+        let mut seen: FastSet<&str> = FastSet::default();
+        pages
+            .iter()
+            .filter(|other| other.url != page.url)
+            .filter(|other| other.links.iter().any(|link| link == &page.url))
+            .filter(|other| seen.insert(other.url.as_str()))
+            .collect()
+    }
+
+    /// Follow the redirect target chain for this page, stopping at a repeat or eight hops.
+    pub fn redirect_chain(&self, page: &Page) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut seen: FastSet<&str> = FastSet::default();
+        let mut target = page.redirect_to.as_str();
+        while !target.is_empty() && chain.len() < 8 && seen.insert(target) {
+            chain.push(target.to_string());
+            let Some(next) = self.redirects.get(target) else {
+                break;
+            };
+            target = next;
+        }
+        chain
+    }
+}
+
+/// The content checks the result views filter on, without formatting their issue text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentCheck {
+    Title,
+    Meta,
+    H1,
+    Canonical,
+    Images,
+}
+
+/// Whether a page has a finding for `check`, using the same rules as the row audit.
+pub fn content_issue(page: &Page, audit: &Audit, check: ContentCheck) -> bool {
+    let auditable = auditable(page);
+    let mut buffer = String::new();
+    match check {
+        ContentCheck::Title => title_has_issue(page, auditable, audit, &mut buffer),
+        ContentCheck::Meta => meta_has_issue(page, auditable, audit, &mut buffer),
+        ContentCheck::H1 => h1_has_issue(page, auditable, audit, &mut buffer),
+        ContentCheck::Canonical => canonical_has_issue(page, auditable),
+        ContentCheck::Images => auditable && page.images_missing_alt > 0,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -690,6 +836,9 @@ pub fn auditable(page: &Page) -> bool {
             page.indexability.evidence.read,
             ReadState::Failed | ReadState::Truncated | ReadState::NotRead
         )
+        // An incomplete Browser capture can look whole while scripts, source evidence or the
+        // document itself were cut short. Content audits wait until the capture is complete.
+        && page.indexability.capture.is_complete()
 }
 
 pub fn title_issue(page: &Page, audit: &Audit) -> String {
@@ -828,6 +977,7 @@ pub fn crawl_site(seed: &str) -> Outcome {
         true,
         CrawlOptions::default(),
         None,
+        None,
         &mut |_| {},
     );
     Outcome {
@@ -853,6 +1003,7 @@ pub fn crawl_site_stream(
         true,
         CrawlOptions::default(),
         Some(cancel),
+        None,
         &mut |event| {
             if let CrawlEvent::Page(page) = event {
                 on_page(&page);
@@ -866,23 +1017,53 @@ pub fn crawl_site_stream(
 }
 
 /// Crawl with sitemap discovery and stream every update as it happens.
+///
+/// Browser mode launches one local browser for the whole crawl. A missing or unusable browser
+/// is reported before any page work starts, so HTML mode never pays for a browser check.
 pub fn crawl_site_with(
     seed: &str,
     limits: Limits,
     options: CrawlOptions,
-    cancel: &AtomicBool,
+    cancel: Arc<AtomicBool>,
     mut on_event: impl FnMut(CrawlEvent),
 ) -> CrawlResult {
-    crawl_engine(
+    let browser = match options.rendering {
+        RenderMode::Html => None,
+        RenderMode::Browser => {
+            let config = render::RenderConfig {
+                browser_path: options.browser_path.clone(),
+                ..render::RenderConfig::default()
+            };
+            match BrowserRenderer::launch(config, cancel.clone()) {
+                Ok(renderer) => Some(renderer),
+                Err(reason) => {
+                    return CrawlResult {
+                        message: reason,
+                        pages: Vec::new(),
+                        sitemap: sitemap::SitemapReport::default(),
+                        outcome: CrawlOutcome::Failed,
+                    };
+                }
+            }
+        }
+    };
+    let job = browser.as_ref().map(|renderer| BrowserJob {
+        renderer,
+        cancel: cancel.clone(),
+    });
+    let result = crawl_engine(
         seed,
         limits,
         |url| fetch(agent(), url),
-        |url, before, backoff| fetch_sitemap(agent(), url, Some(cancel), before, backoff),
+        |url, before, backoff| fetch_sitemap(agent(), url, Some(&cancel), before, backoff),
         true,
         options,
-        Some(cancel),
+        Some(&cancel),
+        job,
         &mut on_event,
-    )
+    );
+    drop(browser);
+    result
 }
 
 /// A shared agent keeps its connection pool (and TLS sessions) warm between crawls, so
@@ -902,17 +1083,27 @@ fn agent() -> &'static ureq::Agent {
 }
 
 /// A fetched page on its way from a worker to the crawl loop.
+/// A launched browser and the stop flag shared by every page it renders.
+#[derive(Clone)]
+struct BrowserJob<'a> {
+    renderer: &'a BrowserRenderer,
+    cancel: Arc<AtomicBool>,
+}
+
 struct FetchedPage {
     url: String,
     depth: u8,
     fetched: Fetched,
     parsed: Option<Parsed>,
+    /// The pre-script source document, kept only when the rendered DOM was also parsed.
+    source: Option<Parsed>,
+    capture: CaptureInfo,
 }
 
 /// Page results and sitemap discovery share one channel so the loop can end only after
 /// both kinds of work report completion.
 enum EngineEvent {
-    Page(FetchedPage),
+    Page(Box<FetchedPage>),
     SitemapFile(sitemap::SitemapFile),
     SitemapUrl(sitemap::SitemapUrl),
     SitemapPartial(String),
@@ -1003,6 +1194,7 @@ pub fn crawl_with(seed: &str, limits: Limits, fetch: impl Fn(&str) -> Fetched + 
         false,
         CrawlOptions::default(),
         None,
+        None,
         &mut |_| {},
     );
     Outcome {
@@ -1032,6 +1224,7 @@ pub fn crawl_with_options(
         false,
         options,
         cancel,
+        None,
         &mut on_event,
     )
 }
@@ -1045,6 +1238,7 @@ fn crawl_engine(
     cache_robots: bool,
     options: CrawlOptions,
     cancel: Option<&AtomicBool>,
+    browser: Option<BrowserJob<'_>>,
     on_event: &mut dyn FnMut(CrawlEvent),
 ) -> CrawlResult {
     let no_cancel = AtomicBool::new(false);
@@ -1055,6 +1249,7 @@ fn crawl_engine(
         Err(message) => {
             return CrawlResult {
                 message,
+                outcome: CrawlOutcome::Failed,
                 ..CrawlResult::default()
             };
         }
@@ -1080,6 +1275,7 @@ fn crawl_engine(
         return CrawlResult {
             pages: Vec::new(),
             message: format!("Blocked by robots.txt · {host}"),
+            outcome: CrawlOutcome::Blocked,
             ..CrawlResult::default()
         };
     }
@@ -1100,7 +1296,29 @@ fn crawl_engine(
         ..Work::default()
     });
     let wake = Condvar::new();
-    let workers = limits.max_pages.min(PARALLEL_REQUESTS);
+    // Browser pages are far heavier than HTTP fetches, so Browser mode runs at most two at a
+    // time. HTML mode keeps the wide pool that makes it fast.
+    let workers = if browser.is_some() {
+        limits.max_pages.min(render::MAX_CONCURRENCY)
+    } else {
+        limits.max_pages.min(PARALLEL_REQUESTS)
+    };
+    // A browser may only request documents that the crawl would itself schedule. This closure
+    // is consulted before a navigation leaves the browser, so scripts cannot widen the crawl.
+    let browser_allowed: Option<render::UrlFilter> = browser.as_ref().map(|_| {
+        let host = host.clone();
+        let robots = robots.clone();
+        let allowed = move |url: &str| {
+            let Ok(url) = Url::parse(url) else {
+                return false;
+            };
+            same_host(&url, &host)
+                && robots
+                    .as_ref()
+                    .is_none_or(|robots| robots.allows(&request_path(&url)))
+        };
+        Arc::new(allowed) as render::UrlFilter
+    });
     let mut discovery_done = !options.sitemaps;
     let mut sitemap_report = sitemap::SitemapReport::default();
     sitemap_report.discovery_done = discovery_done;
@@ -1113,6 +1331,8 @@ fn crawl_engine(
             let shared = &shared;
             let wake = &wake;
             let fetch = &fetch;
+            let browser_allowed = browser_allowed.clone();
+            let browser = browser.as_ref();
             scope.spawn(move || {
                 loop {
                     let (url, depth) = {
@@ -1132,20 +1352,27 @@ fn crawl_engine(
                     }
                     // A panicking fetcher must still produce a result, or the crawl loop would
                     // wait forever for this URL.
-                    let (fetched, parsed) = catch_unwind(AssertUnwindSafe(|| {
-                        let fetched = fetch(&url);
-                        let parsed = if fetched.status == 200
-                            && is_html(&fetched.content_type, &fetched.body)
-                        {
-                            Some(parse_html(&fetched.body))
+                    let (fetched, parsed, source, capture) = catch_unwind(AssertUnwindSafe(|| {
+                        if let (Some(job), Some(allowed)) = (browser, browser_allowed.as_ref()) {
+                            let capture =
+                                job.renderer
+                                    .render(&url, allowed.clone(), job.cancel.clone());
+                            browser_page(&capture)
                         } else {
-                            None
-                        };
-                        // The body is no longer needed once parsed; dropping it here keeps large
-                        // pages from crossing the channel into the crawl loop.
-                        let mut fetched = fetched;
-                        fetched.body = String::new();
-                        (fetched, parsed)
+                            let fetched = fetch(&url);
+                            let parsed = if fetched.status == 200
+                                && is_html(&fetched.content_type, &fetched.body)
+                            {
+                                Some(parse_html(&fetched.body))
+                            } else {
+                                None
+                            };
+                            // The body is no longer needed once parsed; dropping it here keeps
+                            // large pages from crossing the channel into the crawl loop.
+                            let mut fetched = fetched;
+                            fetched.body = String::new();
+                            (fetched, parsed, None, CaptureInfo::html())
+                        }
                     }))
                     .unwrap_or_else(|_| {
                         (
@@ -1154,6 +1381,8 @@ fn crawl_engine(
                                 ..Fetched::default()
                             },
                             None,
+                            None,
+                            CaptureInfo::default(),
                         )
                     });
                     if fetched.status == 429 || fetched.status == 503 {
@@ -1168,12 +1397,14 @@ fn crawl_engine(
                         wake.notify_all();
                     }
                     if tx
-                        .send(EngineEvent::Page(FetchedPage {
+                        .send(EngineEvent::Page(Box::new(FetchedPage {
                             url,
                             depth,
                             fetched,
                             parsed,
-                        }))
+                            source,
+                            capture,
+                        })))
                         .is_err()
                     {
                         return;
@@ -1325,30 +1556,24 @@ fn crawl_engine(
                 depth,
                 fetched,
                 parsed,
-            } = result;
-            let page_url = if parsed.is_some() || (300..400).contains(&fetched.status) {
-                Url::parse(&url).ok()
-            } else {
-                None
-            };
+                source,
+                capture,
+            } = *result;
+            let page_url =
+                if parsed.is_some() || source.is_some() || (300..400).contains(&fetched.status) {
+                    Url::parse(&url).ok()
+                } else {
+                    None
+                };
             let mut new_jobs: Vec<(String, u8)> = Vec::new();
             let mut page_links: Vec<String> = Vec::new();
             let mut canonicals: Vec<CanonicalDeclaration> = Vec::new();
 
-            if let (Some(parsed), Some(page_url)) = (parsed.as_ref(), page_url.as_ref()) {
-                let link_base = parsed
-                    .base
-                    .as_deref()
-                    .and_then(|href| resolve(page_url, href))
-                    .unwrap_or_else(|| page_url.clone());
-                for raw in &parsed.canonicals {
-                    canonicals.push(indexability::canonical_declaration(
-                        raw.as_deref(),
-                        &link_base,
-                    ));
-                }
-                for href in &parsed.links {
-                    let Some(next) = resolve(&link_base, href) else {
+            // One policy path for every discovered link, whether it came from the rendered DOM
+            // or from the source document when no rendered DOM exists.
+            let mut discover_links = |links: &[String], link_base: &Url| {
+                for href in links {
+                    let Some(next) = resolve(link_base, href) else {
                         continue;
                     };
                     if !same_host(&next, &host) || looks_like_asset(&next) {
@@ -1374,7 +1599,51 @@ fn crawl_engine(
                     committed += 1;
                     new_jobs.push((key, depth + 1));
                 }
+            };
+
+            if let (Some(parsed), Some(page_url)) = (parsed.as_ref(), page_url.as_ref()) {
+                let link_base = parsed
+                    .base
+                    .as_deref()
+                    .and_then(|href| resolve(page_url, href))
+                    .unwrap_or_else(|| page_url.clone());
+                let stage = if capture.mode == CaptureMode::Browser {
+                    EvidenceStage::Rendered
+                } else {
+                    EvidenceStage::Document
+                };
+                for raw in &parsed.canonicals {
+                    canonicals.push(indexability::canonical_declaration_staged(
+                        raw.as_deref(),
+                        &link_base,
+                        stage,
+                    ));
+                }
+                discover_links(&parsed.links, &link_base);
             }
+
+            if let (Some(source), Some(page_url)) = (source.as_ref(), page_url.as_ref()) {
+                let source_base = source
+                    .base
+                    .as_deref()
+                    .and_then(|href| resolve(page_url, href))
+                    .unwrap_or_else(|| page_url.clone());
+                let mut source_canonicals = Vec::new();
+                for raw in &source.canonicals {
+                    source_canonicals.push(indexability::canonical_declaration_staged(
+                        raw.as_deref(),
+                        &source_base,
+                        EvidenceStage::Document,
+                    ));
+                }
+                indexability::merge_canonicals(&mut canonicals, source_canonicals);
+                // Without a rendered document the source is the only document that can supply
+                // discovered links. Those links are still not a completed content audit.
+                if parsed.is_none() {
+                    discover_links(&source.links, &source_base);
+                }
+            }
+            drop(discover_links);
 
             let redirect = if (300..400).contains(&fetched.status) {
                 page_url
@@ -1402,6 +1671,33 @@ fn crawl_engine(
                 }
             }
 
+            // A script that moved the document to a new path or query is a destination, not a
+            // fact about this URL. Admit it through the same scope, robots and budget path as a
+            // discovered link, at the same depth as a replacement navigation.
+            let navigation = capture
+                .render
+                .as_ref()
+                .map(|render| render.navigation_to.as_str())
+                .filter(|to| !to.is_empty())
+                .and_then(|to| Url::parse(to).ok());
+            if let Some(next) = navigation
+                && same_host(&next, &host)
+                && !looks_like_asset(&next)
+                && robots
+                    .as_ref()
+                    .is_none_or(|robots| robots.allows(&request_path(&next)))
+            {
+                let key = url_key(next);
+                if seen.insert(key.clone()) {
+                    if committed < limits.max_pages {
+                        committed += 1;
+                        new_jobs.push((key, depth));
+                    } else {
+                        over_cap = true;
+                    }
+                }
+            }
+
             let had_html = parsed.is_some();
             let (title, meta_description, h1s, words, images, images_missing_alt, mut directives) =
                 match parsed {
@@ -1424,6 +1720,9 @@ fn crawl_engine(
                         Vec::new(),
                     ),
                 };
+            if let Some(source) = source {
+                indexability::merge_directives(&mut directives, source.robots_directives);
+            }
             directives.extend(fetched.header_directives);
             let content_type = if fetched.content_type.is_empty() && had_html {
                 "text/html".into()
@@ -1444,6 +1743,7 @@ fn crawl_engine(
                 &redirect_to,
                 &fetched.error,
                 evidence,
+                capture,
             );
             let page = Page {
                 url,
@@ -1467,7 +1767,7 @@ fn crawl_engine(
                 indexability,
             };
             sitemap_report.observe_page(&page);
-            on_event(CrawlEvent::Page(page.clone()));
+            on_event(CrawlEvent::Page(Box::new(page.clone())));
             page_index.insert(page.url.clone(), pages.len());
             pages.push(page);
 
@@ -1488,11 +1788,17 @@ fn crawl_engine(
     } else {
         format!("{} pages on {host}", pages.len())
     };
+    let mut outcome = if stopped_early {
+        CrawlOutcome::Stopped
+    } else {
+        CrawlOutcome::Completed
+    };
     if over_cap && !stopped_early {
         message.push_str(&format!(
             " · stopped at the {} page limit",
             limits.max_pages
         ));
+        outcome = CrawlOutcome::Limited;
     }
     if !stopped_early && pages.iter().all(|page| page.status == 0) {
         let why = pages
@@ -1501,6 +1807,7 @@ fn crawl_engine(
             .filter(|e| !e.is_empty())
             .unwrap_or("no response");
         message = format!("Crawl failed · {why}");
+        outcome = CrawlOutcome::Failed;
     }
     sitemap_report.discovery_done = true;
     if stopped_early {
@@ -1514,6 +1821,7 @@ fn crawl_engine(
         pages,
         message,
         sitemap: sitemap_report,
+        outcome,
     }
 }
 
@@ -1574,7 +1882,73 @@ fn is_word_block(name: &str) -> bool {
 /// The previous version ran a separate selector match for the title, meta tags, H1s, links,
 /// base, canonical, images and word blocks — eight full traversals of the DOM per page. The
 /// tree is immutable, so everything can be collected while visiting each node once.
+/// Turn one browser capture into the fetch result, parses and provenance the crawl uses.
+///
+/// The rendered DOM is the only document that supplies audited content. The pre-script source is
+/// parsed for evidence that scripts may have removed, and is used for link discovery only when no
+/// rendered DOM exists. An incomplete capture therefore keeps its source evidence without
+/// pretending the source was a completed rendered audit.
+fn browser_page(capture: &Capture) -> (Fetched, Option<Parsed>, Option<Parsed>, CaptureInfo) {
+    let mut fetched = Fetched {
+        status: capture.status,
+        content_type: capture.content_type.clone(),
+        location: capture.location.clone(),
+        ..Fetched::default()
+    };
+    let header_values: Vec<&str> = capture
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-robots-tag"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    let (directives, truncated, omitted) = indexability::parse_x_robots_tag(&header_values);
+    fetched.header_directives = directives;
+    fetched.header_truncated = truncated;
+    fetched.header_omitted = omitted;
+    if capture.state == RenderState::Failed {
+        fetched.error = capture.reason.clone();
+    }
+
+    let mut parsed = None;
+    let mut source_parsed = None;
+    if capture.status == 200 && is_html(&capture.content_type, "") {
+        if let Some(body) = capture.rendered_html.as_deref() {
+            parsed = Some(parse_html_staged(body, EvidenceStage::Rendered));
+        }
+        if let Some(body) = capture.source_html.as_deref() {
+            source_parsed = Some(parse_html_staged(body, EvidenceStage::Document));
+        }
+        // Content completeness follows the rendered DOM. Source-only captures remain available
+        // for evidence inspection but are not completed content audits.
+        fetched.read = if capture.rendered_html.is_some() {
+            if capture.rendered_truncated {
+                ReadState::Truncated
+            } else {
+                ReadState::Complete
+            }
+        } else {
+            match capture.source_state {
+                SourceState::Captured => ReadState::Complete,
+                SourceState::Truncated => ReadState::Truncated,
+                SourceState::TooLarge | SourceState::Unavailable | SourceState::NotApplicable => {
+                    ReadState::NotRead
+                }
+            }
+        };
+    }
+    (
+        fetched,
+        parsed,
+        source_parsed,
+        CaptureInfo::browser(capture),
+    )
+}
+
 fn parse_html(body: &str) -> Parsed {
+    parse_html_staged(body, EvidenceStage::Document)
+}
+
+fn parse_html_staged(body: &str, stage: EvidenceStage) -> Parsed {
     let doc = Html::parse_document(body);
 
     let mut title: Option<String> = None;
@@ -1603,10 +1977,9 @@ fn parse_html(body: &str) -> Parsed {
                         saw_description = true;
                         meta = element.attr("content").map(clean).unwrap_or_default();
                     }
-                    if let Some(directive) = element
-                        .attr("content")
-                        .and_then(|content| indexability::parse_meta_directive(name, content))
-                    {
+                    if let Some(directive) = element.attr("content").and_then(|content| {
+                        indexability::parse_meta_directive_staged(name, content, stage)
+                    }) {
                         robots_directives.push(directive);
                     }
                 }
@@ -2254,6 +2627,7 @@ pub fn indexability_sample_pages() -> Vec<Page> {
                 &page.redirect_to,
                 &page.error,
                 evidence,
+                indexability::CaptureInfo::html(),
             );
             page.noindex = page.indexability.has_noindex();
             page.canonical = page
@@ -2380,6 +2754,7 @@ fn sample_assessment(page: &Page) -> Assessment {
     if page.noindex {
         evidence.directives.push(RobotsDirective {
             source: indexability::EvidenceSource::Meta,
+            stage: indexability::EvidenceStage::Document,
             agent: None,
             raw: "noindex".into(),
             noindex: true,
@@ -2404,6 +2779,7 @@ fn sample_assessment(page: &Page) -> Assessment {
         &page.redirect_to,
         &page.error,
         evidence,
+        indexability::CaptureInfo::html(),
     )
 }
 
@@ -2712,7 +3088,7 @@ mod tests {
             max_pages: 10,
             max_depth: 2,
         };
-        let outcome = crawl_with("https://example.com/", limits.clone(), fetch);
+        let outcome = crawl_with("https://example.com/", limits, fetch);
         let urls: Vec<_> = outcome.pages.iter().map(|page| page.url.as_str()).collect();
         assert!(urls.contains(&"https://example.com/"), "{urls:?}");
         assert!(urls.contains(&"https://example.com/public"), "{urls:?}");
@@ -2763,6 +3139,7 @@ mod tests {
             false,
             CrawlOptions::default(),
             Some(&no_stop),
+            None,
             &mut |event| {
                 if let CrawlEvent::Page(page) = event {
                     all.borrow_mut().push(page.url.clone());
@@ -2793,6 +3170,7 @@ mod tests {
             false,
             CrawlOptions::default(),
             Some(&stop_after_one),
+            None,
             &mut |event| {
                 if let CrawlEvent::Page(page) = event {
                     seen.borrow_mut().push(page.url.clone());
@@ -3120,6 +3498,7 @@ mod tests {
                 directives,
                 ..PageEvidence::default()
             },
+            indexability::CaptureInfo::default(),
         );
         assert_eq!(assessment.label, indexability::Label::Noindex);
         assert!(
@@ -3143,6 +3522,7 @@ mod tests {
                 read: big.read,
                 ..PageEvidence::default()
             },
+            indexability::CaptureInfo::default(),
         );
         assert_eq!(assessment.label, indexability::Label::NotAssessed);
         assert!(assessment.reason_text().contains("truncated"));
@@ -3169,6 +3549,7 @@ mod tests {
                 omitted: cap.header_omitted,
                 ..PageEvidence::default()
             },
+            indexability::CaptureInfo::default(),
         );
         assert_eq!(assessment.label, indexability::Label::Noindex);
         assert!(assessment.has_noindex());
@@ -3199,6 +3580,7 @@ mod tests {
                 omitted: partial.header_omitted,
                 ..PageEvidence::default()
             },
+            indexability::CaptureInfo::default(),
         );
         assert_eq!(assessment.label, indexability::Label::FetchFailed);
         assert!(assessment.has_noindex());
@@ -3276,7 +3658,10 @@ mod tests {
                 max_pages: 10,
                 max_depth: 0,
             },
-            CrawlOptions { sitemaps: true },
+            CrawlOptions {
+                sitemaps: true,
+                ..CrawlOptions::default()
+            },
             fetch,
             fetch_sitemap,
             None,
@@ -3352,7 +3737,10 @@ mod tests {
                 max_pages: 10,
                 max_depth: 0,
             },
-            CrawlOptions { sitemaps: true },
+            CrawlOptions {
+                sitemaps: true,
+                ..CrawlOptions::default()
+            },
             fetch,
             fetch_sitemap,
             None,
@@ -3397,7 +3785,10 @@ mod tests {
                 max_pages: 2,
                 max_depth: 0,
             },
-            CrawlOptions { sitemaps: true },
+            CrawlOptions {
+                sitemaps: true,
+                ..CrawlOptions::default()
+            },
             fetch,
             fetch_sitemap,
             None,
@@ -3451,7 +3842,10 @@ mod tests {
                 max_pages: 10,
                 max_depth: 0,
             },
-            CrawlOptions { sitemaps: true },
+            CrawlOptions {
+                sitemaps: true,
+                ..CrawlOptions::default()
+            },
             fetch,
             fetch_sitemap,
             None,
@@ -3479,7 +3873,10 @@ mod tests {
                 max_pages: 10,
                 max_depth: 0,
             },
-            CrawlOptions { sitemaps: true },
+            CrawlOptions {
+                sitemaps: true,
+                ..CrawlOptions::default()
+            },
             fetch,
             broken,
             None,
@@ -3533,7 +3930,10 @@ mod tests {
                 max_pages: 10,
                 max_depth: 0,
             },
-            CrawlOptions { sitemaps: true },
+            CrawlOptions {
+                sitemaps: true,
+                ..CrawlOptions::default()
+            },
             fetch,
             fetch_sitemap,
             None,
@@ -3588,7 +3988,10 @@ mod tests {
                 max_pages: 0,
                 max_depth: 2,
             },
-            CrawlOptions { sitemaps: true },
+            CrawlOptions {
+                sitemaps: true,
+                ..CrawlOptions::default()
+            },
             fetch,
             fetch_sitemap,
             Some(&cancel),
@@ -3616,7 +4019,10 @@ mod tests {
                 max_pages: 4,
                 max_depth: 0,
             },
-            CrawlOptions { sitemaps: true },
+            CrawlOptions {
+                sitemaps: true,
+                ..CrawlOptions::default()
+            },
             fetch,
             fetch_sitemap,
             Some(&cancel),

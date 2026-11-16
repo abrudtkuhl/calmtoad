@@ -4,5 +4,6 @@
 pub mod crawl;
 pub mod export;
 pub mod indexability;
+pub mod render;
 pub mod sitemap;
 pub mod update;

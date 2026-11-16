@@ -1,12 +1,16 @@
 [package]
 name = "calmtoad"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A small SEO spider: crawl one host, read its sitemaps, and audit titles, meta descriptions, H1s, response codes, canonicals, images and links."
 publish = false
 
 [dependencies]
+base64 = "0.22"
+chromiumoxide = "0.9.1"
 flate2 = "1.1.11"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "io-util", "process", "sync", "macros"] }
 minisign-verify = "0.3.0"
 quick-xml = "0.41"
 rune = { git = "https://github.com/anomalyco/rune", rev = "78d22ed8eef60d76ac3f322ffc5883f3fcbc57f5", features = ["native-file-dialog"] }
