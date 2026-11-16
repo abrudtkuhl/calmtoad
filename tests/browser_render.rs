@@ -160,6 +160,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 struct Fixture {
     addr: SocketAddr,
     hits: Arc<Mutex<HashMap<String, usize>>>,
+    endless_release: Arc<AtomicBool>,
 }
 
 impl Fixture {
@@ -168,13 +169,20 @@ impl Fixture {
         let addr = listener.local_addr().expect("fixture address");
         let hits = Arc::new(Mutex::new(HashMap::new()));
         let shared = hits.clone();
+        let endless_release = Arc::new(AtomicBool::new(false));
+        let release = endless_release.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let hits = shared.clone();
-                thread::spawn(move || serve(stream, hits));
+                let release = release.clone();
+                thread::spawn(move || serve(stream, hits, release));
             }
         });
-        Self { addr, hits }
+        Self {
+            addr,
+            hits,
+            endless_release,
+        }
     }
 
     fn base(&self) -> String {
@@ -186,13 +194,24 @@ impl Fixture {
     }
 }
 
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Release the held response even if an assertion fails.
+        self.endless_release.store(true, Ordering::Relaxed);
+    }
+}
+
 fn hits_for(hits: &Arc<Mutex<HashMap<String, usize>>>, path: &str) -> usize {
     hits.lock()
         .map(|hits| hits.get(path).copied().unwrap_or(0))
         .unwrap_or(0)
 }
 
-fn serve(stream: TcpStream, hits: Arc<Mutex<HashMap<String, usize>>>) {
+fn serve(
+    stream: TcpStream,
+    hits: Arc<Mutex<HashMap<String, usize>>>,
+    endless_release: Arc<AtomicBool>,
+) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(clone) => clone,
         Err(_) => return,
@@ -267,14 +286,22 @@ fn serve(stream: TcpStream, hits: Arc<Mutex<HashMap<String, usize>>>) {
             let _ = stream.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
             );
-            let chunk = "a".repeat(1024);
-            for _ in 0..400 {
+            // Larger chunks reach Chrome's streaming notification threshold without
+            // making this correctness test depend on small-chunk buffering or CI speed.
+            let chunk = "a".repeat(32 * 1024);
+            for _ in 0..16 {
                 let frame = format!("{:x}\r\n{chunk}\r\n", chunk.len());
                 if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
-                    break;
+                    return;
                 }
                 thread::sleep(Duration::from_millis(25));
             }
+            // Never finish until the test releases us. A disabled transfer cap must
+            // produce TimedOut, not pass because this fixture happened to finish.
+            while !endless_release.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(25));
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
         }
         "/home" => write_response(&mut stream, 200, "text/html; charset=utf-8", &[], HOME),
         "/noindex-source" => write_response(
@@ -737,13 +764,11 @@ fn browser_mode_stops_a_never_finishing_response_at_the_transfer_cap() {
     };
     let fixture = Fixture::start();
     let url = format!("{}/endless", fixture.base());
-    let started = Instant::now();
     let capture = renderer.render(
         &url,
         allow_base(&fixture.base()),
         Arc::new(AtomicBool::new(false)),
     );
-    let elapsed = started.elapsed();
     assert_eq!(
         capture.state,
         RenderState::Truncated,
@@ -755,9 +780,10 @@ fn browser_mode_stops_a_never_finishing_response_at_the_transfer_cap() {
         "the cap is stated plainly: {}",
         capture.reason
     );
+    assert_eq!(capture.source_state, SourceState::TooLarge);
     assert!(
-        elapsed < Duration::from_secs(8),
-        "the cap stops loading without waiting for the body (took {elapsed:?})"
+        capture.source_html.is_none(),
+        "the held source never finished"
     );
     assert!(
         capture.transfer_bytes >= 64 * 1024,
