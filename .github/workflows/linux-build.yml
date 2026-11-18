@@ -73,7 +73,7 @@ jobs:
             objdump -T "$binary" | awk -v max="$MAX_GLIBC" '
               match($0, /GLIBC_[0-9.]+/) {
                 version = substr($0, RSTART + 6, RLENGTH - 6)
-                split(version, have, "."); split(max, limit, ".")
+                split(version, have, "[.]"); split(max, limit, "[.]")
                 if (have[1] > limit[1] || (have[1] == limit[1] && have[2] + 0 > limit[2] + 0))
                   print "  GLIBC_" version "  " $NF
               }' | sort -uV >&2
