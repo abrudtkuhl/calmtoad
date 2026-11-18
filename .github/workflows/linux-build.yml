@@ -1,0 +1,134 @@
+name: Linux build
+
+# The Linux download, built so it starts on Ubuntu 22.04 and newer. Release calls this
+# workflow to produce the published asset; CI calls it on every push so a regression shows
+# up on the pull request instead of in a published release.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit, branch, or tag to build
+        required: true
+        type: string
+      artifact:
+        description: Name of the uploaded artifact holding the download
+        required: true
+        type: string
+      retention-days:
+        required: false
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+env:
+  DOWNLOAD: Calm-Toad-Linux.tar.gz
+  # Ubuntu 22.04. A binary only runs where glibc is at least the newest symbol version it was
+  # linked against, so the build happens in that release's container. v0.6.0 was linked on
+  # Ubuntu 26.04 and needed GLIBC_2.43, which Debian 13 and Ubuntu 24.04 do not have.
+  MAX_GLIBC: "2.35"
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    container: ubuntu:22.04
+    steps:
+      - name: Install build tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            binutils build-essential ca-certificates curl git libxkbcommon-dev pkg-config
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: linux-portable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Fail if the binary needs a newer glibc than Ubuntu 22.04
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=target/release/calmtoad
+          required="$(objdump -T "$binary" | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -Vu | tail -n1)"
+          if [[ -z "$required" ]]; then
+            echo "No versioned glibc symbols found in $binary." >&2
+            exit 1
+          fi
+          echo "$binary requires GLIBC_$required; the ceiling is GLIBC_$MAX_GLIBC."
+          if [[ "$(printf '%s\n%s\n' "$required" "$MAX_GLIBC" | sort -V | tail -n1)" != "$MAX_GLIBC" ]]; then
+            echo "Symbols newer than GLIBC_$MAX_GLIBC:" >&2
+            objdump -T "$binary" | awk -v max="$MAX_GLIBC" '
+              match($0, /GLIBC_[0-9.]+/) {
+                version = substr($0, RSTART + 6, RLENGTH - 6)
+                split(version, have, "."); split(max, limit, ".")
+                if (have[1] > limit[1] || (have[1] == limit[1] && have[2] + 0 > limit[2] + 0))
+                  print "  GLIBC_" version "  " $NF
+              }' | sort -uV >&2
+            echo "This download would not start on Ubuntu 22.04." >&2
+            exit 1
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="dist/Calm Toad"
+          mkdir -p "$package"
+          cp target/release/calmtoad "$package/Calm Toad"
+          cp README.md "$package/"
+          tar -C dist -czf "dist/${DOWNLOAD}" "${package#dist/}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}
+          path: dist/${{ env.DOWNLOAD }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+
+  # Open the packaged download on the oldest supported release and on the distributions that
+  # could not start v0.6.0. --snap draws a real frame offscreen with a software Vulkan driver.
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "debian:13"]
+    runs-on: ubuntu-26.04
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install a software Vulkan driver
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends libvulkan1 mesa-vulkan-drivers
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact }}
+
+      - name: Start the app
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "$DOWNLOAD"
+          app="Calm Toad/Calm Toad"
+          ldd "$app"
+          "$app" --help > /dev/null
+          "$app" --snap smoke.png --scene sample --size 800x500
+          test -s smoke.png
+          echo "Calm Toad started and drew a frame on ${{ matrix.image }} (glibc $(ldd --version | head -n1 | awk '{ print $NF }'))."
