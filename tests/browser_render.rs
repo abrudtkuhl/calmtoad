@@ -2120,6 +2120,8 @@ fn a_stop_during_browser_startup_is_not_a_setup_failure() {
 #[cfg(unix)]
 #[test]
 fn a_stop_during_browser_preparation_returns_stopped_without_setup_failure() {
+    // Browser lifecycle checks share the process-wide owned-browser registry.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let (_dir, script) = fake_browser("#!/bin/sh\nsleep 30\n");
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_thread = cancel.clone();
@@ -2150,6 +2152,7 @@ fn a_stop_during_browser_preparation_returns_stopped_without_setup_failure() {
 #[cfg(unix)]
 #[test]
 fn browser_launch_failure_is_typed_as_setup_not_a_domain_failure() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let (_dir, script) = fake_browser("#!/bin/sh\nexit 1\n");
     let outcome = crawl_site_with(
         "https://example.com/",
