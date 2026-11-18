@@ -3,7 +3,7 @@
 User-facing changes are recorded here as work ships. Versions without a release
 date are being prepared for release.
 
-## [Unreleased]
+## [0.6.1] - 2026-11-18
 
 ### Fixed
 
