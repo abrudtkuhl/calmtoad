@@ -97,7 +97,13 @@ pub const TITLE_MAX: usize = 60;
 pub const META_MIN: usize = 70;
 pub const META_MAX: usize = 160;
 
-pub const USER_AGENT: &str = "Calmtoad/0.1 (SEO spider; +https://example.com/calmtoad)";
+/// Sent on every crawl request (HTML fetches, robots.txt, sitemaps, and Browser mode), so site
+/// owners see the release that visited them. The version comes from `Cargo.toml` at build time.
+pub const USER_AGENT: &str = concat!(
+    "CalmToad/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://calmtoad.com)"
+);
 /// Fetches run in parallel because almost all of a crawl is spent waiting on the network.
 /// The cap keeps us fast without hammering a small site.
 const PARALLEL_REQUESTS: usize = 16;

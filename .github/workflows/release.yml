@@ -218,9 +218,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-26.04
-            asset: linux-x86_64
-            download: Calm-Toad-Linux.tar.gz
           - os: macos-latest
             asset: macos-aarch64
             download: Calm-Toad-Mac-Apple-Silicon.zip
@@ -242,33 +239,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.3
 
-      - name: Prepare xkbcommon linker (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          library="$(ldconfig -p | awk '$1 == "libxkbcommon.so.0" { print $NF; exit }')"
-          if [[ -z "$library" ]]; then
-            echo "The Linux runner does not provide libxkbcommon.so.0." >&2
-            exit 1
-          fi
-          mkdir -p "$RUNNER_TEMP/xkbcommon"
-          ln -s "$library" "$RUNNER_TEMP/xkbcommon/libxkbcommon.so"
-          echo "RUSTFLAGS=-L native=$RUNNER_TEMP/xkbcommon" >> "$GITHUB_ENV"
-
       - name: Build
         run: cargo build --release --locked
-
-      - name: Prepare Linux download
-        if: runner.os == 'Linux'
-        env:
-          DOWNLOAD: ${{ matrix.download }}
-        run: |
-          set -euo pipefail
-          package="dist/Calm Toad"
-          mkdir -p "$package"
-          cp target/release/calmtoad "$package/Calm Toad"
-          cp README.md "$package/"
-          tar -C dist -czf "dist/${DOWNLOAD}" "${package#dist/}"
 
       - name: Prepare macOS app download
         if: runner.os == 'macOS'
@@ -318,8 +290,20 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Linux is built in an Ubuntu 22.04 container, checked against a glibc ceiling, and opened
+  # on Ubuntu 22.04, Ubuntu 24.04, and Debian 13 before anything is published.
+  build_linux:
+    needs: create_tag
+    if: needs.create_tag.outputs.mode == 'new'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/linux-build.yml
+    with:
+      ref: ${{ needs.create_tag.outputs.tag }}
+      artifact: release-linux-x86_64
+
   publish:
-    needs: [create_tag, build]
+    needs: [create_tag, build, build_linux]
     if: needs.create_tag.outputs.mode == 'new'
     runs-on: ubuntu-26.04
     permissions:

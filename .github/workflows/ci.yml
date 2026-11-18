@@ -53,3 +53,12 @@ jobs:
         env:
           CALMTOAD_REQUIRE_BROWSER: "1"
         run: cargo test
+
+  # The same Linux download the release publishes, so a glibc regression fails here first.
+  # Nothing is published; the artifact is kept briefly for manual testing.
+  linux-download:
+    uses: ./.github/workflows/linux-build.yml
+    with:
+      ref: ${{ github.sha }}
+      artifact: linux-x86_64-ci
+      retention-days: 3

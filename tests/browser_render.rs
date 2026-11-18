@@ -234,6 +234,7 @@ fn serve(
         *hits.entry(path.clone()).or_default() += 1;
     }
     let mut line = String::new();
+    let mut user_agent = String::new();
     while reader
         .read_line(&mut line)
         .map(|read| read > 0)
@@ -242,11 +243,32 @@ fn serve(
         if line == "\r\n" || line == "\n" {
             break;
         }
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("user-agent")
+        {
+            user_agent = value.trim().to_string();
+        }
         line.clear();
     }
 
     let mut stream = stream;
     match path.as_str() {
+        "/whoami" => {
+            // Echo the request header into the source, and let a script report the identity
+            // the page itself sees, so both halves of the browser identity are observable.
+            let escaped = user_agent
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            let body = format!(
+                "<!doctype html><html><head><title>Who am I</title></head><body>\
+                 <p id=\"header-ua\">{escaped}</p>\
+                 <script>const p = document.createElement('p'); p.id = 'script-ua'; \
+                 p.textContent = navigator.userAgent; document.body.appendChild(p);</script>\
+                 </body></html>"
+            );
+            write_response(&mut stream, 200, "text/html; charset=utf-8", &[], &body)
+        }
         "/plain" => write_response(&mut stream, 200, "text/html; charset=utf-8", &[], PLAIN),
         "/notes.txt" => write_response(
             &mut stream,
@@ -688,6 +710,47 @@ fn browser_mode_captures_scripted_dom_and_real_response_metadata() {
     assert_eq!(header(&capture, "content-type").len(), 1);
 
     renderer.shutdown();
+}
+
+#[test]
+fn browser_mode_identifies_as_the_running_release_to_servers_and_scripts() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let allowed = allow_base(&fixture.base());
+    let url = format!("{}/whoami", fixture.base());
+
+    let capture = renderer.render(&url, allowed, Arc::new(AtomicBool::new(false)));
+    assert_eq!(capture.state, RenderState::Captured, "{}", capture.reason);
+
+    let product = format!("CalmToad/{}", env!("CARGO_PKG_VERSION"));
+    let source = capture.source_html.as_deref().expect("source body");
+    let header_ua = between(source, "<p id=\"header-ua\">", "</p>");
+    assert!(
+        header_ua.starts_with(&product) && header_ua.contains("+https://calmtoad.com"),
+        "the browser's request header was {header_ua:?}"
+    );
+    let rendered = capture.rendered_html.as_deref().expect("rendered DOM");
+    let script_ua = between(rendered, "<p id=\"script-ua\">", "</p>");
+    assert_eq!(
+        script_ua, header_ua,
+        "page scripts see the same identity the server does"
+    );
+
+    renderer.shutdown();
+}
+
+fn between<'a>(haystack: &'a str, start: &str, end: &str) -> &'a str {
+    let from = haystack
+        .find(start)
+        .unwrap_or_else(|| panic!("{start} missing from {haystack}"))
+        + start.len();
+    let len = haystack[from..]
+        .find(end)
+        .unwrap_or_else(|| panic!("{end} missing after {start}"));
+    &haystack[from..from + len]
 }
 
 #[test]
