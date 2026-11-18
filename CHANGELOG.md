@@ -3,6 +3,25 @@
 User-facing changes are recorded here as work ships. Versions without a release
 date are being prepared for release.
 
+## [0.6.0] - 2026-11-17
+
+### Added
+
+- Start in Overview to see finding groups and crawl coverage, then jump straight to the matching URL tables.
+- Choose a browser application directly on macOS from Applications, including `Google Chrome.app`, and remember your choice between launches.
+
+### Improved
+
+- Explain **Use sitemap URLs** where you configure a crawl: sitemap-listed URLs share the page limit, and robots.txt still applies.
+- Show the indexability verdict once, remove mixed-meaning tab counts, and identify the capture mode of retained results when next-run settings differ.
+- Keep browser startup errors short, with Retry, Choose browser, and Use HTML recovery actions. Raw diagnostics stay under Details and can be copied.
+
+### Fixed
+
+- Treat Stop during browser preparation as a stopped run, preserving the browser selection instead of reporting an installation failure.
+- Keep successful Browser captures of PDFs and other non-HTML responses out of incomplete-check counts, while preserving real capture failures and truncation.
+- Match Overview coverage counts to the rows they open, and surface failed or skipped sitemap files even when they supplied no URLs.
+
 ## [0.5.0] - 2026-11-16
 
 ### Added

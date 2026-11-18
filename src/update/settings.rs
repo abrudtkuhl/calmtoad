@@ -21,6 +21,9 @@ pub struct Settings {
     pub last_checked: Option<u64>,
     #[serde(default)]
     pub skipped_version: Option<String>,
+    /// An explicitly chosen browser application/executable, remembered between launches.
+    #[serde(default)]
+    pub browser_path: Option<String>,
 }
 
 fn default_schema() -> u32 {
@@ -38,6 +41,7 @@ impl Default for Settings {
             auto_check: true,
             last_checked: None,
             skipped_version: None,
+            browser_path: None,
         }
     }
 }
@@ -102,6 +106,11 @@ impl Settings {
     pub fn skip_matches(&self, version: &str) -> bool {
         self.skipped_version.as_deref() == Some(version)
     }
+
+    pub fn remember_browser(&mut self, path: &Path) -> Result<()> {
+        self.browser_path = Some(path.to_string_lossy().into_owned());
+        self.save()
+    }
 }
 
 fn path_in(dir: &Path) -> PathBuf {
@@ -125,11 +134,16 @@ mod tests {
         let mut settings = Settings::default();
         settings.mark_checked();
         settings.skip("0.2.0").unwrap();
+        settings.browser_path = Some("/Applications/Google Chrome.app".into());
         settings.save_to(dir.path()).unwrap();
 
         let loaded = Settings::load_from(dir.path());
         assert!(loaded.skip_matches("0.2.0"));
         assert!(!loaded.skip_matches("0.3.0"));
+        assert_eq!(
+            loaded.browser_path.as_deref(),
+            Some("/Applications/Google Chrome.app")
+        );
         assert!(loaded.last_checked.is_some());
         assert!(!loaded.is_due());
     }

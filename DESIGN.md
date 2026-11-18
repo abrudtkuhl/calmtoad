@@ -167,10 +167,10 @@ A two-ground system: carbon black or warm off-white, with a narrow neutral ladde
 
 The window is one column, top to bottom, with no outer container and no page margin beyond a 20px gutter.
 
-1. **Top bar** — 44px: the existing small toad mark and nine tabs, after the platform titlebar inset. Crawl and update status stay in the footer or update strip rather than competing with the tabs. A hairline closes the bar.
+1. **Top bar** — 44px: the existing small toad mark and ten tabs, after the platform titlebar inset. Tabs carry bare uppercase labels with no numeric suffix; counts belong to Overview and each view's summary. Crawl and update status stay in the footer or update strip rather than competing with the tabs. A hairline closes the bar.
 2. **Progress line** — 2px, only while crawling: a hairline track with an ink fill for pages found against the cap.
-3. **Command bar** — 12px above and 8px below a 40px strip: URL, Pages, Depth, HTML/Browser, Sitemaps and CRAWL/STOP. Numeric fields are compact so the URL stays readable at 880px. In Browser mode a quiet line names the detected browser and offers **Choose browser…**. The exact version/path are available on hover; an unavailable browser shows its actual error below the line. Settings remain disabled during a crawl.
-4. **Results toolbar** — 40px: one visible-versus-total count with findings and incomplete checks, a compact search field, All/Findings/Incomplete filters, **Run** details, Export, Copy visible URLs and the details toggle. Do not repeat the active tab as a second heading. Sitemaps adds compact URLs/Files controls; the full sitemap coverage breakdown and filter basis are available on hover, and Partial stays visible. Search and filter state is stored per tab and per Sitemaps view.
+3. **Command bar** — 12px above and 8px below a 40px strip: URL, Pages, Depth, HTML/Browser, **Use sitemap URLs** and CRAWL/STOP. Numeric fields are compact so the URL stays readable at 880px. A disclosure arrow beside the sitemap checkbox opens a compact explanation; it is not a permanent strip. In Browser mode a quiet line names the detected browser and offers **Choose browser…**. Paths and diagnostics stay behind **Details**; an unavailable browser keeps Crawl disabled but never blocks retained results. Settings remain disabled during a crawl.
+4. **Results toolbar** — 40px, on table views: one visible-versus-total count with findings and incomplete checks, a compact search field, All/Findings/Incomplete filters, **Run** details, Export, Copy visible URLs and the details toggle. Overview is not a table and has no search, sort or copy toolbar. Do not repeat the active tab as a second heading. Sitemaps adds compact URLs/Files controls; the full sitemap coverage breakdown and filter basis are available on hover, and Partial stays visible. Search and filter state is stored per tab and per Sitemaps view.
 5. **Results** — grows to fill the window: a full-bleed table and optional 320px details drawer. Both page and sitemap details have a bounded scroll region.
 6. **Status footer** — 30px: the crawl outcome and elapsed time, update status and version. Preserve the actual stopped/limit/error reason; truncate long text with the complete message available on hover. Do not replace coverage information with a generic completion message.
 
@@ -193,7 +193,7 @@ There are no shadows and no raised surfaces. Depth is expressed with three tools
 
 Corners are nearly square. Fields, the command bar, and the primary action use a 4px radius; tabs use 2px. Status dots are perfect circles at 5px. The only silhouettes that recur are the rectangle and the hairline. There are no pills, no capsules, and no decorative geometry.
 
-There is no logo, wordmark, or monogram. The first element in the header is the Internal tab, aligned to the gutter.
+There is no logo, wordmark, or monogram. The first element in the header is the Overview tab, aligned to the gutter.
 
 **The Near-Square Rule.** Radii stay at 4px or below. If a shape needs to feel softer, it is probably too large for this system.
 
@@ -203,15 +203,15 @@ There is no logo, wordmark, or monogram. The first element in the header is the 
 - **Shape:** 4px radius for the command action; 2px for tabs. No pill buttons.
 - **Primary — CRAWL:** bone ink fill on carbon ground (inverted in light), ground-colored mono label at 10.5px with 1.2px tracking, 40px tall. It is the only filled control on a resting screen.
 - **Crawling — STOP:** the same geometry, but a field ground with signal red text and a hairline ring. The action changes role, not size.
-- **Active tab:** a neutral fill one step above the page, ink label, muted count.
-- **Idle tab:** transparent ground, muted label and count, no ring until hover.
+- **Active tab:** a neutral fill one step above the page, ink label.
+- **Idle tab:** transparent ground, muted label, no ring until hover.
 - **Hover / Focus:** a 1px ring in hairline or hairline strong. No glow, no lift, no scale.
 
 ### Rendering Picker
 A two-segment HTML/Browser control inside the command strip, fitted to its labels rather than filling the bar. The selected segment is a raised hairline surface in the field tone; the other is transparent muted ink. It sits between Depth and Sitemaps and carries the accessible name "Page rendering". It is visible in both modes, so HTML stays the obvious default and Browser is one click away. While a crawl runs it is disabled, because the run's capture mode was fixed when Crawl was pressed.
 
 ### Browser Setup Strip
-Only in Browser mode, directly under the command bar: a small neutral dot, a readable short browser name/version and **Choose browser…** at the right. No LOCAL BROWSER label or permanently displayed filesystem path. The exact version and path remain in hover help. Checking says “Finding a browser…”. Unavailable says “Chrome or Chromium required” and displays the actual probe/path error in readable secondary text; the disabled Crawl action and empty-state recovery point to choosing a browser or using HTML. There is no install wizard or repeated disclaimer.
+Only in Browser mode, directly under the command bar: a small neutral dot, a readable short browser name and **Retry**, **Use HTML**, **Choose browser…**, **Details** as appropriate. No LOCAL BROWSER label or permanently displayed filesystem path. The chosen application path, version and raw diagnostics stay behind **Details** with copy access. Checking says “Finding a browser…”. Unavailable gives a short truthful summary, including when the controlled launch failed after discovery; the disabled Crawl action and one-click HTML recovery remain available, while retained results stay inspectable and exportable. There is no install wizard or repeated disclaimer.
 ### Chips
 Not used. Status is a dot plus a mono code, not a badge.
 
@@ -226,7 +226,13 @@ Not used. The command bar is the only enclosed rectangle, and it is a control gr
 - **Placeholder:** faint ink at reading contrast, never lighter than necessary.
 
 ### Navigation
-Nine tabs in one row: Internal, Titles, Meta, H1, Response, Canonical, Images, Links, and Sitemaps. Each is a ghost button containing an uppercase mono label and a separate muted count with a 6px gap. The active tab alone gets a 2px-radius neutral fill. Tabs never wrap; at narrow widths the row compresses rather than becoming a menu. Tab labels are authored in normal case and uppercased visually.
+Ten tabs in one row: Overview, Internal, Titles, Meta, H1, Response, Canonical, Images, Links, and Sitemaps. Each is a ghost button containing only an uppercase mono label; the old numeric suffixes mixed crawled URLs, findings and listed URLs under one unexplained style. The active tab alone gets a 2px-radius neutral fill. Tabs never wrap; at narrow widths the row compresses rather than becoming a menu. Tab labels are authored in normal case and uppercased visually.
+
+### Overview
+
+The default view is a compact summary, not a URL table. A site/run line names the host, captured URL count, actual capture mode and live or terminal outcome. Below it, a plain list shows only nonzero finding groups — response/fetch, indexing and canonical review, titles, descriptions, headings, image alt and broken links — each with an explicit affected-URL count and a **Show** action that opens the matching table with Findings selected and any hidden query cleared. A visible note says counts are per check and may overlap; they are never summed into a unique-page claim.
+
+Coverage is separate: incomplete checks, incomplete sitemap URL checks, sitemap file findings, partial sitemap discovery, and stopped/limited/failed states stay visible. Each count uses the same existing filter its Show action opens; guessed absent sitemap roots stay informational. **No findings in completed checks** is never presented as an all-clear when coverage is missing. With no run, Overview invites a URL and Crawl. **Open URL table** and **Export CSV** keep the table and its export obvious; Cmd/Ctrl+F moves to Internal search. Overview uses cached count facts and does not rescan the dataset per frame.
 
 Sitemaps carries URLs and Files views in the section header rather than as extra tabs. The URLs view lists each address, its state, status, source file, and issue; the Files view lists each document, its origin (robots.txt, index, or guessed), state, status, URL count, and issue. Both use the same table geometry, sorting, selection, per-view search and All/Findings/Incomplete filter, and CSV export as the other tabs.
 
@@ -265,7 +271,7 @@ Centered in the results area. A 13px uppercase mono title ("Crawl a site", "Prep
 A 2px full-width track in hairline weak with an ink fill for pages found against the cap. It appears only while preparing, crawling or stopping and disappears without animation when the crawl ends.
 
 ### Keyboard
-`Cmd/Ctrl+F` focuses the results search, `Cmd/Ctrl+L` focuses the site URL, and Escape closes the inspector, run details or an open evidence disclosure. `Cmd/Ctrl+F` and `Cmd/Ctrl+L` are menu equivalents marked keys-first so typing and text editing keep their normal behavior. Table arrow keys move the visible selection and the inspector follows it.
+`Cmd/Ctrl+F` focuses the results search (from Overview it opens Internal search), `Cmd/Ctrl+L` focuses the site URL, and Escape closes the inspector, run details or an open evidence disclosure. `Cmd/Ctrl+F` and `Cmd/Ctrl+L` are menu equivalents marked keys-first so typing and text editing keep their normal behavior. Table arrow keys move the visible selection and the inspector follows it.
 
 ## Do's and Don'ts
 

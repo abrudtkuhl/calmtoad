@@ -215,6 +215,9 @@ pub struct CrawlResult {
     pub sitemap: sitemap::SitemapReport,
     /// Why the crawl ended, as a typed fact rather than a presentation string.
     pub outcome: CrawlOutcome,
+    /// A browser setup failure, separate from page/domain failures. The message stays short
+    /// for the run summary; this detail belongs behind the browser setup disclosure.
+    pub setup_failure: Option<String>,
 }
 
 /// How a crawl ended.
@@ -1037,11 +1040,23 @@ pub fn crawl_site_with(
             match BrowserRenderer::launch(config, cancel.clone()) {
                 Ok(renderer) => Some(renderer),
                 Err(reason) => {
+                    // A stop during startup is not a broken installation, and must not open
+                    // browser recovery controls.
+                    if cancel.load(Ordering::Relaxed) {
+                        return CrawlResult {
+                            message: "Stopped before the browser finished starting.".into(),
+                            pages: Vec::new(),
+                            sitemap: sitemap::SitemapReport::default(),
+                            outcome: CrawlOutcome::Stopped,
+                            setup_failure: None,
+                        };
+                    }
                     return CrawlResult {
-                        message: reason,
+                        message: "Browser could not start.".into(),
                         pages: Vec::new(),
                         sitemap: sitemap::SitemapReport::default(),
                         outcome: CrawlOutcome::Failed,
+                        setup_failure: Some(reason),
                     };
                 }
             }
@@ -1822,6 +1837,7 @@ fn crawl_engine(
         message,
         sitemap: sitemap_report,
         outcome,
+        setup_failure: None,
     }
 }
 

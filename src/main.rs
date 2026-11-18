@@ -45,6 +45,7 @@ static TOAD_MARK: Icon = Icon {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
+    Overview,
     Internal,
     Titles,
     Meta,
@@ -389,6 +390,142 @@ struct ViewCounts {
     incomplete: usize,
 }
 
+/// Cached facts for the default Overview. Computed with the same throttled count refresh as the
+/// tab help, never per frame. Group counts overlap by design and are never summed into a
+/// unique-page claim.
+#[derive(Clone, Copy, Debug, Default)]
+struct OverviewCounts {
+    pages: usize,
+    response: usize,
+    indexability: usize,
+    titles: usize,
+    descriptions: usize,
+    headings: usize,
+    images: usize,
+    links: usize,
+    incomplete: usize,
+    sitemap_incomplete: usize,
+    sitemap_file_findings: usize,
+}
+
+impl OverviewCounts {
+    fn groups(self) -> [(OverviewGroup, usize); 7] {
+        [
+            (OverviewGroup::Response, self.response),
+            (OverviewGroup::Indexability, self.indexability),
+            (OverviewGroup::Titles, self.titles),
+            (OverviewGroup::Descriptions, self.descriptions),
+            (OverviewGroup::Headings, self.headings),
+            (OverviewGroup::Images, self.images),
+            (OverviewGroup::Links, self.links),
+        ]
+    }
+
+    fn has_findings(self) -> bool {
+        self.groups().iter().any(|(_, count)| *count > 0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverviewGroup {
+    Response,
+    Indexability,
+    Titles,
+    Descriptions,
+    Headings,
+    Images,
+    Links,
+}
+
+impl OverviewGroup {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Response => "overview-response",
+            Self::Indexability => "overview-indexability",
+            Self::Titles => "overview-titles",
+            Self::Descriptions => "overview-descriptions",
+            Self::Headings => "overview-headings",
+            Self::Images => "overview-images",
+            Self::Links => "overview-links",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Response => "Response or fetch findings",
+            Self::Indexability => "Indexing and canonical review",
+            Self::Titles => "Title findings",
+            Self::Descriptions => "Meta description findings",
+            Self::Headings => "H1 findings",
+            Self::Images => "Image alt findings",
+            Self::Links => "Broken link findings",
+        }
+    }
+
+    fn help(self) -> &'static str {
+        match self {
+            Self::Response => "HTTP errors, redirects, and pages that could not be fetched",
+            Self::Indexability => {
+                "Noindex and other indexing restrictions, canonical review, and capture problems"
+            }
+            Self::Titles => "Missing, long, short, or duplicate page titles",
+            Self::Descriptions => "Missing, long, short, or duplicate meta descriptions",
+            Self::Headings => "Missing, multiple, or duplicate H1 headings",
+            Self::Images => "Images without alternative text on completed captures",
+            Self::Links => "Same-host links whose target failed in this crawl",
+        }
+    }
+
+    fn target(self) -> (Tab, CheckFilter) {
+        match self {
+            Self::Response => (Tab::Response, CheckFilter::Findings),
+            Self::Indexability => (Tab::Internal, CheckFilter::Findings),
+            Self::Titles => (Tab::Titles, CheckFilter::Findings),
+            Self::Descriptions => (Tab::Meta, CheckFilter::Findings),
+            Self::Headings => (Tab::H1, CheckFilter::Findings),
+            Self::Images => (Tab::Images, CheckFilter::Findings),
+            Self::Links => (Tab::Links, CheckFilter::Findings),
+        }
+    }
+}
+
+fn overview_counts(pages: &[Page], counts: &Counts, sitemap: &SitemapReport) -> OverviewCounts {
+    OverviewCounts {
+        pages: counts.pages,
+        response: counts.response,
+        indexability: pages
+            .iter()
+            .filter(|page| assessment_has_known_finding(&page.indexability))
+            .count(),
+        titles: counts.title,
+        descriptions: counts.meta,
+        headings: counts.h1,
+        images: counts.images,
+        links: counts.links,
+        incomplete: pages.iter().filter(|page| page_incomplete(page)).count(),
+        sitemap_incomplete: sitemap_incomplete(sitemap),
+        sitemap_file_findings: sitemap_file_findings(sitemap),
+    }
+}
+
+/// The same set the Sitemaps URLs Incomplete filter shows.
+fn sitemap_incomplete(report: &SitemapReport) -> usize {
+    report
+        .urls
+        .iter()
+        .filter(|entry| sitemap_url_incomplete(entry))
+        .count()
+}
+
+/// Known file findings, excluding guessed absence and pending discovery.
+fn sitemap_file_findings(report: &SitemapReport) -> usize {
+    report
+        .files
+        .iter()
+        .filter(|file| sitemap_file_has_finding(file))
+        .count()
+}
+
 static OPEN_LINK: Icon = Icon {
     name: "open-link",
     view: 16.0,
@@ -406,6 +543,9 @@ enum CrawlEvent {
     SitemapUrl(SitemapUrl),
     SitemapPartial(String),
     SitemapDone,
+    /// The controlled browser process failed to start. This is setup, not a page/domain
+    /// failure, so the Browser strip can offer Retry, Choose browser…, and Use HTML.
+    BrowserSetupFailed(String),
     Done(String, Box<SitemapReport>, CrawlOutcome),
 }
 
@@ -447,14 +587,16 @@ enum UpdateEvent {
 
 /// What this machine can offer Browser mode right now.
 enum BrowserStatus {
-    /// Launching `--version` takes long enough that startup must not wait on it.
     Checking,
     Ready {
         path: PathBuf,
+        application: Option<PathBuf>,
         version: String,
+        label: String,
     },
     Unavailable {
-        reason: String,
+        summary: String,
+        detail: String,
     },
 }
 
@@ -472,18 +614,31 @@ struct BrowserChoice {
 }
 
 fn detect_browser(path: Option<PathBuf>) -> BrowserChoice {
+    let chosen = path.is_some();
     let status = match render::discover_browser(path.as_deref()) {
-        Ok(info) => BrowserStatus::Ready {
-            path: info.path,
-            version: info.version,
+        Ok(info) => {
+            let label = info.label();
+            BrowserStatus::Ready {
+                path: info.path,
+                application: info.application,
+                version: info.version,
+                label,
+            }
+        }
+        Err(detail) => BrowserStatus::Unavailable {
+            summary: if chosen {
+                "Couldn't use the chosen browser.".to_string()
+            } else {
+                "No Chrome or Chromium installation was found.".to_string()
+            },
+            detail,
         },
-        Err(reason) => BrowserStatus::Unavailable { reason },
     };
     BrowserChoice { path, status }
 }
 
-/// Detect a browser off the UI thread. Startup stays responsive while a local Chrome or
-/// Chromium answers `--version`.
+/// Detect a browser off the UI thread. Discovery only checks application/executable presence;
+/// capability is proven by the controlled CDP launch, so a slow `--version` cannot block it.
 fn probe_browser(path: Option<PathBuf>) -> mpsc::Receiver<BrowserChoice> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -497,9 +652,11 @@ struct State {
     rendering: RenderMode,
     browser: BrowserChoice,
     browser_probe: Option<mpsc::Receiver<BrowserChoice>>,
+    browser_details_open: bool,
     pages_limit: TextEdit,
     depth_limit: TextEdit,
     use_sitemaps: bool,
+    crawl_options_open: bool,
     tab: Tab,
     /// One search/filter/sort/selection state per tab and per sitemap view.
     views: Vec<ViewState>,
@@ -527,6 +684,7 @@ struct State {
     counts_deferred: bool,
     counts_at: Option<Instant>,
     view_counts: ViewCounts,
+    overview: OverviewCounts,
     sitemap: SitemapReport,
     sitemap_view: SitemapView,
     sitemap_visible: Vec<usize>,
@@ -559,19 +717,24 @@ struct State {
 fn init() -> State {
     let mut table = TableState::new().key("grid");
     table.set_sort("indexability", SortDir::Ascending);
+    let settings = update::Settings::load();
+    let remembered = settings.browser_path.as_ref().map(PathBuf::from);
     State {
         url: TextEdit::new("https://example.com/"),
         rendering: RenderMode::Html,
         browser: BrowserChoice {
-            path: None,
+            path: remembered.clone(),
             status: BrowserStatus::Checking,
         },
-        browser_probe: Some(probe_browser(None)),
+        browser_probe: Some(probe_browser(remembered)),
+        browser_details_open: false,
         pages_limit: TextEdit::new(DEFAULT_MAX_PAGES.to_string()),
         depth_limit: TextEdit::new(MAX_DEPTH.to_string()),
         use_sitemaps: true,
-        tab: Tab::Internal,
+        crawl_options_open: false,
+        tab: Tab::Overview,
         views: vec![
+            ViewState::new("indexability"),
             ViewState::new("indexability"),
             ViewState::new("issue"),
             ViewState::new("issue"),
@@ -603,6 +766,7 @@ fn init() -> State {
         counts_deferred: false,
         counts_at: None,
         view_counts: ViewCounts::default(),
+        overview: OverviewCounts::default(),
         sitemap: SitemapReport::default(),
         sitemap_view: SitemapView::Urls,
         sitemap_visible: Vec::new(),
@@ -623,7 +787,7 @@ fn init() -> State {
         waker: None,
         update: UpdateUi::Idle,
         update_job: None,
-        settings: update::Settings::load(),
+        settings,
         next_update_check: None,
         update_confirmed: false,
     }
@@ -636,17 +800,18 @@ fn setup(state: &mut State, waker: Waker) {
 
 fn view_slot(tab: Tab, sitemap_view: SitemapView) -> usize {
     match tab {
-        Tab::Internal => 0,
-        Tab::Titles => 1,
-        Tab::Meta => 2,
-        Tab::H1 => 3,
-        Tab::Response => 4,
-        Tab::Canonical => 5,
-        Tab::Images => 6,
-        Tab::Links => 7,
+        Tab::Overview => 0,
+        Tab::Internal => 1,
+        Tab::Titles => 2,
+        Tab::Meta => 3,
+        Tab::H1 => 4,
+        Tab::Response => 5,
+        Tab::Canonical => 6,
+        Tab::Images => 7,
+        Tab::Links => 8,
         Tab::Sitemaps => match sitemap_view {
-            SitemapView::Urls => 8,
-            SitemapView::Files => 9,
+            SitemapView::Urls => 9,
+            SitemapView::Files => 10,
         },
     }
 }
@@ -842,6 +1007,10 @@ fn poll_crawl(state: &mut State) -> bool {
                 state.sitemap_discovering = false;
                 sitemap_changed = true;
             }
+            Ok(CrawlEvent::BrowserSetupFailed(detail)) => {
+                apply_browser_setup_failure(state, detail);
+                changed = true;
+            }
             Ok(CrawlEvent::Done(message, report, outcome)) => {
                 finished = Some((message, report, outcome));
                 break;
@@ -873,6 +1042,12 @@ fn poll_crawl(state: &mut State) -> bool {
         refresh_visible(state);
     } else if sitemap_changed && state.tab == Tab::Sitemaps {
         refresh_sitemap_visible(state);
+    }
+    if sitemap_changed {
+        // Keep Overview's coverage honest while sitemap discovery streams without rescanning
+        // page facts or relabeling retained findings.
+        state.overview.sitemap_incomplete = sitemap_incomplete(&state.sitemap);
+        state.overview.sitemap_file_findings = sitemap_file_findings(&state.sitemap);
     }
     let counts_changed = refresh_counts(state, false);
     let did_finish = finished.is_some();
@@ -1108,6 +1283,9 @@ fn start_crawl(state: &mut State) {
         .unwrap_or_else(|| seed.clone());
     state.field_errors.clear();
     state.run_outcome = None;
+    // A valid new crawl starts on Overview. Later streaming, completion and manual tab
+    // changes never pull the person back here.
+    state.tab = Tab::Overview;
     state.run = Some(RunContext {
         seed: seed.clone(),
         host,
@@ -1131,6 +1309,7 @@ fn start_crawl(state: &mut State) {
     state.counts_deferred = false;
     state.counts_at = None;
     state.view_counts = ViewCounts::default();
+    state.overview = OverviewCounts::default();
     state.sitemap = SitemapReport::default();
     state.sitemap.discovery_done = !state.use_sitemaps;
     state.sitemap_discovering = state.use_sitemaps;
@@ -1169,6 +1348,9 @@ fn start_crawl(state: &mut State) {
                 wake();
             }
         });
+        if let Some(detail) = outcome.setup_failure {
+            let _ = tx.send(CrawlEvent::BrowserSetupFailed(detail));
+        }
         let _ = tx.send(CrawlEvent::Done(
             outcome.message,
             Box::new(outcome.sitemap),
@@ -1256,6 +1438,7 @@ fn assessment_has_known_finding(assessment: &Assessment) -> bool {
 /// incomplete. Completed content claims remain gated by `content_issue`.
 fn page_has_finding(tab: Tab, page: &Page, audit: &Audit) -> bool {
     match tab {
+        Tab::Overview => false,
         Tab::Internal => assessment_has_known_finding(&page.indexability),
         Tab::Titles => content_issue(page, audit, ContentCheck::Title),
         Tab::Meta => content_issue(page, audit, ContentCheck::Meta),
@@ -1377,6 +1560,9 @@ fn visible_id(state: &State, row: usize) -> Option<String> {
 /// Keep the selected row inside the visible set, choosing the first visible row when the old
 /// selection was filtered out and clearing it when nothing is visible.
 fn sync_selection(state: &mut State) {
+    if state.tab == Tab::Overview {
+        return;
+    }
     let count = visible_len(state);
     let desired = state.view().selected.as_deref();
     let chosen = desired
@@ -1419,6 +1605,11 @@ fn refresh_visible_forced(state: &mut State) {
 }
 
 fn refresh_visible_inner(state: &mut State, force: bool) {
+    if state.tab == Tab::Overview {
+        // Overview is a summary, not a URL table. The dedicated tables keep their own filters,
+        // searches and selections until a person explicitly opens one.
+        return;
+    }
     if state.tab == Tab::Sitemaps {
         refresh_sitemap_visible_inner(state, force);
         return;
@@ -1669,6 +1860,7 @@ fn refresh_counts(state: &mut State, force: bool) -> bool {
         return false;
     }
     state.counts = counts_with(&state.pages, &state.audit);
+    state.overview = overview_counts(&state.pages, &state.counts, &state.sitemap);
     state.counts_at = Some(Instant::now());
     state.counts_dirty = false;
     state.counts_deferred = false;
@@ -1778,7 +1970,7 @@ fn set_sitemap_sort(state: &mut State, column: &str, dir: SortDir) {
 }
 
 fn sort_pages(state: &mut State) {
-    if state.tab == Tab::Sitemaps {
+    if matches!(state.tab, Tab::Overview | Tab::Sitemaps) {
         sort_sitemap(state);
         return;
     }
@@ -1872,6 +2064,7 @@ fn visible_len(state: &State) -> usize {
 
 fn issue_for(tab: Tab, page: &Page, audit: &Audit) -> String {
     match tab {
+        Tab::Overview => String::new(),
         Tab::Internal => page.indexability.reason_text(),
         Tab::Titles => title_issue(page, audit),
         Tab::Meta => meta_issue(page, audit),
@@ -1896,6 +2089,7 @@ fn issue_for(tab: Tab, page: &Page, audit: &Audit) -> String {
 
 fn tab_key(tab: Tab) -> &'static str {
     match tab {
+        Tab::Overview => "tab-overview",
         Tab::Internal => "tab-internal",
         Tab::Titles => "tab-titles",
         Tab::Meta => "tab-meta",
@@ -1908,22 +2102,9 @@ fn tab_key(tab: Tab) -> &'static str {
     }
 }
 
-fn tab_label(tab: Tab, counts: &Counts, sitemap: &SitemapReport) -> String {
-    match tab {
-        Tab::Internal => format!("Internal {}", counts.pages),
-        Tab::Titles => format!("Titles {}", counts.title),
-        Tab::Meta => format!("Meta {}", counts.meta),
-        Tab::H1 => format!("H1 {}", counts.h1),
-        Tab::Response => format!("Response {}", counts.response),
-        Tab::Canonical => format!("Canonical {}", counts.canonical),
-        Tab::Images => format!("Images {}", counts.images),
-        Tab::Links => format!("Links {}", counts.links),
-        Tab::Sitemaps => format!("Sitemaps {}", sitemap.urls.len()),
-    }
-}
-
 fn tab_help(tab: Tab, counts: &Counts, sitemap: &SitemapReport) -> String {
     match tab {
+        Tab::Overview => "Run summary, review groups and coverage".into(),
         Tab::Internal => format!("{} crawled URLs", counts.pages),
         Tab::Titles => format!(
             "{} URLs with a title finding · {} crawled URLs",
@@ -1963,6 +2144,7 @@ fn tab_help(tab: Tab, counts: &Counts, sitemap: &SitemapReport) -> String {
 
 fn tab_short(tab: Tab) -> &'static str {
     match tab {
+        Tab::Overview => "Overview",
         Tab::Internal => "Internal",
         Tab::Titles => "Titles",
         Tab::Meta => "Meta",
@@ -1975,22 +2157,9 @@ fn tab_short(tab: Tab) -> &'static str {
     }
 }
 
-fn tab_count(tab: Tab, counts: &Counts, sitemap: &SitemapReport) -> usize {
-    match tab {
-        Tab::Internal => counts.pages,
-        Tab::Titles => counts.title,
-        Tab::Meta => counts.meta,
-        Tab::H1 => counts.h1,
-        Tab::Response => counts.response,
-        Tab::Canonical => counts.canonical,
-        Tab::Images => counts.images,
-        Tab::Links => counts.links,
-        Tab::Sitemaps => sitemap.urls.len(),
-    }
-}
-
 fn tab_title(tab: Tab) -> &'static str {
     match tab {
+        Tab::Overview => "Overview",
         Tab::Internal => "Internal URLs",
         Tab::Titles => "Page titles",
         Tab::Meta => "Meta descriptions",
@@ -2027,21 +2196,27 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         app = app.child(progress_line(&k, state));
     }
     app = app.child(command_bar(&k, state));
+    if state.crawl_options_open {
+        app = app.child(crawl_options_note(&k, state));
+    }
     if state.rendering == RenderMode::Browser {
         app = app.child(browser_strip(&k, state));
     }
     if let Some(banner) = update_banner(&k, state) {
         app = app.child(banner);
     }
-    if !state.pages.is_empty() || state.tab == Tab::Sitemaps {
-        app = app.child(section_header(&k, state));
+    if state.tab == Tab::Overview {
+        app = app.child(overview_view(&k, state));
+    } else {
+        if !state.pages.is_empty() || state.tab == Tab::Sitemaps {
+            app = app.child(section_header(&k, state));
+        }
+        if state.run_details_open {
+            app = app.child(run_details_panel(&k, state));
+        }
+        app = app.child(results(&k, state));
     }
-    if state.run_details_open {
-        app = app.child(run_details_panel(&k, state));
-    }
-    app.child(results(&k, state))
-        .child(status_line(&k, state))
-        .on_key(handle_app_key)
+    app.child(status_line(&k, state)).on_key(handle_app_key)
 }
 
 fn handle_app_key(state: &mut State, event: &KeyEvent, _tx: &mut Tx) -> bool {
@@ -2085,6 +2260,19 @@ fn focus_site_url(state: &mut State, tx: &mut Tx) {
 }
 
 fn focus_search_state(state: &mut State) -> bool {
+    if state.tab == Tab::Overview {
+        if state.pages.is_empty() {
+            return false;
+        }
+        // Overview has no search field of its own. Find in Results goes to the Internal URL
+        // table, whose search covers the same crawled pages.
+        state.tab = Tab::Internal;
+        state.relation_pages = RelationPages::default();
+        state.selection_epoch = state.selection_epoch.wrapping_add(1);
+        let (column, dir) = state.view().sort.clone();
+        state.table.set_sort(column, dir);
+        refresh_visible_forced(state);
+    }
     let has_data = if state.tab == Tab::Sitemaps {
         match state.sitemap_view {
             SitemapView::Urls => !state.sitemap.urls.is_empty(),
@@ -2178,6 +2366,7 @@ fn vrule(k: &Kit) -> El {
 fn topbar(k: &Kit, state: &State, counts: &Counts, inset: f32) -> El {
     let tabs = row().gap(2.0).center_y().children(
         [
+            Tab::Overview,
             Tab::Internal,
             Tab::Titles,
             Tab::Meta,
@@ -2519,70 +2708,202 @@ fn rendering_picker(k: &Kit, state: &State) -> El {
 }
 
 fn browser_strip(k: &Kit, state: &State) -> El {
-    let (color, label, help) = match &state.browser.status {
-        BrowserStatus::Checking => (
-            k.c.text_muted,
-            "Finding a browser…".to_string(),
-            "Looking for installed Chrome or Chromium.".to_string(),
-        ),
-        BrowserStatus::Ready { path, version } => {
-            let label = version
-                .split_once('/')
-                .map(|(name, number)| {
-                    format!("{name} {}", number.split('.').next().unwrap_or(number))
-                })
-                .unwrap_or_else(|| version.clone());
-            (
-                k.c.text_muted,
-                label,
-                format!("{version}\n{}", path.display()),
-            )
-        }
-        BrowserStatus::Unavailable { reason } => (
-            k.c.warning.fg,
-            "Chrome or Chromium required".to_string(),
-            reason.clone(),
-        ),
+    let (color, summary, can_retry) = match &state.browser.status {
+        BrowserStatus::Checking => (k.c.text_muted, "Finding a browser…".to_string(), false),
+        BrowserStatus::Ready { label, .. } => (k.c.text_muted, label.clone(), false),
+        BrowserStatus::Unavailable { summary, .. } => (k.c.warning.fg, summary.clone(), true),
     };
-    let unavailable = matches!(state.browser.status, BrowserStatus::Unavailable { .. });
-    let line = row()
-        .key("browser-strip")
-        .w_full()
-        .px(GUTTER)
-        .pb(4.0)
-        .gap(8.0)
-        .center_y()
-        .child(dot(color))
-        .child(
-            text(label)
-                .font(k.ty.text_xsmall)
-                .color(color)
-                .help(help.clone()),
-        )
-        .child(el().grow(1.0))
+    let mut actions = row().gap(4.0);
+    if can_retry {
+        actions = actions
+            .child(
+                Button::new("Retry")
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .disabled(state.phase.active())
+                    .on_press(retry_browser)
+                    .build(k)
+                    .key("retry-browser"),
+            )
+            .child(
+                Button::new("Use HTML")
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(|state: &mut State| {
+                        state.rendering = RenderMode::Html;
+                        state.message = "HTML capture selected for the next crawl.".into();
+                    })
+                    .build(k)
+                    .key("use-html"),
+            );
+    }
+    actions = actions
         .child(
             Button::new("Choose browser…")
                 .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
                 .disabled(state.phase.active())
-                .help("Choose a local Chrome or Chromium executable")
+                .help("Choose a browser application")
                 .on_press_tx(choose_browser)
                 .build(k)
                 .key("choose-browser"),
-        );
-    if unavailable {
-        col().w_full().gap(2.0).child(line).child(
-            text(help)
-                .font(k.ty.text_xsmall)
-                .color(k.c.text_muted)
-                .px(GUTTER)
-                .pb(4.0)
-                .w_full()
-                .wrap()
-                .key("browser-error"),
         )
-    } else {
-        line
+        .child(
+            Button::new("Details")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .expanded(state.browser_details_open)
+                .on_press(|state: &mut State| {
+                    state.browser_details_open = !state.browser_details_open
+                })
+                .build(k)
+                .key("browser-details"),
+        );
+    let mut block = col().w_full().gap(3.0).child(
+        row()
+            .key("browser-strip")
+            .w_full()
+            .px(GUTTER)
+            .pb(4.0)
+            .gap(8.0)
+            .center_y()
+            .child(dot(color))
+            .child(text(summary).font(k.ty.text_xsmall).color(color))
+            .child(el().grow(1.0))
+            .children([actions]),
+    );
+    if state.browser_details_open {
+        let (path, detail) = match &state.browser.status {
+            BrowserStatus::Checking => (
+                state
+                    .browser
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                "Looking for an installed browser application.".to_string(),
+            ),
+            BrowserStatus::Ready {
+                path,
+                application,
+                version,
+                ..
+            } => (
+                application.as_ref().unwrap_or(path).display().to_string(),
+                if version.is_empty() {
+                    format!("Browser executable: {}", path.display())
+                } else {
+                    format!("{version}\nBrowser executable: {}", path.display())
+                },
+            ),
+            BrowserStatus::Unavailable { detail, .. } => (
+                state
+                    .browser
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                detail.clone(),
+            ),
+        };
+        let mut body = col().w_full().gap(2.0).px(GUTTER).pb(5.0);
+        if !path.is_empty() {
+            body = body.child(
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .child(
+                        text(path.clone())
+                            .font(k.ty.text_xsmall)
+                            .color(k.c.text_muted)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .help(path.clone()),
+                    )
+                    .child(copy_icon(k, "Copy browser path", path)),
+            );
+        }
+        body = body.child(
+            row()
+                .w_full()
+                .gap(6.0)
+                .center_y()
+                .child(
+                    copy_icon(k, "Copy browser diagnostics", detail.clone())
+                        .key("copy-browser-diagnostics"),
+                )
+                .child(
+                    text(detail.clone())
+                        .font(k.ty.text_xsmall)
+                        .color(k.c.text_muted)
+                        .wrap()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .key("browser-detail"),
+                ),
+        );
+        block = block.child(body);
+    }
+    block
+}
+
+/// A failed controlled launch is a browser setup failure. Keep the raw diagnostic behind the
+/// Details disclosure and expose the same recovery actions as a missing browser.
+fn apply_browser_setup_failure(state: &mut State, detail: String) {
+    let label = match &state.browser.status {
+        BrowserStatus::Ready { label, .. } if !label.is_empty() => Some(label.clone()),
+        _ => state
+            .browser
+            .path
+            .as_deref()
+            .and_then(std::path::Path::file_stem)
+            .and_then(|name| name.to_str())
+            .map(str::to_string),
+    };
+    state.browser.status = BrowserStatus::Unavailable {
+        summary: label
+            .map(|label| format!("Couldn't start {label}."))
+            .unwrap_or_else(|| "Couldn't start the browser.".into()),
+        detail,
+    };
+    state.browser_details_open = false;
+}
+
+fn retry_browser(state: &mut State) {
+    if state.phase.active() {
+        return;
+    }
+    state.browser.status = BrowserStatus::Checking;
+    state.browser_details_open = false;
+    state.browser_probe = Some(probe_browser(state.browser.path.clone()));
+    state.message = "Checking the browser…".into();
+}
+
+fn browser_dialog_options() -> FileDialogOptions {
+    #[cfg(target_os = "macos")]
+    {
+        // A normal Open panel in /Applications; .app bundles are selectable by name.
+        FileDialogOptions {
+            title: "Choose browser application".into(),
+            directory: Some(PathBuf::from("/Applications")),
+            ..Default::default()
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        FileDialogOptions {
+            title: "Choose browser application".into(),
+            filters: vec![("Applications".into(), vec!["exe".into()])],
+            ..Default::default()
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        FileDialogOptions {
+            title: "Choose browser executable".into(),
+            ..Default::default()
+        }
     }
 }
 
@@ -2592,40 +2913,103 @@ fn choose_browser(state: &mut State, tx: &mut Tx) {
     if state.phase.active() {
         return;
     }
-    let options = FileDialogOptions {
-        title: "Choose a Chrome or Chromium executable".into(),
-        ..Default::default()
-    };
-    tx.open_file(options, |state: &mut State, result, _tx| match result {
-        Ok(Some(path)) => {
-            if state.phase.active() {
-                return;
+    tx.open_file(
+        browser_dialog_options(),
+        |state: &mut State, result, _tx| match result {
+            Ok(Some(path)) => {
+                if state.phase.active() {
+                    return;
+                }
+                if let Err(error) = state.settings.remember_browser(&path) {
+                    state.message = format!("Could not remember the browser choice: {error}");
+                }
+                state.browser = BrowserChoice {
+                    path: Some(path.clone()),
+                    status: BrowserStatus::Checking,
+                };
+                state.browser_probe = Some(probe_browser(Some(path)));
+                state.rendering = RenderMode::Browser;
+                state.browser_details_open = false;
+                state.message = "Checking the chosen browser…".into();
             }
-            state.browser = BrowserChoice {
-                path: Some(path.clone()),
-                status: BrowserStatus::Checking,
-            };
-            state.browser_probe = Some(probe_browser(Some(path)));
-            state.rendering = RenderMode::Browser;
-            state.message = "Checking the chosen browser…".into();
-        }
-        Ok(None) => {}
-        Err(error) => {
-            state.message = format!("Could not open the file chooser: {error}");
-        }
-    });
+            Ok(None) => {}
+            Err(error) => {
+                state.message = format!("Could not open the file chooser: {error}");
+            }
+        },
+    );
+}
+
+fn crawl_option_note_text(on: bool) -> &'static str {
+    if on {
+        "Also crawls URLs listed in the site's sitemaps. Shares the same page limit."
+    } else {
+        "Following page links only. Sitemaps are not read for this crawl."
+    }
+}
+
+fn crawl_options_note(k: &Kit, state: &State) -> El {
+    let detail = if state.use_sitemaps {
+        "Listed URLs enter at depth 0 and robots.txt still applies. This does not create or submit a sitemap."
+    } else {
+        "Only links found on crawled pages are followed. robots.txt still applies."
+    };
+    col()
+        .w_full()
+        .px(GUTTER)
+        .pb(6.0)
+        .gap(2.0)
+        .key("crawl-options-note")
+        .child(
+            text(crawl_option_note_text(state.use_sitemaps))
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        )
+        .child(
+            text(detail)
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        )
 }
 
 fn sitemaps_toggle(k: &Kit, state: &State) -> El {
-    row().h_full().px(12.0).center_y().child(
-        Checkbox::new(state.use_sitemaps)
-            .label("Sitemaps")
-            .disabled(state.phase.active())
-            .on_toggle(|state: &mut State| state.use_sitemaps ^= true)
-            .build(k)
-            .help("Add sitemap-listed URLs to the crawl; robots.txt rules are always respected")
-            .key("use-sitemaps"),
-    )
+    let glyph = if state.crawl_options_open {
+        k.glyph.triangle_down
+    } else {
+        k.glyph.triangle_right
+    };
+    row()
+        .h_full()
+        .px(8.0)
+        .gap(2.0)
+        .center_y()
+        .child(
+            Checkbox::new(state.use_sitemaps)
+                .label("Use sitemap URLs")
+                .disabled(state.phase.active())
+                .on_toggle(|state: &mut State| state.use_sitemaps ^= true)
+                .build(k)
+                .help("Listed URLs enter at depth 0 and share the page limit; robots.txt still applies.")
+                .key("use-sitemaps"),
+        )
+        .child(
+            IconButton::new(glyph)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Sitemap option details")
+                .help(if state.crawl_options_open {
+                    "Hide the sitemap option explanation"
+                } else {
+                    "Explain what Use sitemap URLs does"
+                })
+                .expanded(state.crawl_options_open)
+                .on_press(|state: &mut State| state.crawl_options_open ^= true)
+                .build(k)
+                .key("sitemap-options"),
+        )
 }
 
 fn crawl_button(k: &Kit, state: &State) -> El {
@@ -2680,15 +3064,15 @@ fn crawl_button(k: &Kit, state: &State) -> El {
 
 fn tab_button(k: &Kit, state: &State, tab: Tab, counts: &Counts) -> El {
     let selected = state.tab == tab;
-    let count = tab_count(tab, counts, &state.sitemap);
-    let count_ink = k.c.text_muted;
     let label_ink = if selected {
         k.c.text_base
     } else {
         k.c.text_muted
     };
     let small = k.ty.small;
-    Button::new(tab_label(tab, counts, &state.sitemap))
+    // Tab labels stay bare: the old numeric suffixes mixed crawled URLs, findings and listed
+    // URLs under one unlabeled style. Explicit counts live in Overview and view summaries.
+    Button::new(tab_short(tab))
         .control_size(ControlSize::Small)
         .variant(if selected {
             ButtonVariant::Neutral
@@ -2696,20 +3080,10 @@ fn tab_button(k: &Kit, state: &State, tab: Tab, counts: &Counts) -> El {
             ButtonVariant::Ghost
         })
         .label_with(move |_, _| {
-            row()
-                .gap(6.0)
-                .center_y()
-                .child(
-                    text(tab_short(tab))
-                        .font(small)
-                        .color(label_ink)
-                        .text_case(TextCase::Uppercase),
-                )
-                .child(
-                    text(count.to_string())
-                        .font(small.tracking(0.0))
-                        .color(count_ink),
-                )
+            text(tab_short(tab))
+                .font(small)
+                .color(label_ink)
+                .text_case(TextCase::Uppercase)
         })
         .on_press(move |state: &mut State| {
             state.tab = tab;
@@ -2717,7 +3091,7 @@ fn tab_button(k: &Kit, state: &State, tab: Tab, counts: &Counts) -> El {
             state.selection_epoch = state.selection_epoch.wrapping_add(1);
             let (column, dir) = state.view().sort.clone();
             state.table.set_sort(column, dir);
-            sort_pages(state);
+            refresh_visible_forced(state);
         })
         .help(tab_help(tab, counts, &state.sitemap))
         .build(k)
@@ -2733,6 +3107,517 @@ fn progress_line(k: &Kit, state: &State) -> El {
         .child(el().h_full().w_frac(fraction).fill(k.c.text_base))
         .child(el().grow(1.0))
         .key("progress")
+}
+
+fn overview_view(k: &Kit, state: &State) -> El {
+    let mut body = col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .px(GUTTER)
+        .py(14.0)
+        .gap(16.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(overview_run_line(k, state));
+    if state.run.is_some() {
+        body = body
+            .child(overview_findings(k, state))
+            .child(overview_coverage(k, state));
+    }
+    if !state.pages.is_empty() {
+        body = body.child(overview_actions(k, state));
+    }
+    col()
+        .key("overview")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(body)
+        .child(el().w_full().h(1.0).fill(k.c.border_weak).a11y_hidden())
+}
+
+fn overview_run_line(k: &Kit, state: &State) -> El {
+    let Some(run) = &state.run else {
+        let failed_setup = matches!(state.phase, RunPhase::Failed | RunPhase::Blocked)
+            && !state.message.starts_with("Ready");
+        return col()
+            .w_full()
+            .gap(4.0)
+            .child(
+                text(if failed_setup {
+                    "Couldn’t start a crawl"
+                } else {
+                    "No crawl yet"
+                })
+                .font(k.ty.body_medium)
+                .color(k.c.text_base)
+                .key("overview-title"),
+            )
+            .child(
+                text(if failed_setup {
+                    state.message.clone()
+                } else {
+                    "Enter a site URL above and start a crawl. Findings and coverage will appear here."
+                        .into()
+                })
+                .font(k.ty.text_small)
+                .color(if failed_setup {
+                    k.c.warning.fg
+                } else {
+                    k.c.text_muted
+                })
+                .wrap()
+                .w_full(),
+            );
+    };
+    let page_word = if state.counts.pages == 1 {
+        "URL"
+    } else {
+        "URLs"
+    };
+    let mut facts = if state.phase.active() {
+        format!(
+            "{} {page_word} so far · {} capture · {}",
+            state.counts.pages,
+            run_capture_label(state),
+            state.phase.label()
+        )
+    } else {
+        format!(
+            "{} {page_word} · {} capture · {}",
+            state.counts.pages,
+            run_capture_label(state),
+            state.phase.label()
+        )
+    };
+    if state.sitemap.partial.is_some() {
+        facts.push_str(" · sitemap discovery partial");
+    }
+    let mut block = col()
+        .w_full()
+        .min_w(0.0)
+        .gap(3.0)
+        .child(
+            row()
+                .w_full()
+                .min_w(0.0)
+                .gap(10.0)
+                .center_y()
+                .child(
+                    text(run.host.clone())
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_base)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate()
+                        .key("overview-host")
+                        .help(run.seed.clone()),
+                )
+                .child(
+                    text(facts)
+                        .font(k.ty.text_xsmall)
+                        .color(k.c.text_muted)
+                        .key("overview-run-facts"),
+                ),
+        )
+        .child(
+            text(run.seed.clone())
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .truncate()
+                .w_full()
+                .min_w(0.0)
+                .help(run.seed.clone()),
+        );
+    if !state.phase.active()
+        && matches!(
+            state.phase,
+            RunPhase::Stopped | RunPhase::Limited | RunPhase::Failed | RunPhase::Blocked
+        )
+    {
+        block = block.child(
+            text(run_report_reason(state))
+                .font(k.ty.text_small)
+                .color(k.c.warning.fg)
+                .wrap()
+                .w_full()
+                .key("overview-outcome"),
+        );
+    }
+    block
+}
+
+fn overview_section_label(k: &Kit, label: &str, note: Option<String>) -> El {
+    let mut row = row().w_full().gap(10.0).center_y().child(
+        text(label)
+            .font(TextStyle::new(10.5, 500.0).mono().lh(14.0).tracking(1.2))
+            .color(k.c.text_muted)
+            .text_case(TextCase::Uppercase),
+    );
+    if let Some(note) = note {
+        row = row.child(
+            text(note.clone())
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate()
+                .help(note),
+        );
+    }
+    row
+}
+
+fn overview_findings(k: &Kit, state: &State) -> El {
+    let counts = state.overview;
+    let block = col().w_full().gap(6.0).child(overview_section_label(
+        k,
+        "Findings",
+        if counts.has_findings() {
+            Some("Counts are per check and can overlap.".into())
+        } else {
+            None
+        },
+    ));
+    if state.run.is_none() {
+        return block;
+    }
+    if counts.pages == 0 {
+        return block.child(
+            text(if state.phase.active() {
+                "Results appear as pages are checked."
+            } else {
+                "No pages completed, so there are no finding counts."
+            })
+            .font(k.ty.text_small)
+            .color(k.c.text_muted)
+            .wrap()
+            .w_full()
+            .key("overview-no-findings"),
+        );
+    }
+    if !counts.has_findings() {
+        let mut note = "No findings in completed checks.".to_string();
+        if counts.incomplete > 0 || matches!(state.phase, RunPhase::Stopped | RunPhase::Limited) {
+            note.push_str(" Some checks did not complete; see coverage below.");
+        }
+        return block.child(
+            text(note)
+                .font(k.ty.text_small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full()
+                .key("overview-no-findings"),
+        );
+    }
+    let mut rows = col().w_full().gap(1.0);
+    for (group, count) in counts.groups() {
+        if count == 0 {
+            continue;
+        }
+        rows = rows.child(overview_group_row(k, group, count));
+    }
+    block.child(rows)
+}
+
+fn overview_group_row(k: &Kit, group: OverviewGroup, count: usize) -> El {
+    let label = group.label();
+    let help = group.help();
+    let count_text = count.to_string();
+    let key = group.key();
+    let small = k.ty.text_xsmall;
+    let mono = k.ty.mono;
+    let text_base = k.c.text_base;
+    let text_muted = k.c.text_muted;
+    Button::new(format!("{label}: {count} URLs"))
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Regular)
+        .label_with(move |font, ink| {
+            row()
+                .w_full()
+                .min_w(0.0)
+                .gap(10.0)
+                .center_y()
+                .child(
+                    text(label)
+                        .font(font)
+                        .color(ink)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .child(text(count_text.clone()).font(mono).color(text_base))
+                .child(text("URLs").font(small).color(text_muted))
+                .child(text("Show").font(small).color(text_muted))
+        })
+        .help(help)
+        .on_press(move |state: &mut State| open_overview_group(state, group))
+        .build(k)
+        .w_full()
+        .key(key)
+}
+
+fn overview_coverage(k: &Kit, state: &State) -> El {
+    let counts = state.overview;
+    let block = col()
+        .w_full()
+        .gap(6.0)
+        .child(overview_section_label(k, "Coverage", None));
+    if state.run.is_none() {
+        return block;
+    }
+    let mut rows = col().w_full().gap(1.0);
+    let mut gaps = 0;
+    if counts.incomplete > 0 {
+        gaps += 1;
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-incomplete",
+            format!(
+                "{} {} incomplete checks",
+                counts.incomplete,
+                if counts.incomplete == 1 {
+                    "URL has"
+                } else {
+                    "URLs have"
+                }
+            ),
+            "Captures or checks that did not finish. They are not counted as clean.",
+            move |state: &mut State| {
+                open_overview_target(state, Tab::Internal, CheckFilter::Incomplete)
+            },
+        ));
+    }
+    if counts.sitemap_incomplete > 0 && !state.phase.active() {
+        gaps += 1;
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-sitemap-incomplete",
+            format!(
+                "{} sitemap {} incomplete",
+                counts.sitemap_incomplete,
+                if counts.sitemap_incomplete == 1 {
+                    "URL check is"
+                } else {
+                    "URL checks are"
+                }
+            ),
+            "Listed URLs whose crawl state or capture evidence is incomplete. Show uses the same Incomplete filter.",
+            move |state: &mut State| {
+                state.sitemap_view = SitemapView::Urls;
+                open_overview_target(state, Tab::Sitemaps, CheckFilter::Incomplete)
+            },
+        ));
+    }
+    if counts.sitemap_file_findings > 0 {
+        gaps += 1;
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-sitemap-files",
+            format!(
+                "{} sitemap {} findings",
+                counts.sitemap_file_findings,
+                if counts.sitemap_file_findings == 1 {
+                    "file has"
+                } else {
+                    "files have"
+                }
+            ),
+            "Declared or read sitemap files with an error, skipped state, or document issue. Guessed absent roots are informational.",
+            move |state: &mut State| {
+                state.sitemap_view = SitemapView::Files;
+                open_overview_target(state, Tab::Sitemaps, CheckFilter::Findings)
+            },
+        ));
+    }
+    if let Some(partial) = &state.sitemap.partial {
+        gaps += 1;
+        rows = rows.child(
+            text(format!("Sitemap discovery was partial: {partial}"))
+                .font(k.ty.text_small)
+                .color(k.c.warning.fg)
+                .wrap()
+                .w_full()
+                .key("overview-sitemap-partial"),
+        );
+    }
+    match state.phase {
+        RunPhase::Stopped => {
+            gaps += 1;
+            rows = rows.child(coverage_note(
+                k,
+                "Stopped before the crawl finished. URLs that were never reached are not counted as clean.",
+            ));
+        }
+        RunPhase::Limited => {
+            gaps += 1;
+            rows = rows.child(coverage_note(
+                k,
+                "The page limit ended the crawl. More URLs may exist beyond this run.",
+            ));
+        }
+        RunPhase::Failed | RunPhase::Blocked => {
+            gaps += 1;
+            rows = rows.child(coverage_note(
+                k,
+                "This run ended before it could complete its checks.",
+            ));
+        }
+        _ => {}
+    }
+    if gaps == 0 {
+        if state.phase.active() || counts.pages == 0 {
+            // Nothing measured yet and no coverage gap to name: do not leave an empty
+            // COVERAGE heading while the crawl is still preparing or streaming.
+            return col();
+        }
+        rows = rows.child(
+            text("Every captured URL finished its checks. This covers this crawl only, not the whole site.")
+                .font(k.ty.text_small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full()
+                .key("overview-coverage-complete"),
+        );
+    }
+    block.child(rows)
+}
+
+fn coverage_note(k: &Kit, text_value: &str) -> El {
+    text(text_value)
+        .font(k.ty.text_small)
+        .color(k.c.warning.fg)
+        .wrap()
+        .w_full()
+}
+
+fn overview_coverage_row(
+    k: &Kit,
+    key: &'static str,
+    label: String,
+    help: &'static str,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
+    let small = k.ty.text_xsmall;
+    let muted = k.c.text_muted;
+    Button::new(label.clone())
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .label_with(move |font, ink| {
+            row()
+                .w_full()
+                .min_w(0.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    text(label.clone())
+                        .font(font)
+                        .color(ink)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .child(text("Show").font(small).color(muted))
+        })
+        .help(help)
+        .on_press(action)
+        .build(k)
+        .w_full()
+        .key(key)
+}
+
+fn overview_actions(k: &Kit, state: &State) -> El {
+    let has_pages = !state.pages.is_empty();
+    let mut row = row()
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(
+            Button::new("Open URL table")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Regular)
+                .disabled(!has_pages)
+                .help("Show every crawled URL with its indexability evidence")
+                .on_press(|state: &mut State| {
+                    open_overview_target(state, Tab::Internal, CheckFilter::All)
+                })
+                .build(k)
+                .key("overview-open-urls"),
+        )
+        .child(
+            Button::new("Export CSV")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Regular)
+                .disabled(state.phase.active() || !has_pages)
+                .help("Save every crawled URL with the Internal URL table columns")
+                .on_press_tx(export_overview_csv)
+                .build(k)
+                .key("overview-export-csv"),
+        )
+        .child(el().grow(1.0));
+    if has_pages {
+        row = row.child(
+            text("Cmd/Ctrl+F searches the URL table.")
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted),
+        );
+    }
+    row
+}
+
+fn open_overview_group(state: &mut State, group: OverviewGroup) {
+    let (tab, filter) = group.target();
+    open_overview_target(state, tab, filter);
+}
+
+fn open_overview_target(state: &mut State, tab: Tab, filter: CheckFilter) {
+    state.tab = tab;
+    state.relation_pages = RelationPages::default();
+    state.selection_epoch = state.selection_epoch.wrapping_add(1);
+    // A group count must not open onto an empty hidden query left in another visit.
+    state.view_mut().query.replace_text("");
+    state.view_mut().filter = filter;
+    let (column, dir) = state.view().sort.clone();
+    state.table.set_sort(column, dir);
+    refresh_visible_forced(state);
+}
+
+fn export_overview_csv(state: &mut State, tx: &mut Tx) {
+    if state.phase.active() || state.pages.is_empty() {
+        return;
+    }
+    let (column, dir) = state.views[view_slot(Tab::Internal, SitemapView::Urls)]
+        .sort
+        .clone();
+    let mut indices: Vec<usize> = (0..state.pages.len()).collect();
+    indices.sort_by(|left, right| {
+        dir.apply(compare(
+            &state.pages[*left],
+            &state.pages[*right],
+            Tab::Internal,
+            &column,
+            &state.audit,
+        ))
+    });
+    let rows = indices
+        .iter()
+        .map(|index| export_row(Tab::Internal, &state.pages[*index], &state.audit))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return;
+    }
+    let scope = format!("{} crawled URL rows", rows.len());
+    save_csv(
+        state,
+        tx,
+        export_headers(Tab::Internal),
+        rows,
+        "Internal URLs",
+        "internal-urls",
+        scope,
+    );
 }
 
 fn section_header(k: &Kit, state: &State) -> El {
@@ -2753,6 +3638,7 @@ fn section_header(k: &Kit, state: &State) -> El {
         ));
     }
     if let Some(run) = &state.run {
+        summary.push_str(&format!(" · {}", run_capture_label(state)));
         summary.push_str(&format!(" · {}", run.host));
     }
     row()
@@ -2785,6 +3671,14 @@ fn section_header(k: &Kit, state: &State) -> El {
         .child(export_button(k, state, shown))
         .child(copy_urls_button(k, state, shown))
         .child(details_toggle(k, state))
+}
+
+fn run_capture_label(state: &State) -> &'static str {
+    state
+        .run
+        .as_ref()
+        .map(|run| run.rendering.label())
+        .unwrap_or("HTML")
 }
 
 fn run_report_reason(state: &State) -> String {
@@ -2931,6 +3825,9 @@ fn sitemap_section_header(k: &Kit, state: &State) -> El {
             state.view_counts.findings, state.view_counts.incomplete
         ));
     }
+    if state.run.is_some() {
+        summary.push_str(&format!(" · {}", run_capture_label(state)));
+    }
     if state.sitemap.partial.is_some() {
         summary.push_str(" · Partial");
     }
@@ -2974,7 +3871,7 @@ fn sitemap_section_header(k: &Kit, state: &State) -> El {
 
 fn sitemap_coverage_line(state: &State) -> String {
     if !run_sitemaps(state) {
-        return "Sitemaps: off for this run".into();
+        return "Sitemaps: discovery was off for this crawl".into();
     }
     if state.sitemap_discovering || (state.phase.active() && !state.sitemap.discovery_done) {
         let summary = state.sitemap.summary();
@@ -3032,7 +3929,7 @@ fn sitemap_summary(state: &State) -> String {
         };
     }
     if !run_sitemaps(state) {
-        return "Sitemap discovery is off".to_string();
+        return "Sitemap discovery was off for this crawl".to_string();
     }
     if summary.files == 0 {
         return match &state.sitemap.partial {
@@ -3255,6 +4152,7 @@ fn csv_path(mut path: std::path::PathBuf) -> std::path::PathBuf {
 
 fn tab_slug(tab: Tab) -> &'static str {
     match tab {
+        Tab::Overview => "overview",
         Tab::Internal => "internal-urls",
         Tab::Titles => "titles",
         Tab::Meta => "meta-descriptions",
@@ -3269,7 +4167,7 @@ fn tab_slug(tab: Tab) -> &'static str {
 
 fn export_headers(tab: Tab) -> &'static [&'static str] {
     match tab {
-        Tab::Internal => &[
+        Tab::Overview | Tab::Internal => &[
             "ADDRESS",
             "STATUS",
             "INDEXABILITY",
@@ -3385,7 +4283,7 @@ fn export_row(tab: Tab, page: &Page, audit: &Audit) -> Vec<String> {
     };
     let mut row = vec![page.url.clone()];
     match tab {
-        Tab::Internal => {
+        Tab::Overview | Tab::Internal => {
             row.push(if page.status == 0 {
                 "ERR".into()
             } else {
@@ -3636,7 +4534,7 @@ fn empty(k: &Kit, state: &State) -> El {
 fn sitemap_empty(state: &State) -> (String, String) {
     if !run_sitemaps(state) {
         return (
-            "Sitemap discovery is off".into(),
+            "Sitemap discovery was off for this crawl".into(),
             "This crawl still followed page links. Turn on Sitemaps and crawl again to include URLs listed in sitemap files.".into(),
         );
     }
@@ -3733,7 +4631,7 @@ fn table(k: &Kit, state: &State) -> El {
         state.details_open = true;
     });
     table = match tab {
-        Tab::Internal => table
+        Tab::Overview | Tab::Internal => table
             .column(
                 TableColumn::new("url", "ADDRESS")
                     .flex(2.4)
@@ -4489,7 +5387,7 @@ fn primary_issue(tab: Tab, page: &Page, audit: &Audit) -> String {
         Tab::Canonical => "No canonical finding".into(),
         Tab::Images => "No missing image alt text".into(),
         Tab::Links => "No broken link observed in this crawl".into(),
-        Tab::Internal => page.indexability.label.text().to_string(),
+        Tab::Overview | Tab::Internal => page.indexability.label.text().to_string(),
         Tab::Sitemaps => "No issue".into(),
     }
 }
@@ -4505,24 +5403,31 @@ fn inspector_lead(k: &Kit, state: &State, page: &Page) -> El {
     } else {
         k.c.text_base
     };
-    let mut lead = col().w_full().min_w(0.0).gap(8.0).child(
-        text(issue)
-            .font(k.ty.body_medium)
-            .color(color)
-            .wrap()
-            .w_full()
-            .key("inspector-lead"),
-    );
-    match tab {
-        Tab::Internal => {
-            lead = lead.child(assessment_detail(
+    let mut lead = col().w_full().min_w(0.0).gap(8.0);
+    if tab == Tab::Internal {
+        // The assessment's own label is the single verdict line. Printing `primary_issue`
+        // first duplicated it as a white heading above the same colored status.
+        lead = lead.child(col().w_full().min_w(0.0).key("inspector-lead").child(
+            assessment_detail(
                 k,
                 page,
                 &state.pages,
                 state.evidence_open,
                 state.capture_open,
-            ));
-        }
+            ),
+        ));
+    } else {
+        lead = lead.child(
+            text(issue)
+                .font(k.ty.body_medium)
+                .color(color)
+                .wrap()
+                .w_full()
+                .key("inspector-lead"),
+        );
+    }
+    match tab {
+        Tab::Overview | Tab::Internal => {}
         Tab::Titles | Tab::Meta => {
             let (label, value) = if tab == Tab::Titles {
                 ("Title", page.title.as_str())
@@ -5930,6 +6835,48 @@ fn scene_empty(_state: &mut State) {}
 fn scene_sample(state: &mut State) {
     load_sample(state);
 }
+fn scene_overview(state: &mut State) {
+    load_sample(state);
+    switch_tab(state, Tab::Overview);
+}
+fn scene_overview_clean(state: &mut State) {
+    load_sample(state);
+    let mut clean = crawl::sample_pages()
+        .into_iter()
+        .nth(3)
+        .expect("the sample keeps a clean page");
+    clean.h1s = vec!["Why a calm homepage converts better".into()];
+    clean.links.clear();
+    clean.images = 0;
+    clean.images_missing_alt = 0;
+    set_pages(state, vec![clean], "1 page on example.com".into());
+    state.sitemap = SitemapReport::default();
+    state.sitemap.discovery_done = true;
+    if let Some(run) = state.run.as_mut() {
+        run.sitemaps = false;
+    }
+    state.counts_dirty = true;
+    let _ = refresh_counts(state, true);
+    switch_tab(state, Tab::Overview);
+}
+fn scene_overview_limited(state: &mut State) {
+    scene_limited(state);
+    switch_tab(state, Tab::Overview);
+}
+fn scene_overview_failed(state: &mut State) {
+    scene_failed(state);
+    switch_tab(state, Tab::Overview);
+}
+fn scene_overview_unavailable(state: &mut State) {
+    load_sample(state);
+    scene_browser_unavailable(state);
+    switch_tab(state, Tab::Overview);
+}
+fn scene_sitemap_options(state: &mut State) {
+    load_sample(state);
+    state.crawl_options_open = true;
+    switch_tab(state, Tab::Overview);
+}
 fn scene_titles(state: &mut State) {
     load_sample(state);
     switch_tab(state, Tab::Titles);
@@ -6077,8 +7024,12 @@ fn scene_preparing(state: &mut State) {
     state.visible.clear();
     state.search_index.clear();
     state.counts = Counts::default();
+    state.overview = OverviewCounts::default();
     state.view_counts = ViewCounts::default();
+    state.sitemap = SitemapReport::default();
+    state.sitemap_discovering = state.use_sitemaps;
     state.table.clear_selection();
+    switch_tab(state, Tab::Overview);
 }
 
 fn scene_stopping(state: &mut State) {
@@ -6086,6 +7037,7 @@ fn scene_stopping(state: &mut State) {
     state.phase = RunPhase::Stopping;
     state.crawl_started = Some(Instant::now());
     state.message = "Stopping…".into();
+    switch_tab(state, Tab::Overview);
 }
 
 fn scene_limited(state: &mut State) {
@@ -6093,6 +7045,7 @@ fn scene_limited(state: &mut State) {
     state.phase = RunPhase::Limited;
     state.crawl_elapsed = Some(Duration::from_millis(2_140));
     state.message = "9 pages on example.com · stopped at the 40 page limit".into();
+    state.run_outcome = Some(state.message.clone());
 }
 
 fn scene_failed(state: &mut State) {
@@ -6103,6 +7056,7 @@ fn scene_failed(state: &mut State) {
     state.visible.clear();
     state.counts = Counts::default();
     state.view_counts = ViewCounts::default();
+    state.overview = OverviewCounts::default();
     state.sitemap = SitemapReport::default();
     state.run = Some(RunContext {
         seed: "https://example.com/".into(),
@@ -6121,10 +7075,34 @@ fn scene_indexability_details(state: &mut State) {
     select_scene_url(state, "https://example.com/wholesale");
     state.details_open = true;
 }
+fn scene_indexability_clean_details(state: &mut State) {
+    load_indexability_sample(state);
+    let url = state
+        .pages
+        .iter()
+        .find(|page| page.indexability.label == Label::NoBlockFound)
+        .map(|page| page.url.clone())
+        .expect("the mixed fixture keeps a clean page");
+    select_scene_url(state, &url);
+    state.details_open = true;
+}
+fn scene_indexability_incomplete_details(state: &mut State) {
+    load_browser_sample(state);
+    let url = state
+        .pages
+        .iter()
+        .find(|page| page_incomplete(page))
+        .map(|page| page.url.clone())
+        .expect("the browser fixture keeps an incomplete capture");
+    select_scene_url(state, &url);
+    state.details_open = true;
+}
 fn browser_sample_status() -> BrowserStatus {
     BrowserStatus::Ready {
-        path: PathBuf::from("/Applications/Google Chrome.app"),
+        path: PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        application: Some(PathBuf::from("/Applications/Google Chrome.app")),
         version: "Chrome/157.0.8103.40".into(),
+        label: "Google Chrome".into(),
     }
 }
 
@@ -6258,6 +7236,61 @@ fn scene_browser_details(state: &mut State) {
     select_scene_url(state, "https://example.com/nofollow");
     state.details_open = true;
 }
+fn scene_overview_browser_launch_failed(state: &mut State) {
+    load_sample(state);
+    state.rendering = RenderMode::Browser;
+    state.browser_probe = None;
+    state.browser = BrowserChoice {
+        path: Some(PathBuf::from(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        )),
+        status: browser_sample_status(),
+    };
+    apply_browser_setup_failure(
+        state,
+        "Could not start /Applications/Google Chrome.app/Contents/MacOS/Google Chrome: exited before reporting a debugging endpoint".into(),
+    );
+    switch_tab(state, Tab::Overview);
+}
+fn scene_overview_browser_launch_failed_details(state: &mut State) {
+    scene_overview_browser_launch_failed(state);
+    state.browser_details_open = true;
+}
+fn scene_overview_browser_checking(state: &mut State) {
+    load_sample(state);
+    state.rendering = RenderMode::Browser;
+    state.browser_probe = None;
+    state.browser = BrowserChoice {
+        path: None,
+        status: BrowserStatus::Checking,
+    };
+    switch_tab(state, Tab::Overview);
+}
+fn scene_overview_browser_ready(state: &mut State) {
+    load_sample(state);
+    state.rendering = RenderMode::Browser;
+    state.browser_probe = None;
+    state.browser = BrowserChoice {
+        path: Some(PathBuf::from(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        )),
+        status: browser_sample_status(),
+    };
+    switch_tab(state, Tab::Overview);
+}
+fn scene_browser_setup_details(state: &mut State) {
+    load_sample(state);
+    state.rendering = RenderMode::Browser;
+    state.browser_probe = None;
+    state.browser = BrowserChoice {
+        path: Some(PathBuf::from(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        )),
+        status: browser_sample_status(),
+    };
+    state.browser_details_open = true;
+    switch_tab(state, Tab::Overview);
+}
 
 fn scene_browser_evidence(state: &mut State) {
     scene_browser_details(state);
@@ -6271,7 +7304,8 @@ fn scene_browser_unavailable(state: &mut State) {
     state.browser = BrowserChoice {
         path: None,
         status: BrowserStatus::Unavailable {
-            reason: "No Chrome or Chromium was found on this machine.".into(),
+            summary: "No Chrome or Chromium installation was found.".into(),
+            detail: "Choose a browser application to use Browser mode.".into(),
         },
     };
     state.message = "Ready · enter a site URL to begin. Up to 40 pages and 3 levels deep.".into();
@@ -6289,7 +7323,7 @@ fn scene_error(state: &mut State) {
     state.message = "Couldn’t read “not a url” as a URL.".into();
 }
 fn scene_crawling(state: &mut State) {
-    state.pages.clear();
+    scene_preparing(state);
     state.phase = RunPhase::Crawling;
     state.message = "Crawling https://example.com/…".into();
 }
@@ -6373,6 +7407,12 @@ fn main() {
         scenes: &[
             ("empty", scene_empty),
             ("sample", scene_sample),
+            ("overview", scene_overview),
+            ("overview-clean", scene_overview_clean),
+            ("overview-limited", scene_overview_limited),
+            ("overview-failed", scene_overview_failed),
+            ("overview-unavailable", scene_overview_unavailable),
+            ("sitemap-options", scene_sitemap_options),
             ("titles", scene_titles),
             ("meta", scene_meta),
             ("h1", scene_h1),
@@ -6385,6 +7425,14 @@ fn main() {
             ("sitemap-files-findings", scene_sitemap_files_findings),
             ("indexability", scene_indexability),
             ("indexability-details", scene_indexability_details),
+            (
+                "indexability-clean-details",
+                scene_indexability_clean_details,
+            ),
+            (
+                "indexability-incomplete-details",
+                scene_indexability_incomplete_details,
+            ),
             ("filter-empty", scene_filter_empty),
             ("filter-findings", scene_filter_findings),
             ("filter-incomplete", scene_filter_incomplete),
@@ -6403,6 +7451,17 @@ fn main() {
             ("failed", scene_failed),
             ("browser", scene_browser),
             ("browser-details", scene_browser_details),
+            ("browser-setup-details", scene_browser_setup_details),
+            (
+                "overview-browser-launch-failed",
+                scene_overview_browser_launch_failed,
+            ),
+            (
+                "overview-browser-launch-failed-details",
+                scene_overview_browser_launch_failed_details,
+            ),
+            ("overview-browser-checking", scene_overview_browser_checking),
+            ("overview-browser-ready", scene_overview_browser_ready),
             ("browser-evidence", scene_browser_evidence),
             ("browser-unavailable", scene_browser_unavailable),
             ("title-issues", scene_title_issues),
@@ -6512,6 +7571,598 @@ mod tests {
     }
 
     #[test]
+    fn overview_is_the_default_and_navigates_each_group_to_its_view() {
+        let mut state = init();
+        load_sample(&mut state);
+        switch_tab(&mut state, Tab::Overview);
+        // A stale query in a table view must not make a clicked group look empty.
+        state.views[view_slot(Tab::Titles, SitemapView::Urls)]
+            .query
+            .replace_text("no-such-result");
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert_eq!(rt.state.tab, Tab::Overview);
+        assert!(rt.find("overview").is_some());
+        assert!(rt.find("grid").is_none(), "Overview is not a URL table");
+        assert!(rt.find("result-search").is_none());
+        assert!(rt.find("copy-urls").is_none());
+        assert!(rt.find("export-csv").is_none());
+        assert!(rt.find("overview-open-urls").is_some());
+        assert!(rt.find("overview-export-csv").is_some());
+
+        let response = rt.state.overview.response;
+        assert!(response > 0);
+        click_key(&mut rt, "overview-response");
+        assert_eq!(rt.state.tab, Tab::Response);
+        assert_eq!(rt.state.view().filter, CheckFilter::Findings);
+        assert_eq!(rt.state.visible.len(), response);
+
+        click_key(&mut rt, "tab-overview");
+        let titles = rt.state.overview.titles;
+        assert!(titles > 0);
+        click_key(&mut rt, "overview-titles");
+        assert_eq!(rt.state.tab, Tab::Titles);
+        assert_eq!(rt.state.view().filter, CheckFilter::Findings);
+        assert!(
+            rt.state.view().query.text.is_empty(),
+            "hidden query cleared"
+        );
+        assert_eq!(rt.state.visible.len(), titles);
+
+        click_key(&mut rt, "tab-overview");
+        let indexing = rt.state.overview.indexability;
+        click_key(&mut rt, "overview-indexability");
+        assert_eq!(rt.state.tab, Tab::Internal);
+        assert_eq!(rt.state.view().filter, CheckFilter::Findings);
+        assert_eq!(rt.state.visible.len(), indexing);
+
+        for (key, expected_tab, count) in [
+            (
+                "overview-descriptions",
+                Tab::Meta,
+                rt.state.overview.descriptions,
+            ),
+            ("overview-headings", Tab::H1, rt.state.overview.headings),
+            ("overview-images", Tab::Images, rt.state.overview.images),
+            ("overview-links", Tab::Links, rt.state.overview.links),
+        ] {
+            click_key(&mut rt, "tab-overview");
+            click_key(&mut rt, key);
+            assert_eq!(rt.state.tab, expected_tab, "{key}");
+            assert_eq!(rt.state.view().filter, CheckFilter::Findings, "{key}");
+            assert_eq!(rt.state.visible.len(), count, "{key}");
+        }
+    }
+
+    #[test]
+    fn overview_open_url_table_and_keyboard_search_have_clear_destinations() {
+        let mut state = init();
+        load_sample(&mut state);
+        switch_tab(&mut state, Tab::Overview);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        click_key(&mut rt, "overview-open-urls");
+        assert_eq!(rt.state.tab, Tab::Internal);
+        assert_eq!(rt.state.view().filter, CheckFilter::All);
+        assert_eq!(rt.state.visible.len(), rt.state.pages.len());
+
+        switch_tab(&mut rt.state, Tab::Overview);
+        assert!(focus_search_state(&mut rt.state));
+        assert_eq!(rt.state.tab, Tab::Internal);
+        assert!(rt.state.view().query.focused);
+    }
+
+    #[test]
+    fn streaming_and_completion_never_force_navigation_back_to_overview() {
+        let mut state = init();
+        state.tab = Tab::Overview;
+        state.phase = RunPhase::Crawling;
+        state.run = Some(RunContext {
+            seed: "https://example.com/".into(),
+            host: "example.com".into(),
+            limits: Limits::default(),
+            rendering: RenderMode::Html,
+            sitemaps: false,
+        });
+        let (tx, rx) = mpsc::channel();
+        state.job = Some(CrawlJob {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            stopping: false,
+        });
+        let pages = crawl::sample_pages();
+        let _ = tx.send(CrawlEvent::Page(Box::new(pages[0].clone())));
+        poll_crawl(&mut state);
+        assert_eq!(state.tab, Tab::Overview, "streaming stays on Overview");
+
+        switch_tab(&mut state, Tab::Titles);
+        let _ = tx.send(CrawlEvent::Page(Box::new(pages[1].clone())));
+        poll_crawl(&mut state);
+        assert_eq!(state.tab, Tab::Titles, "a manual table choice is kept");
+        let _ = tx.send(CrawlEvent::Done(
+            "2 pages on example.com".into(),
+            Box::new(calmtoad::sitemap::sample_report()),
+            CrawlOutcome::Completed,
+        ));
+        poll_crawl(&mut state);
+        assert_eq!(state.phase, RunPhase::Completed);
+        assert_eq!(
+            state.tab,
+            Tab::Titles,
+            "completion does not pull the person back"
+        );
+    }
+
+    #[test]
+    fn invalid_setup_keeps_the_current_run_and_view() {
+        let mut state = init();
+        load_sample(&mut state);
+        switch_tab(&mut state, Tab::Titles);
+        state.view_mut().filter = CheckFilter::Findings;
+        state.view_mut().query.replace_text("calm");
+        refresh_visible_forced(&mut state);
+        let pages = state.pages.len();
+        let visible = state.visible.clone();
+        let filter = state.view().filter;
+        let sort = state.view().sort.clone();
+        state.url.replace_text("not a url");
+        start_crawl(&mut state);
+        assert!(state.field_errors.any());
+        assert_eq!(state.tab, Tab::Titles);
+        assert_eq!(state.pages.len(), pages);
+        assert_eq!(state.visible, visible);
+        assert_eq!(state.view().filter, filter);
+        assert_eq!(state.view().sort, sort);
+    }
+
+    #[test]
+    fn overview_states_do_not_claim_an_all_clear_for_missing_coverage() {
+        let mut state = init();
+        load_sample(&mut state);
+        switch_tab(&mut state, Tab::Overview);
+        state.phase = RunPhase::Stopped;
+        state.overview = OverviewCounts {
+            pages: 9,
+            incomplete: 2,
+            ..OverviewCounts::default()
+        };
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("overview-no-findings").is_some());
+        assert!(rt.find("overview-incomplete").is_some());
+        assert!(rt.find("overview-coverage-complete").is_none());
+        assert!(rt.find("overview-outcome").is_some());
+
+        let mut state = init();
+        load_sample(&mut state);
+        switch_tab(&mut state, Tab::Overview);
+        state.overview = OverviewCounts {
+            pages: 9,
+            ..OverviewCounts::default()
+        };
+        state.sitemap = SitemapReport::default();
+        state.phase = RunPhase::Completed;
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("overview-no-findings").is_some());
+        assert!(rt.find("overview-coverage-complete").is_some());
+        assert!(rt.find("overview-incomplete").is_none());
+    }
+
+    fn test_browser_capture(
+        state: RenderState,
+        rendered: bool,
+        source: SourceState,
+        truncated: bool,
+    ) -> CaptureInfo {
+        CaptureInfo {
+            mode: CaptureMode::Browser,
+            render: Some(RenderSummary {
+                state,
+                reason: String::new(),
+                browser: "Chrome/test".into(),
+                observed_url: "https://example.com/".into(),
+                source_captured: source == SourceState::Captured,
+                source_state: source,
+                source_note: String::new(),
+                rendered_captured: rendered,
+                rendered_truncated: truncated,
+                resource_failures: Vec::new(),
+                navigation_to: String::new(),
+                elapsed_ms: 1,
+                requests: 1,
+            }),
+        }
+    }
+
+    fn test_browser_ready() -> BrowserChoice {
+        BrowserChoice {
+            path: Some(PathBuf::from(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            )),
+            status: browser_sample_status(),
+        }
+    }
+
+    #[test]
+    fn a_real_browser_launch_failure_opens_setup_recovery_not_a_domain_error() {
+        let mut state = init();
+        load_sample(&mut state);
+        state.rendering = RenderMode::Browser;
+        state.browser = test_browser_ready();
+        let (tx, rx) = mpsc::channel();
+        state.job = Some(CrawlJob {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            stopping: false,
+        });
+        let detail =
+            "Could not start /Applications/Google Chrome.app/Contents/MacOS/Google Chrome: exited before reporting a debugging endpoint"
+                .to_string();
+        tx.send(CrawlEvent::BrowserSetupFailed(detail.clone()))
+            .unwrap();
+        tx.send(CrawlEvent::Done(
+            "Browser could not start.".into(),
+            Box::default(),
+            CrawlOutcome::Failed,
+        ))
+        .unwrap();
+        poll_crawl(&mut state);
+        match &state.browser.status {
+            BrowserStatus::Unavailable {
+                summary,
+                detail: shown,
+            } => {
+                assert_eq!(summary, "Couldn't start Google Chrome.");
+                assert_eq!(shown, &detail);
+            }
+            _ => panic!("a launch failure must leave the setup strip recoverable"),
+        }
+        assert_eq!(
+            state.run_outcome.as_deref(),
+            Some("Browser could not start."),
+            "the primary run summary stays short"
+        );
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("browser-strip").is_some());
+        assert!(rt.find("retry-browser").is_some());
+        assert!(rt.find("use-html").is_some());
+        assert!(rt.find("choose-browser").is_some());
+        assert!(rt.find("browser-detail").is_none());
+        click_key(&mut rt, "browser-details");
+        assert!(rt.find("browser-detail").is_some());
+        assert!(
+            rt.find("copy-browser-diagnostics").is_some(),
+            "the raw launch diagnostic can be copied"
+        );
+    }
+
+    #[test]
+    fn auto_discovery_failure_details_copy_the_raw_diagnostic_without_a_path() {
+        let detail = "No Chrome or Chromium installation was found. Choose a browser application."
+            .to_string();
+        let mut state = init();
+        load_sample(&mut state);
+        state.rendering = RenderMode::Browser;
+        state.browser_probe = None;
+        state.browser = BrowserChoice {
+            path: None,
+            status: BrowserStatus::Unavailable {
+                summary: "No Chrome or Chromium installation was found.".into(),
+                detail: detail.clone(),
+            },
+        };
+        state.browser_details_open = false;
+        let clipboard = rune::clipboard::memory();
+        let mut rt = test_runtime(state);
+        rt.use_clipboard(&clipboard);
+        rt.frame(0.016);
+        click_key(&mut rt, "browser-details");
+        rt.frame(0.016);
+        assert!(rt.find("browser-detail").is_some());
+        click_key(&mut rt, "copy-browser-diagnostics");
+        rt.frame(0.016);
+        assert_eq!(
+            clipboard
+                .text()
+                .map(|text| text.to_string())
+                .unwrap_or_default(),
+            detail
+        );
+    }
+
+    #[test]
+    fn a_domain_failure_does_not_turn_a_working_browser_into_a_setup_failure() {
+        let mut state = init();
+        load_sample(&mut state);
+        state.rendering = RenderMode::Browser;
+        state.browser = test_browser_ready();
+        let (tx, rx) = mpsc::channel();
+        state.job = Some(CrawlJob {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            stopping: false,
+        });
+        tx.send(CrawlEvent::Done(
+            "Crawl failed · no response".into(),
+            Box::default(),
+            CrawlOutcome::Failed,
+        ))
+        .unwrap();
+        poll_crawl(&mut state);
+        assert!(
+            state.browser.status.is_ready(),
+            "ordinary page/domain failures keep a working browser ready"
+        );
+        assert_eq!(
+            state.run_outcome.as_deref(),
+            Some("Crawl failed · no response")
+        );
+    }
+
+    #[test]
+    fn a_stopped_browser_crawl_keeps_the_browser_ready() {
+        let mut state = init();
+        load_sample(&mut state);
+        state.rendering = RenderMode::Browser;
+        state.browser = test_browser_ready();
+        let (tx, rx) = mpsc::channel();
+        state.job = Some(CrawlJob {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            stopping: false,
+        });
+        tx.send(CrawlEvent::Done(
+            "Stopped · 0 pages on example.com".into(),
+            Box::default(),
+            CrawlOutcome::Stopped,
+        ))
+        .unwrap();
+        poll_crawl(&mut state);
+        assert_eq!(state.phase, RunPhase::Stopped);
+        assert!(
+            state.browser.status.is_ready(),
+            "a deliberate stop is not a browser setup failure"
+        );
+    }
+
+    #[test]
+    fn sitemap_incomplete_count_matches_the_incomplete_filter_copy_and_export_scope() {
+        let mut report = SitemapReport::default();
+        report.discovery_done = true;
+        let mut not_checked = SitemapUrl {
+            url: "https://example.com/not-checked".into(),
+            state: UrlState::NotChecked,
+            ..SitemapUrl::default()
+        };
+        not_checked.sources = vec!["https://example.com/sitemap.xml".into()];
+        report.insert_url(not_checked);
+        let mut truncated = SitemapUrl {
+            url: "https://example.com/truncated".into(),
+            state: UrlState::Checked,
+            status: 200,
+            content_type: "text/html".into(),
+            ..SitemapUrl::default()
+        };
+        truncated.sources = vec!["https://example.com/sitemap.xml".into()];
+        truncated.assessment.evidence.read = ReadState::Truncated;
+        report.insert_url(truncated);
+        let clean = SitemapUrl {
+            url: "https://example.com/clean".into(),
+            state: UrlState::Checked,
+            status: 200,
+            content_type: "text/html".into(),
+            ..SitemapUrl::default()
+        };
+        report.insert_url(clean);
+
+        let mut state = init();
+        load_sample(&mut state);
+        state.sitemap = report;
+        state.counts_dirty = true;
+        let _ = refresh_counts(&mut state, true);
+        switch_tab(&mut state, Tab::Overview);
+        assert_eq!(state.overview.sitemap_incomplete, 2);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        click_key(&mut rt, "overview-sitemap-incomplete");
+        assert_eq!(rt.state.tab, Tab::Sitemaps);
+        assert_eq!(rt.state.sitemap_view, SitemapView::Urls);
+        assert_eq!(rt.state.view().filter, CheckFilter::Incomplete);
+        assert_eq!(visible_len(&rt.state), 2);
+        assert_eq!(
+            export_scope(&rt.state, visible_len(&rt.state), "Sitemap URLs"),
+            "2 filtered visible Sitemap URLs rows"
+        );
+        let clipboard = rune::clipboard::memory();
+        rt.use_clipboard(&clipboard);
+        click_key(&mut rt, "copy-urls");
+        let copied = clipboard
+            .text()
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        assert_eq!(copied.lines().count(), 2);
+        assert_eq!(copied.lines().collect::<Vec<_>>(), visible_ids(&rt.state));
+    }
+
+    #[test]
+    fn sitemap_file_findings_are_counted_without_listed_urls_or_partial_discovery() {
+        let mut report = SitemapReport::default();
+        report.discovery_done = true;
+        report.insert_file(SitemapFile {
+            url: "https://example.com/broken-sitemap.xml".into(),
+            state: FileState::Error,
+            status: 404,
+            issue: "Not found (404)".into(),
+            ..SitemapFile::default()
+        });
+        report.insert_file(SitemapFile {
+            url: "https://example.com/sitemap_index.xml".into(),
+            state: FileState::Absent,
+            status: 404,
+            ..SitemapFile::default()
+        });
+        report.insert_file(SitemapFile {
+            url: "https://example.com/pending-sitemap.xml".into(),
+            state: FileState::Pending,
+            ..SitemapFile::default()
+        });
+        assert!(report.urls.is_empty());
+        assert!(report.partial.is_none());
+
+        let mut state = init();
+        load_sample(&mut state);
+        state.sitemap = report;
+        state.counts_dirty = true;
+        let _ = refresh_counts(&mut state, true);
+        switch_tab(&mut state, Tab::Overview);
+        assert_eq!(state.overview.sitemap_incomplete, 0);
+        assert_eq!(
+            state.overview.sitemap_file_findings, 1,
+            "an error is a finding; guessed absence and pending discovery are not"
+        );
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("overview-sitemap-files").is_some());
+        assert!(
+            rt.find("overview-coverage-complete").is_none(),
+            "file findings are coverage gaps"
+        );
+        click_key(&mut rt, "overview-sitemap-files");
+        assert_eq!(rt.state.tab, Tab::Sitemaps);
+        assert_eq!(rt.state.sitemap_view, SitemapView::Files);
+        assert_eq!(rt.state.view().filter, CheckFilter::Findings);
+        assert_eq!(visible_len(&rt.state), 1);
+    }
+
+    #[test]
+    fn browser_non_html_is_complete_but_missing_html_dom_and_truncation_are_not() {
+        let mut pdf = crawl::indexability_sample_pages()
+            .into_iter()
+            .find(|page| page.url.ends_with("/report-2026.pdf"))
+            .expect("sample PDF");
+        pdf.indexability.capture = test_browser_capture(
+            RenderState::Captured,
+            false,
+            SourceState::NotApplicable,
+            false,
+        );
+        assert!(
+            !page_incomplete(&pdf),
+            "a successful non-HTML response has no DOM to require"
+        );
+        assert!(!auditable(&pdf));
+        assert_eq!(
+            export_row(Tab::Internal, &pdf, &Audit::default())[3],
+            "Browser · response"
+        );
+
+        let mut missing_dom = crawl::sample_pages()[0].clone();
+        missing_dom.indexability.capture =
+            test_browser_capture(RenderState::Captured, false, SourceState::Captured, false);
+        assert!(
+            page_incomplete(&missing_dom),
+            "HTML still requires a rendered DOM"
+        );
+        let missing_capture = export_row(Tab::Internal, &missing_dom, &Audit::default())[3].clone();
+        assert!(missing_capture.contains("incomplete"));
+        assert!(missing_capture.contains("DOM missing"));
+
+        let mut truncated = crawl::sample_pages()[1].clone();
+        truncated.indexability.capture =
+            test_browser_capture(RenderState::Captured, true, SourceState::Captured, true);
+        assert!(
+            page_incomplete(&truncated),
+            "a truncated DOM remains incomplete"
+        );
+        assert!(export_row(Tab::Internal, &truncated, &Audit::default())[3].contains("DOM capped"));
+
+        let mut state = init();
+        set_pages(
+            &mut state,
+            vec![pdf, missing_dom, truncated],
+            "3 pages on example.com".into(),
+        );
+        switch_tab(&mut state, Tab::Overview);
+        assert_eq!(
+            state.overview.incomplete, 2,
+            "only the HTML missing-DOM and truncated captures are incomplete"
+        );
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        click_key(&mut rt, "overview-incomplete");
+        assert_eq!(rt.state.tab, Tab::Internal);
+        assert_eq!(rt.state.view().filter, CheckFilter::Incomplete);
+        assert_eq!(visible_len(&rt.state), 2);
+
+        let mut report = SitemapReport::default();
+        report.discovery_done = true;
+        report.insert_url(SitemapUrl {
+            url: "https://example.com/report-2026.pdf".into(),
+            state: UrlState::Checked,
+            status: 200,
+            content_type: "application/pdf".into(),
+            assessment: Box::new(calmtoad::indexability::assess(
+                "https://example.com/report-2026.pdf",
+                200,
+                "application/pdf",
+                "",
+                "",
+                Default::default(),
+                test_browser_capture(
+                    RenderState::Captured,
+                    false,
+                    SourceState::NotApplicable,
+                    false,
+                ),
+            )),
+            ..SitemapUrl::default()
+        });
+        assert!(
+            !sitemap_url_incomplete(&report.urls[0]),
+            "a checked PDF sitemap URL is a complete non-HTML observation"
+        );
+    }
+
+    #[test]
+    fn overview_and_all_tabs_fit_the_minimum_window_without_numeric_suffixes() {
+        let state = init();
+        let mut rt = Runtime::new(
+            state,
+            view,
+            (880.0, 560.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.016);
+        for tab in [
+            Tab::Overview,
+            Tab::Internal,
+            Tab::Titles,
+            Tab::Meta,
+            Tab::H1,
+            Tab::Response,
+            Tab::Canonical,
+            Tab::Images,
+            Tab::Links,
+            Tab::Sitemaps,
+        ] {
+            let (x, y) = rt
+                .find(tab_key(tab))
+                .unwrap_or_else(|| panic!("missing {}", tab_short(tab)));
+            assert!(
+                (0.0..880.0).contains(&x) && (0.0..560.0).contains(&y),
+                "{} is reachable at 880px: ({x}, {y})",
+                tab_short(tab)
+            );
+        }
+        assert_eq!(rt.state.tab, Tab::Overview);
+    }
+
+    #[test]
     fn a_rejected_url_replaces_the_empty_invitation() {
         let mut state = init();
         scene_error(&mut state);
@@ -6525,8 +8176,14 @@ mod tests {
             },
         );
         rt.frame(0.016);
-        assert!(rt.find("frame").is_some(), "results frame");
-        assert!(rt.find("empty-title").is_some(), "error state is rendered");
+        assert!(
+            rt.find("overview").is_some(),
+            "Overview remains the entry point"
+        );
+        assert!(
+            rt.find("overview-title").is_some(),
+            "error state is rendered"
+        );
         assert!(rt.state.pages.is_empty());
         assert!(!rt.state.phase.active());
     }
@@ -6736,7 +8393,10 @@ mod tests {
         state.phase = RunPhase::Completed;
         state.use_sitemaps = false;
         state.sitemap.discovery_done = true;
-        assert_eq!(sitemap_summary(&state), "Sitemap discovery is off");
+        assert_eq!(
+            sitemap_summary(&state),
+            "Sitemap discovery was off for this crawl"
+        );
     }
 
     #[test]
@@ -7266,6 +8926,46 @@ mod tests {
     }
 
     #[test]
+    fn browser_recovery_actions_and_picker_context_are_scripted_safely() {
+        let mut state = init();
+        load_sample(&mut state);
+        let pages = state.pages.len();
+        scene_browser_unavailable(&mut state);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("browser-strip").is_some());
+        assert!(rt.find("retry-browser").is_some());
+        assert!(rt.find("use-html").is_some());
+        assert!(rt.find("choose-browser").is_some());
+
+        click_key(&mut rt, "browser-details");
+        assert!(rt.state.browser_details_open);
+        assert!(rt.find("browser-detail").is_some());
+
+        click_key(&mut rt, "choose-browser");
+        let (kind, options) = rt.file_dialog().expect("browser picker opened");
+        assert_eq!(kind, rune::file_dialog::FileDialogKind::Open);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                options.directory.as_deref(),
+                Some(std::path::Path::new("/Applications"))
+            );
+            assert!(
+                options.filters.is_empty(),
+                "a normal Open panel must leave .app bundles selectable"
+            );
+            assert!(options.title.to_lowercase().contains("application"));
+        }
+        rt.resolve_file_dialog(None).expect("cancel the picker");
+        rt.frame(0.016);
+
+        click_key(&mut rt, "use-html");
+        assert_eq!(rt.state.rendering, RenderMode::Html);
+        assert_eq!(rt.state.pages.len(), pages, "results are retained");
+        assert!(rt.state.details_open || !rt.state.pages.is_empty());
+    }
+    #[test]
     fn browser_mode_cannot_start_without_a_usable_browser() {
         let mut state = init();
         scene_browser_unavailable(&mut state);
@@ -7334,7 +9034,8 @@ mod tests {
         state.browser = BrowserChoice {
             path: None,
             status: BrowserStatus::Unavailable {
-                reason: "No browser".into(),
+                summary: "Couldn't use the chosen browser.".into(),
+                detail: "The selected application is not available.".into(),
             },
         };
         let mut rt = test_runtime(state);
@@ -8449,6 +10150,55 @@ mod tests {
         assert_eq!(
             run_report_reason(&rt.state),
             "Stopped · 3 pages on example.com"
+        );
+    }
+
+    #[test]
+    fn sitemap_explanation_is_a_compact_disclosure_not_a_permanent_strip() {
+        let mut state = init();
+        load_sample(&mut state);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("use-sitemaps").is_some());
+        assert!(rt.find("sitemap-options").is_some());
+        assert!(
+            rt.find("crawl-options-note").is_none(),
+            "the explanation is available without a permanent strip"
+        );
+        click_key(&mut rt, "sitemap-options");
+        assert!(rt.state.crawl_options_open);
+        assert!(rt.find("crawl-options-note").is_some());
+        click_key(&mut rt, "use-sitemaps");
+        assert!(!rt.state.use_sitemaps);
+        assert!(rt.find("crawl-options-note").is_some());
+        click_key(&mut rt, "sitemap-options");
+        assert!(!rt.state.crawl_options_open);
+        assert!(rt.find("crawl-options-note").is_none());
+    }
+
+    #[test]
+    fn sitemap_option_copy_and_retained_capture_provenance_are_explicit() {
+        assert!(crawl_option_note_text(true).contains("same page limit"));
+        assert!(crawl_option_note_text(false).contains("page links only"));
+        let mut state = init();
+        load_sample(&mut state);
+        assert_eq!(run_capture_label(&state), "HTML");
+        scene_browser_unavailable(&mut state);
+        assert_eq!(
+            run_capture_label(&state),
+            "HTML",
+            "next-run Browser setup does not relabel retained HTML results"
+        );
+        assert!(sitemap_summary(&state).contains("listed"));
+        state.use_sitemaps = false;
+        assert!(
+            sitemap_summary(&state).contains("listed"),
+            "the next-run checkbox does not erase saved sitemap coverage"
+        );
+        state.run.as_mut().unwrap().sitemaps = false;
+        assert_eq!(
+            sitemap_summary(&state),
+            "Sitemap discovery was off for this crawl"
         );
     }
     #[test]

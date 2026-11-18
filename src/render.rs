@@ -400,8 +400,26 @@ fn unregister_process(registry: &mut HashMap<u32, OwnedProcess>, pid: u32, proce
 
 #[derive(Clone, Debug)]
 pub struct BrowserInfo {
+    /// The browser executable used for the isolated process.
     pub path: PathBuf,
+    /// The selected application bundle on macOS, when the choice came from one.
+    pub application: Option<PathBuf>,
+    /// A version label when known. Discovery deliberately does not wait on a version
+    /// subprocess; capability is proven by the controlled CDP launch.
     pub version: String,
+}
+
+impl BrowserInfo {
+    /// A short application name for the setup strip.
+    pub fn label(&self) -> String {
+        self.application
+            .as_deref()
+            .or(Some(self.path.as_path()))
+            .and_then(Path::file_stem)
+            .and_then(|name| name.to_str())
+            .unwrap_or("Chrome or Chromium")
+            .to_string()
+    }
 }
 
 /// Find a usable local Chrome/Chromium. No download is attempted.
@@ -410,12 +428,7 @@ pub struct BrowserInfo {
 /// reported instead of silently falling back to a different installed browser.
 pub fn discover_browser(explicit: Option<&Path>) -> Result<BrowserInfo, String> {
     if let Some(path) = explicit {
-        return usable_browser(path).map_err(|reason| {
-            format!(
-                "Browser mode could not use {}: {reason}. Choose a Chrome or Chromium executable.",
-                path.display()
-            )
-        });
+        return usable_browser(path).map_err(|reason| format!("{}: {reason}", path.display()));
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(value) = std::env::var("CALMTOAD_BROWSER_PATH")
@@ -425,35 +438,51 @@ pub fn discover_browser(explicit: Option<&Path>) -> Result<BrowserInfo, String> 
     }
     candidates.extend(platform_candidates());
 
-    let mut failures: Vec<String> = Vec::new();
     for candidate in candidates {
-        match usable_browser(&candidate) {
-            Ok(info) => return Ok(info),
-            Err(reason) => failures.push(reason),
+        if let Ok(info) = usable_browser(&candidate) {
+            return Ok(info);
         }
     }
-
-    let detail = failures.into_iter().take(3).collect::<Vec<_>>().join(" · ");
-    Err(if detail.is_empty() {
-        "Browser mode needs a locally installed Chrome or Chromium. Install one, or choose its executable.".into()
-    } else {
-        format!("Browser mode needs a locally installed Chrome or Chromium ({detail}).")
-    })
+    Err("No Chrome or Chromium installation was found. Choose a browser application.".into())
 }
 
 fn usable_browser(candidate: &Path) -> Result<BrowserInfo, String> {
     let Some(executable) = normalize_executable(candidate) else {
-        return Err(format!(
-            "{} is not a browser executable",
-            candidate.display()
-        ));
+        return Err("that location is not a browser application or executable".into());
     };
-    let version = browser_version(&executable)
-        .map_err(|reason| format!("{}: {reason}", executable.display()))?;
+    if !executable.is_file() {
+        return Err("the browser executable is missing".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(&executable)
+            .map(|metadata| metadata.permissions().mode() & 0o111 == 0)
+            .unwrap_or(true)
+        {
+            return Err("the browser executable is not runnable".into());
+        }
+    }
     Ok(BrowserInfo {
         path: executable,
-        version,
+        application: app_bundle_for(candidate),
+        version: String::new(),
     })
+}
+
+/// The application bundle containing `path`, if any.
+fn app_bundle_for(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate
+            .extension()
+            .is_some_and(|extension| extension == "app")
+        {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    None
 }
 
 fn platform_candidates() -> Vec<PathBuf> {
@@ -523,53 +552,6 @@ fn normalize_executable(path: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn browser_version(executable: &Path) -> Result<String, String> {
-    use std::io::Read;
-
-    let mut child = std::process::Command::new(executable)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not launch: {error}"))?;
-    // Chrome can take several seconds to answer on a cold, busy machine; keep the probe
-    // bounded without failing a healthy installation.
-    let timeout = Duration::from_secs(10);
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "did not report a version within {} seconds",
-                    timeout.as_secs()
-                ));
-            }
-            Err(error) => return Err(format!("could not inspect the version: {error}")),
-        }
-    };
-    if !status.success() {
-        return Err("exited without reporting a version".into());
-    }
-    let mut output = Vec::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        stdout
-            .read_to_end(&mut output)
-            .map_err(|error| format!("could not read the version: {error}"))?;
-    }
-    let version = String::from_utf8_lossy(&output).trim().to_string();
-    if version.is_empty() {
-        return Err("reported no version".into());
-    }
-    Ok(version)
 }
 
 /// One browser process owned by one crawl.
@@ -752,6 +734,7 @@ impl BrowserRenderer {
             owned,
             info: BrowserInfo {
                 path: info.path,
+                application: info.application,
                 version,
             },
             config,

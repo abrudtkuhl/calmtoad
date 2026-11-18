@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use calmtoad::crawl::{CrawlOptions, Limits, auditable, crawl_site_with, title_issue};
+use calmtoad::crawl::{
+    CrawlOptions, CrawlOutcome, Limits, auditable, crawl_site_with, title_issue,
+};
 use calmtoad::indexability::{CaptureInfo, EvidenceStage, FindingCode, Label};
 use calmtoad::render::{
     BrowserRenderer, Capture, RenderConfig, RenderMode, RenderState, SourceState, discover_browser,
@@ -246,6 +248,13 @@ fn serve(
     let mut stream = stream;
     match path.as_str() {
         "/plain" => write_response(&mut stream, 200, "text/html; charset=utf-8", &[], PLAIN),
+        "/notes.txt" => write_response(
+            &mut stream,
+            200,
+            "text/plain; charset=utf-8",
+            &[],
+            "A plain text response with no HTML document.",
+        ),
         "/robots-header" => write_response(
             &mut stream,
             200,
@@ -554,7 +563,7 @@ fn launch_renderer(config: RenderConfig) -> Option<BrowserRenderer> {
             return None;
         }
     };
-    eprintln!("using {} ({})", info.version, info.path.display());
+    eprintln!("using {} ({})", info.label(), info.path.display());
     match BrowserRenderer::launch(config, Arc::new(AtomicBool::new(false))) {
         Ok(renderer) => Some(renderer),
         Err(reason) => {
@@ -869,6 +878,61 @@ fn browser_mode_refuses_out_of_scope_documents_before_they_are_requested() {
     let capture = renderer.render(&other_host, allowed, Arc::new(AtomicBool::new(false)));
     assert_eq!(capture.state, RenderState::Blocked);
     assert_eq!(fixture.hits("/plain"), 0);
+    renderer.shutdown();
+}
+
+#[test]
+fn successful_browser_non_html_response_is_complete_context() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let url = format!("{}/notes.txt", fixture.base());
+    let capture = renderer.render(
+        &url,
+        allow_base(&fixture.base()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(capture.state, RenderState::Captured, "{}", capture.reason);
+    assert!(
+        capture
+            .content_type
+            .to_ascii_lowercase()
+            .contains("text/plain"),
+        "{}",
+        capture.content_type
+    );
+    assert_eq!(capture.source_state, SourceState::NotApplicable);
+    assert!(
+        capture.rendered_html.is_none(),
+        "a non-HTML response has no rendered document"
+    );
+
+    let info = CaptureInfo::browser(&capture);
+    assert!(
+        info.is_complete(),
+        "a complete non-HTML observation is not an incomplete check"
+    );
+    assert_eq!(info.state_label(), "Browser · response");
+    let assessment = calmtoad::indexability::assess(
+        &url,
+        capture.status,
+        &capture.content_type,
+        "",
+        "",
+        Default::default(),
+        info,
+    );
+    assert_eq!(assessment.label, Label::NotAssessed);
+    assert!(
+        !assessment
+            .findings
+            .iter()
+            .any(|finding| finding.code == FindingCode::CaptureIncomplete),
+        "no DOM is expected for non-HTML: {:?}",
+        assessment.findings
+    );
     renderer.shutdown();
 }
 
@@ -1973,6 +2037,35 @@ fn browser_mode_crawl_audits_rendered_documents_and_keeps_source_evidence() {
     assert!(outcome.pages.len() >= 8);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn discovery_accepts_an_application_bundle_without_a_version_probe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let app = dir.path().join("Slow Browser.app");
+    let macos = app.join("Contents/MacOS");
+    std::fs::create_dir_all(&macos).expect("app contents");
+    let executable = macos.join("Slow Browser");
+    // A version probe would hang; discovery must not depend on one.
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 30; fi\nsleep 30\n",
+    )
+    .expect("fake browser");
+    let mut permissions = std::fs::metadata(&executable)
+        .expect("metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).expect("permissions");
+
+    let started = Instant::now();
+    let info = discover_browser(Some(&app)).expect("a present application is usable");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(info.path, executable);
+    assert_eq!(info.application.as_deref(), Some(app.as_path()));
+    assert!(info.label().contains("Slow Browser"));
+}
 #[test]
 fn an_explicit_browser_choice_is_not_silently_replaced() {
     let chosen = Path::new("/definitely/not/a/real/browser");
@@ -1997,9 +2090,91 @@ fn browser_mode_stops_before_crawling_when_the_chosen_browser_cannot_run() {
         |_| {},
     );
     assert!(outcome.pages.is_empty());
+    assert_eq!(outcome.message, "Browser could not start.");
+    let detail = outcome.setup_failure.expect("a setup failure is typed");
     assert!(
-        outcome.message.contains("could not use"),
-        "{}",
-        outcome.message
+        detail.contains("/definitely/not/a/real/browser")
+            && detail.contains("not a browser application"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn a_stop_during_browser_startup_is_not_a_setup_failure() {
+    let cancel = Arc::new(AtomicBool::new(true));
+    let outcome = crawl_site_with(
+        "https://example.com/",
+        Limits::default(),
+        CrawlOptions {
+            rendering: RenderMode::Browser,
+            ..CrawlOptions::default()
+        },
+        cancel,
+        |_| {},
+    );
+    assert_eq!(outcome.outcome, CrawlOutcome::Stopped);
+    assert!(outcome.setup_failure.is_none());
+    assert!(outcome.message.contains("Stopped"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stop_during_browser_preparation_returns_stopped_without_setup_failure() {
+    let (_dir, script) = fake_browser("#!/bin/sh\nsleep 30\n");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_thread = cancel.clone();
+    let handle = thread::spawn(move || {
+        crawl_site_with(
+            "https://example.com/",
+            Limits::default(),
+            CrawlOptions {
+                rendering: RenderMode::Browser,
+                browser_path: Some(script),
+                ..CrawlOptions::default()
+            },
+            cancel_thread,
+            |_| {},
+        )
+    });
+    thread::sleep(Duration::from_millis(200));
+    cancel.store(true, Ordering::Relaxed);
+    let outcome = handle.join().expect("crawl thread");
+    assert_eq!(outcome.outcome, CrawlOutcome::Stopped);
+    assert!(
+        outcome.setup_failure.is_none(),
+        "a user stop is not a browser setup failure"
+    );
+    assert!(outcome.message.contains("Stopped"));
+}
+
+#[cfg(unix)]
+#[test]
+fn browser_launch_failure_is_typed_as_setup_not_a_domain_failure() {
+    let (_dir, script) = fake_browser("#!/bin/sh\nexit 1\n");
+    let outcome = crawl_site_with(
+        "https://example.com/",
+        Limits::default(),
+        CrawlOptions {
+            rendering: RenderMode::Browser,
+            browser_path: Some(script.clone()),
+            ..CrawlOptions::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
+    assert!(outcome.pages.is_empty());
+    assert_eq!(outcome.outcome, CrawlOutcome::Failed);
+    assert_eq!(
+        outcome.message, "Browser could not start.",
+        "the run summary stays short"
+    );
+    let detail = outcome.setup_failure.expect("a setup failure is typed");
+    assert!(
+        !detail.trim().is_empty(),
+        "the raw launch diagnostic is retained for Details"
+    );
+    assert!(
+        detail.contains("debugging endpoint") || detail.contains("Could not start"),
+        "the detail names the controlled launch failure: {detail}"
     );
 }

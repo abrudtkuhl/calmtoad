@@ -266,12 +266,21 @@ impl CaptureInfo {
     }
 
     /// True when the page was fully captured at the selected stage.
+    ///
+    /// A successful non-HTML response legitimately has no rendered DOM and no source document
+    /// to compare. That is a complete observation, not a failed check. An HTML document still
+    /// requires its rendered DOM, so a missing, failed or truncated DOM stays incomplete.
     pub fn is_complete(&self) -> bool {
         match &self.render {
             Some(render) => {
+                let rendered_ok = if render.source_state == SourceState::NotApplicable {
+                    // No HTML document was expected, so there is no DOM to require.
+                    !render.rendered_truncated
+                } else {
+                    render.rendered_captured && !render.rendered_truncated
+                };
                 render.state == crate::render::RenderState::Captured
-                    && render.rendered_captured
-                    && !render.rendered_truncated
+                    && rendered_ok
                     && render.resource_failures.is_empty()
                     && render.source_state.is_complete()
             }
@@ -299,10 +308,14 @@ impl CaptureInfo {
             }
             Some(render) if !self.is_complete() => {
                 let mut parts = vec![self.mode.label().to_string(), "incomplete".to_string()];
-                if !render.rendered_captured {
-                    parts.push("DOM missing".into());
-                } else if render.rendered_truncated {
-                    parts.push("DOM capped".into());
+                // Non-HTML responses have no DOM by design; only name a missing or capped DOM
+                // when the document was expected to be HTML.
+                if render.source_state != SourceState::NotApplicable {
+                    if !render.rendered_captured {
+                        parts.push("DOM missing".into());
+                    } else if render.rendered_truncated {
+                        parts.push("DOM capped".into());
+                    }
                 }
                 if !render.source_state.is_complete() {
                     parts.push(format!(
@@ -318,7 +331,10 @@ impl CaptureInfo {
                 }
                 parts.join(" · ")
             }
-            Some(_) => format!("{} · rendered", self.mode.label()),
+            Some(render) if render.rendered_captured => {
+                format!("{} · rendered", self.mode.label())
+            }
+            Some(_) => format!("{} · response", self.mode.label()),
             None => self.mode.label().to_string(),
         }
     }
@@ -2205,6 +2221,31 @@ mod tests {
                 .evidence_text()
                 .contains("canonical /other → https://example.com/other")
         );
+    }
+
+    #[test]
+    fn a_non_html_browser_capture_is_complete_without_a_rendered_dom() {
+        let non_html = browser_capture(
+            crate::render::RenderState::Captured,
+            false,
+            SourceState::NotApplicable,
+        );
+        assert!(
+            non_html.is_complete(),
+            "a successful non-HTML response has no DOM to require"
+        );
+        assert_eq!(non_html.state_label(), "Browser · response");
+
+        let html_missing_dom = browser_capture(
+            crate::render::RenderState::Captured,
+            false,
+            SourceState::Captured,
+        );
+        assert!(
+            !html_missing_dom.is_complete(),
+            "an HTML document still requires its rendered DOM"
+        );
+        assert!(html_missing_dom.state_label().contains("DOM missing"));
     }
 
     #[test]
