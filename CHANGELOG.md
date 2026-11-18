@@ -5,6 +5,8 @@ date are being prepared for release.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-18
+
 ### Fixed
 
 - The Linux download starts again on Ubuntu 22.04 and newer, Debian 13, and other systems with glibc 2.35 or later. Calm Toad 0.6.0 for Linux needed glibc 2.43 and quit immediately on most current distributions.
