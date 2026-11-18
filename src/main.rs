@@ -8945,6 +8945,7 @@ mod tests {
         click_key(&mut rt, "choose-browser");
         let (kind, options) = rt.file_dialog().expect("browser picker opened");
         assert_eq!(kind, rune::file_dialog::FileDialogKind::Open);
+        assert!(!options.title.is_empty());
         #[cfg(target_os = "macos")]
         {
             assert_eq!(
