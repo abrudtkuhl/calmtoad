@@ -205,4 +205,4 @@ the `releases/latest` URL keeps pointing at the previous version.
 Users who installed a build from before in-app updates existed need one manual
 upgrade; later versions update themselves.
 
-The Linux build needs the `libxkbcommon` runtime. macOS app bundles are currently unsigned and unnotarized.
+The Linux build needs the `libxkbcommon` runtime and glibc 2.35 or newer (Ubuntu 22.04 or later). Release and CI build it in an `ubuntu:22.04` container (`.github/workflows/linux-build.yml`), fail if the binary needs a newer glibc symbol, and open it on Ubuntu 22.04, Ubuntu 24.04, and Debian 13 before publishing. Building on a newer system, as v0.6.0 did on Ubuntu 26.04, produces a download that only starts on that system or newer. macOS app bundles are currently unsigned and unnotarized.

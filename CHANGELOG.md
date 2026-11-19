@@ -26,6 +26,13 @@
 User-facing changes are recorded here as work ships. Versions without a release
 date are being prepared for release.
 
+## [0.6.1] - 2026-11-18
+
+### Fixed
+
+- The Linux download starts again on Ubuntu 22.04 and newer, Debian 13, and other systems with glibc 2.35 or later. Calm Toad 0.6.0 for Linux needed glibc 2.43 and quit immediately on most current distributions.
+- Identify crawl requests as `CalmToad/<version> (+https://calmtoad.com)`, in both HTML and Browser mode, so site owners see the real release and a working contact URL. Earlier versions sent `Calmtoad/0.1` with a placeholder address. Robots.txt groups for `Calmtoad` still apply.
+
 ## [0.6.0] - 2026-11-17
 
 ### Added
