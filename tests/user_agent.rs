@@ -110,6 +110,7 @@ fn every_html_mode_request_names_the_running_release_and_its_site() {
             sitemaps: true,
             rendering: RenderMode::Html,
             browser_path: None,
+            ..CrawlOptions::default()
         },
         Arc::new(AtomicBool::new(false)),
         |_| {},

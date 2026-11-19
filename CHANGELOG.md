@@ -1,6 +1,9 @@
 # Changelog
 
-## [Unreleased]
+User-facing changes are recorded here as work ships. Versions without a release
+date are being prepared for release.
+
+## [0.7.0] - 2026-11-19
 
 ### Added
 
@@ -20,11 +23,8 @@
 - Optional link checks treat unreadable robots policy as unknown/blocked for the whole origin, revalidate redirects against internal page limits, and enforce cancellation plus a 30-second chain deadline, including slow robots reads and long crawl delays.
 - Extraction reports value truncation and missing attributes honestly, keeps later All-mode matches, and rejects duplicate rule IDs before capture or export.
 - Closing the window or installing an update now owns and cancels extraction preview and inventory work. Inventory preparation, save dialog, and file writing are tracked states; updates wait for all of them, and cancelled writes leave an existing destination untouched.
-- Oversized robots policies are explicit unknown/blocked, per-origin Retry-After now delays later checks, and shared redirect terminals are fetched once while each source keeps its own chain.
+- Oversized robots policies are explicit unknown/blocked, per-origin Retry-After now delays later checks, and shared redirect destinations are fetched once while each source keeps its own chain.
 - Cancelling the final optional check now stops the run, and Browser rendered/source evidence shares one 10,000-occurrence page cap without shortening discovery.
-
-User-facing changes are recorded here as work ships. Versions without a release
-date are being prepared for release.
 
 ## [0.6.1] - 2026-11-18
 

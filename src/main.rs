@@ -787,16 +787,23 @@ struct InventorySnapshot {
     run: inventory::InventoryRun,
     link_checks: HashMap<String, LinkCheckResult>,
     scope: InventoryScope,
+    visible_sort: Option<(String, SortDir)>,
 }
 
 struct InventoryPrepareJob {
     scope: InventoryScope,
-    source_indices: Vec<usize>,
     next: usize,
+    page_count: usize,
     pages: Vec<Page>,
     run: inventory::InventoryRun,
-    audit: Audit,
-    link_checks: HashMap<String, LinkCheckResult>,
+    audit: Option<Arc<Audit>>,
+    link_checks: Option<Arc<HashMap<String, LinkCheckResult>>>,
+    query: String,
+    filter: CheckFilter,
+    sort: Option<(String, SortDir)>,
+    snapshot_rx: Option<mpsc::Receiver<InventorySnapshot>>,
+    snapshot_cancel: Arc<AtomicBool>,
+    link_evidence_limited: bool,
     epoch: u64,
 }
 
@@ -866,7 +873,7 @@ struct State {
     search_index: Vec<String>,
     /// Indices into `pages` after the current tab's query and check filter, in display order.
     visible: Vec<usize>,
-    audit: Audit,
+    audit: Arc<Audit>,
     counts: Counts,
     counts_dirty: bool,
     counts_deferred: bool,
@@ -883,7 +890,7 @@ struct State {
     link_visible: Vec<usize>,
     link_search_index: Vec<String>,
     /// Optional destination results keyed by normalized URL. Page occurrences read this map.
-    link_checks: HashMap<String, LinkCheckResult>,
+    link_checks: Arc<HashMap<String, LinkCheckResult>>,
     link_check_search: HashMap<String, String>,
     link_check_total: usize,
     link_check_done: usize,
@@ -981,7 +988,7 @@ fn init() -> State {
         pages: Vec::new(),
         search_index: Vec::new(),
         visible: Vec::new(),
-        audit: Audit::default(),
+        audit: Arc::new(Audit::default()),
         counts: Counts::default(),
         counts_dirty: false,
         counts_deferred: false,
@@ -996,7 +1003,7 @@ fn init() -> State {
         link_row_keys: Vec::new(),
         link_visible: Vec::new(),
         link_search_index: Vec::new(),
-        link_checks: HashMap::new(),
+        link_checks: Arc::new(HashMap::new()),
         link_check_search: HashMap::new(),
         link_check_total: 0,
         link_check_done: 0,
@@ -1078,7 +1085,10 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
     }
     let browser_changed = poll_browser(state);
     let update_changed = poll_updates(state, tx);
-    let crawl_changed = poll_crawl(state);
+    // Keep the captured page/audit/check facts stable while the export snapshots them in
+    // bounded chunks. The network worker may continue producing events; they are drained as
+    // soon as the immutable snapshot has been handed off.
+    let crawl_changed = poll_crawl_when_inventory_snapshot_is_idle(state);
     let preview_changed = poll_extraction_preview(state);
     let inventory_changed = poll_inventory_prepare(state)
         | poll_inventory_export(state, tx)
@@ -1093,6 +1103,14 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
         tx.wake_after(wait);
     }
     browser_changed || update_changed || crawl_changed || preview_changed || inventory_changed
+}
+
+fn poll_crawl_when_inventory_snapshot_is_idle(state: &mut State) -> bool {
+    if state.inventory_prepare.is_some() {
+        false
+    } else {
+        poll_crawl(state)
+    }
 }
 
 fn poll_inventory_write(state: &mut State) -> bool {
@@ -1428,7 +1446,7 @@ fn poll_crawl(state: &mut State) -> bool {
                     )
                     .to_lowercase(),
                 );
-                state.link_checks.insert(key, result);
+                Arc::make_mut(&mut state.link_checks).insert(key, result);
                 state.message = format!(
                     "Checking links · {} of {} destinations…",
                     state.link_check_done, state.link_check_total
@@ -1459,11 +1477,11 @@ fn poll_crawl(state: &mut State) -> bool {
         invalidate_inspector(state);
         let mut broken_added = false;
         for page in &state.pages[start_len..] {
-            state.audit.push(page);
+            Arc::make_mut(&mut state.audit).push(page);
             broken_added |= page.status == 0 || page.status >= 400;
         }
         if broken_added {
-            state.audit.rebuild_broken_links(&state.pages);
+            Arc::make_mut(&mut state.audit).rebuild_broken_links(&state.pages);
         }
         state.counts_dirty = true;
         state.message = format!("{} pages so far…", state.pages.len());
@@ -1491,7 +1509,7 @@ fn poll_crawl(state: &mut State) -> bool {
             state.crawl_elapsed = state.crawl_started.take().map(|started| started.elapsed());
             state.run_outcome = Some(message.clone());
             state.message = message;
-            state.audit = Audit::from_pages(&state.pages);
+            state.audit = Arc::new(Audit::from_pages(&state.pages));
             invalidate_inspector(state);
             state.sitemap = *report;
             state.sitemap_discovering = false;
@@ -1762,7 +1780,7 @@ fn start_crawl(state: &mut State) {
     reset_inspector_dataset(state);
     state.search_index.clear();
     state.visible.clear();
-    state.audit = Audit::default();
+    state.audit = Arc::new(Audit::default());
     state.counts = Counts::default();
     state.counts_dirty = false;
     state.counts_deferred = false;
@@ -1770,7 +1788,7 @@ fn start_crawl(state: &mut State) {
     state.view_counts = ViewCounts::default();
     state.overview = OverviewCounts::default();
     state.sitemap = SitemapReport::default();
-    state.link_checks.clear();
+    Arc::make_mut(&mut state.link_checks).clear();
     state.link_check_search.clear();
     state.link_rows.clear();
     state.link_row_keys.clear();
@@ -1869,6 +1887,9 @@ fn stop_owned_work(state: &mut State) {
     }
     if let Some(job) = &state.extraction_preview_job {
         job.cancel.store(true, Ordering::Relaxed);
+    }
+    if let Some(job) = &state.inventory_prepare {
+        job.snapshot_cancel.store(true, Ordering::Relaxed);
     }
     state.inventory_prepare = None;
     if let Some(job) = &state.inventory_export_job {
@@ -2506,7 +2527,7 @@ fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
     state.pages = pages;
     reset_inspector_dataset(state);
     state.search_index = state.pages.iter().map(page_search_text).collect();
-    state.audit = Audit::from_pages(&state.pages);
+    state.audit = Arc::new(Audit::from_pages(&state.pages));
     let page_checks = state
         .pages
         .iter()
@@ -2783,7 +2804,7 @@ fn record_link_check(state: &mut State, key: String, result: LinkCheckResult) {
         )
         .to_lowercase(),
     );
-    state.link_checks.insert(key, result);
+    Arc::make_mut(&mut state.link_checks).insert(key, result);
 }
 
 fn rebuild_link_rows(state: &mut State) {
@@ -4987,6 +5008,16 @@ fn inventory_indices(state: &State, scope: InventoryScope) -> Vec<usize> {
 }
 
 fn inventory_run(state: &State) -> inventory::InventoryRun {
+    inventory_run_with_limit(
+        state,
+        state
+            .pages
+            .iter()
+            .any(|page| page.link_evidence_limit.contains("Run")),
+    )
+}
+
+fn inventory_run_with_limit(state: &State, link_evidence_limited: bool) -> inventory::InventoryRun {
     let run = state.run.as_ref();
     inventory::InventoryRun {
         seed: run.map(|run| run.seed.clone()).unwrap_or_default(),
@@ -5000,10 +5031,7 @@ fn inventory_run(state: &State) -> inventory::InventoryRun {
         incomplete: state.overview.incomplete,
         sitemap_incomplete: state.overview.sitemap_incomplete,
         sitemap_file_findings: state.overview.sitemap_file_findings,
-        link_evidence_limited: state
-            .pages
-            .iter()
-            .any(|page| page.link_evidence_limit.contains("Run")),
+        link_evidence_limited,
         snapshot: inventory_snapshot_label(state),
         extraction_rules: run
             .map(|run| run.extraction_rules.clone())
@@ -5056,11 +5084,19 @@ fn inventory_snapshot(state: &State, scope: InventoryScope) -> Result<InventoryS
     }
     Ok(InventorySnapshot {
         pages,
-        audit: state.audit.clone(),
+        audit: (*state.audit).clone(),
         indices,
         run: inventory_run(state),
-        link_checks: state.link_checks.clone(),
+        link_checks: (*state.link_checks).clone(),
         scope,
+        visible_sort: match scope {
+            InventoryScope::All => None,
+            InventoryScope::VisibleInternal => Some(
+                state.views[view_slot(Tab::Internal, SitemapView::Urls)]
+                    .sort
+                    .clone(),
+            ),
+        },
     })
 }
 
@@ -5078,13 +5114,24 @@ fn build_inventory_csv(
         run,
         link_checks,
         scope,
+        visible_sort,
     } = snapshot;
     let summary = inventory::InventorySummary {
         run: &run,
         link_checks: &link_checks,
     };
     let mut indices = indices;
-    if matches!(scope, InventoryScope::All) {
+    if let Some((column, dir)) = visible_sort {
+        indices.sort_by(|left, right| {
+            dir.apply(compare(
+                &pages[*left],
+                &pages[*right],
+                Tab::Internal,
+                &column,
+                &audit,
+            ))
+        });
+    } else if matches!(scope, InventoryScope::All) {
         indices.sort_by(|left, right| pages[*left].url.cmp(&pages[*right].url));
     }
     let rows = inventory::rows(&pages, &audit, &indices, &summary);
@@ -5120,22 +5167,22 @@ fn start_inventory_export(state: &mut State, scope: InventoryScope) -> Result<us
     if state.pages.is_empty() {
         return Err("No captured URLs to inventory.".into());
     }
-    let source_indices = match scope {
-        InventoryScope::All => (0..state.pages.len()).collect::<Vec<_>>(),
-        InventoryScope::VisibleInternal => internal_inventory_indices(state),
-    };
-    if source_indices.is_empty() {
-        return Err("No URLs match the selected inventory scope.".into());
-    }
-    let captured = source_indices.len();
+    let captured = state.pages.len();
+    let view = &state.views[view_slot(Tab::Internal, SitemapView::Urls)];
     state.inventory_prepare = Some(InventoryPrepareJob {
         scope,
-        source_indices,
         next: 0,
-        pages: Vec::with_capacity(captured),
-        run: inventory_run(state),
-        audit: state.audit.clone(),
-        link_checks: state.link_checks.clone(),
+        page_count: captured,
+        pages: Vec::new(),
+        run: inventory_run_with_limit(state, false),
+        audit: Some(Arc::clone(&state.audit)),
+        link_checks: Some(Arc::clone(&state.link_checks)),
+        query: normalized_query(&view.query.text),
+        filter: view.filter,
+        sort: (scope == InventoryScope::VisibleInternal).then(|| view.sort.clone()),
+        snapshot_rx: None,
+        snapshot_cancel: Arc::new(AtomicBool::new(false)),
+        link_evidence_limited: false,
         epoch: state.pages_epoch,
     });
     state.export_notice = Some(Ok(format!(
@@ -5156,34 +5203,110 @@ fn poll_inventory_prepare(state: &mut State) -> bool {
         ));
         return true;
     }
+    if let Some(rx) = job.snapshot_rx.take() {
+        match rx.try_recv() {
+            Ok(snapshot) => {
+                state.inventory_prepare = None;
+                spawn_inventory_build(state, snapshot);
+                return true;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                job.snapshot_rx = Some(rx);
+                state.inventory_prepare = Some(job);
+                return false;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.export_notice = Some(Err(
+                    "The inventory snapshot worker stopped before preparing the export.".into(),
+                ));
+                return true;
+            }
+        }
+    }
     let mut remaining = 512_usize;
-    while remaining > 0 && job.next < job.source_indices.len() {
-        let Some(page) = state.pages.get(job.source_indices[job.next]).cloned() else {
+    while remaining > 0 && job.next < job.page_count {
+        let index = job.next;
+        let Some(page) = state.pages.get(index) else {
             state.export_notice = Some(Err(
                 "Crawl results changed while the inventory snapshot was being prepared. Start the export again."
                     .into(),
             ));
             return true;
         };
-        job.pages.push(page);
+        job.link_evidence_limited |= page.link_evidence_limit.contains("Run");
+        let selected = match job.scope {
+            InventoryScope::All => true,
+            InventoryScope::VisibleInternal => {
+                let finding = page_has_finding(Tab::Internal, page, &state.audit);
+                let incomplete = page_incomplete(page);
+                let passes_filter = match job.filter {
+                    CheckFilter::All => true,
+                    CheckFilter::Findings => finding,
+                    CheckFilter::Incomplete => incomplete,
+                };
+                passes_filter
+                    && (job.query.is_empty()
+                        || state
+                            .search_index
+                            .get(index)
+                            .is_some_and(|text| text.contains(&job.query))
+                        || issue_for(Tab::Internal, page, &state.audit)
+                            .to_lowercase()
+                            .contains(&job.query))
+            }
+        };
+        if selected {
+            job.pages.push(page.clone());
+        }
         job.next += 1;
         remaining -= 1;
     }
-    if job.next < job.source_indices.len() {
+    if job.next < job.page_count {
         state.inventory_prepare = Some(job);
         return false;
     }
+    if job.pages.is_empty() {
+        state.export_notice = Some(Err("No URLs match the selected inventory scope.".into()));
+        return true;
+    }
+    job.run.link_evidence_limited = job.link_evidence_limited;
     let count = job.pages.len();
-    let snapshot = InventorySnapshot {
-        pages: job.pages,
-        audit: job.audit,
-        indices: (0..count).collect(),
-        run: job.run,
-        link_checks: job.link_checks,
-        scope: job.scope,
-    };
-    spawn_inventory_build(state, snapshot);
-    true
+    let pages = std::mem::take(&mut job.pages);
+    let run = job.run.clone();
+    let scope = job.scope;
+    let visible_sort = job.sort.clone();
+    let audit = job.audit.take().expect("audit snapshot lease");
+    let link_checks = job.link_checks.take().expect("link-check snapshot lease");
+    let snapshot_cancel = job.snapshot_cancel.clone();
+    let worker_cancel = snapshot_cancel.clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        if worker_cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let owned_audit = (*audit).clone();
+        let owned_link_checks = (*link_checks).clone();
+        // The original Arc leases are dropped before notifying the UI. The next crawl event can
+        // then mutate the live state without triggering a copy-on-write clone on the UI thread.
+        drop(audit);
+        drop(link_checks);
+        if worker_cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let snapshot = InventorySnapshot {
+            indices: (0..count).collect(),
+            pages,
+            audit: owned_audit,
+            run,
+            link_checks: owned_link_checks,
+            scope,
+            visible_sort,
+        };
+        let _ = tx.send(snapshot);
+    });
+    job.snapshot_rx = Some(rx);
+    state.inventory_prepare = Some(job);
+    false
 }
 
 fn spawn_inventory_build(state: &mut State, snapshot: InventorySnapshot) {
@@ -9577,7 +9700,7 @@ fn load_browser_sample(state: &mut State) {
             .to_string();
     }
     state.search_index = state.pages.iter().map(page_search_text).collect();
-    state.audit = Audit::from_pages(&state.pages);
+    state.audit = Arc::new(Audit::from_pages(&state.pages));
     invalidate_inspector(state);
     state.counts_dirty = true;
     let _ = refresh_counts(state, true);
@@ -10574,6 +10697,46 @@ mod tests {
     }
 
     #[test]
+    fn inventory_snapshot_pauses_crawl_events_until_facts_are_frozen() {
+        let mut state = init();
+        let first = crawl::sample_pages().remove(0);
+        set_pages(&mut state, vec![first], "1 page on example.com".into());
+        state.phase = RunPhase::Crawling;
+        let (tx, rx) = mpsc::channel();
+        let mut later = state.pages[0].clone();
+        later.url = "https://example.com/later".into();
+        tx.send(CrawlEvent::Page(Box::new(later)))
+            .expect("queue page");
+        state.job = Some(CrawlJob {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            stopping: false,
+        });
+
+        start_inventory_export(&mut state, InventoryScope::All).expect("start snapshot");
+        assert!(!poll_crawl_when_inventory_snapshot_is_idle(&mut state));
+        assert_eq!(
+            state.pages.len(),
+            1,
+            "queued events wait during snapshot prep"
+        );
+
+        while state.inventory_prepare.is_some() {
+            poll_inventory_prepare(&mut state);
+            std::thread::yield_now();
+        }
+        assert!(state.inventory_export_job.is_some());
+        assert_eq!(
+            state.pages.len(),
+            1,
+            "the export owns the one-page snapshot"
+        );
+        assert!(poll_crawl_when_inventory_snapshot_is_idle(&mut state));
+        assert_eq!(state.pages.len(), 2, "queued crawl events resume afterward");
+        stop_owned_work(&mut state);
+    }
+
+    #[test]
     fn inventory_writer_is_safe_and_gates_install_until_finished() {
         let dir = tempfile::TempDir::new().expect("dir");
         let destination = dir.path().join("inventory.csv");
@@ -10622,42 +10785,35 @@ mod tests {
 
     #[test]
     #[ignore = "local inventory trigger-latency measurement"]
-    fn inventory_trigger_latency_with_heavy_shared_evidence() {
+    fn inventory_trigger_latency_with_50k_pages_and_bounded_evidence() {
         use calmtoad::indexability::EvidenceStage;
         use calmtoad::links::{LinkCheckResult, LinkOccurrence};
 
         let mut state = init();
         let template = crawl::sample_pages().remove(0);
         let mut pages = Vec::new();
-        for index in 0..2_000 {
+        let evidence_per_page = 5;
+        for index in 0..50_000 {
             let mut page = template.clone();
-            page.url = format!("https://example.com/group-{}/page-{index}", index % 20);
+            page.url = format!("https://example.com/group-{}/page-{index}", index % 50);
             page.title = format!("Inventory page {index} title long enough");
-            page.links = Arc::new(vec![format!(
-                "https://example.com/group-{}/child",
-                index % 20
-            )]);
+            page.links = Arc::new(vec![format!("https://example.com/child-{}", index % 1_000)]);
             page.link_evidence = Arc::new(
-                (0..250)
+                (0..evidence_per_page)
                     .map(|order| LinkOccurrence {
                         source: page.url.clone(),
                         order,
                         raw_href: format!("/child-{order}"),
-                        resolved: format!("https://example.com/group-{}/child-{order}", index % 20),
-                        key: format!("https://example.com/group-{}/child-{order}", index % 20),
+                        resolved: format!("https://example.com/child-{}", (index + order) % 1_000),
+                        key: format!("https://example.com/child-{}", (index + order) % 1_000),
                         anchor: format!("Child {order}"),
                         stage: EvidenceStage::Document,
-                        check: Some(Box::new(LinkCheckResult::checked(
-                            200,
-                            format!("https://example.com/group-{}/child-{order}", index % 20),
-                            Vec::new(),
-                        ))),
                         ..LinkOccurrence::default()
                     })
                     .collect(),
             );
             page.extraction = Arc::new(
-                (0..10)
+                (0..2)
                     .map(|rule| extract::ExtractionOutcome {
                         rule_id: format!("rule-{rule}"),
                         state: extract::ExtractionState::Matched,
@@ -10672,7 +10828,15 @@ mod tests {
         }
         state.pages = pages;
         state.search_index = state.pages.iter().map(page_search_text).collect();
-        state.audit = Audit::from_pages(&state.pages);
+        state.audit = Arc::new(Audit::from_pages(&state.pages));
+        state.link_checks = Arc::new(
+            (0..1_000)
+                .map(|index| {
+                    let key = format!("https://example.com/child-{index}");
+                    (key.clone(), LinkCheckResult::checked(200, key, Vec::new()))
+                })
+                .collect(),
+        );
         state.phase = RunPhase::Completed;
         state.max_pages = state.pages.len();
         state.run = Some(RunContext {
@@ -10686,57 +10850,65 @@ mod tests {
             sitemaps: true,
             check_links: true,
             started_utc: inventory::utc_now(),
-            extraction_rules: Vec::new(),
+            extraction_rules: (0..2)
+                .map(|index| extract::ExtractionRule {
+                    id: format!("rule-{index}"),
+                    name: format!("Rule {index}"),
+                    selector: format!(".field-{index}"),
+                    output: extract::ExtractionOutput::Text,
+                    attribute: String::new(),
+                    mode: extract::MatchMode::First,
+                })
+                .collect(),
         });
         switch_tab(&mut state, Tab::Internal);
         state.view_mut().query.replace_text("group-0/");
         refresh_visible_forced(&mut state);
         let visible_count = visible_len(&state);
-        assert!(visible_count > 0 && visible_count < state.pages.len());
-
-        let started = Instant::now();
-        let audit_copy = state.audit.clone();
-        let audit_time = started.elapsed();
-        let started = Instant::now();
-        let all = inventory_snapshot(&state, InventoryScope::All).expect("all snapshot");
-        let all_time = started.elapsed();
-        let started = Instant::now();
-        let visible =
-            inventory_snapshot(&state, InventoryScope::VisibleInternal).expect("visible snapshot");
-        let visible_time = started.elapsed();
-        eprintln!(
-            "pages {} evidence {} extraction {} · audit clone {audit_time:?} · all snapshot {all_time:?} ({} pages) · visible subset {visible_time:?} ({} pages)",
-            state.pages.len(),
+        assert_eq!(visible_count, 1_000);
+        assert_eq!(
             state
                 .pages
                 .iter()
                 .map(|page| page.link_evidence.len())
                 .sum::<usize>(),
-            state
-                .pages
-                .iter()
-                .map(|page| page.extraction.len())
-                .sum::<usize>(),
-            all.pages.len(),
-            visible.pages.len(),
+            250_000,
+            "measurement reaches the run evidence cap"
         );
-        assert_eq!(all.pages.len(), state.pages.len());
-        assert_eq!(visible.pages.len(), visible_count);
-        drop(audit_copy);
-        let started = Instant::now();
-        let _ = start_inventory_export(&mut state, InventoryScope::All).expect("trigger all");
-        let trigger_all = started.elapsed();
-        state.inventory_prepare = None;
-        let started = Instant::now();
-        let _ = start_inventory_export(&mut state, InventoryScope::VisibleInternal)
-            .expect("trigger visible");
-        let trigger_visible = started.elapsed();
-        state.inventory_prepare = None;
-        eprintln!("trigger latency: all {trigger_all:?}, visible subset {trigger_visible:?}");
-        assert!(all_time < Duration::from_secs(1));
-        assert!(visible_time < Duration::from_millis(250));
-        assert!(trigger_all < Duration::from_millis(250));
-        assert!(trigger_visible < Duration::from_millis(100));
+
+        let mut measure = |scope| {
+            let started = Instant::now();
+            let _ = start_inventory_export(&mut state, scope).expect("trigger");
+            let trigger = started.elapsed();
+            let mut polls = 0_usize;
+            let mut max_poll = Duration::ZERO;
+            while state.inventory_prepare.is_some() {
+                let was_waiting_for_worker = state
+                    .inventory_prepare
+                    .as_ref()
+                    .is_some_and(|job| job.snapshot_rx.is_some());
+                let started = Instant::now();
+                poll_inventory_prepare(&mut state);
+                max_poll = max_poll.max(started.elapsed());
+                polls += 1;
+                if was_waiting_for_worker {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            stop_owned_work(&mut state);
+            state.inventory_export_job = None;
+            (trigger, max_poll, polls)
+        };
+        let (all_trigger, all_max_poll, all_polls) = measure(InventoryScope::All);
+        let (visible_trigger, visible_max_poll, visible_polls) =
+            measure(InventoryScope::VisibleInternal);
+        eprintln!(
+            "50k pages, 250k link occurrences, 100k extraction values, 1k checks; all: trigger {all_trigger:?}, max preparation poll {all_max_poll:?} over {all_polls} polls; Visible 1k rows: trigger {visible_trigger:?}, max preparation poll {visible_max_poll:?} over {visible_polls} polls"
+        );
+        assert!(all_trigger < Duration::from_millis(50));
+        assert!(visible_trigger < Duration::from_millis(50));
+        assert!(all_max_poll < Duration::from_millis(100));
+        assert!(visible_max_poll < Duration::from_millis(100));
     }
 
     #[test]
@@ -12021,7 +12193,7 @@ mod tests {
         page.url = "https://example.com/streamed".into();
         page.title = "A streamed CALM page".into();
         state.search_index.push(page_search_text(&page));
-        state.audit.push(&page);
+        Arc::make_mut(&mut state.audit).push(&page);
         state.pages.push(page);
         refresh_visible(&mut state);
         assert!(visible_ids(&state).contains(&"https://example.com/streamed".into()));
@@ -13456,7 +13628,7 @@ mod tests {
 
             let mut state = init();
             state.pages = pages.clone();
-            state.audit = audit.clone();
+            state.audit = Arc::new(audit.clone());
             state.search_index = index;
             state.phase = RunPhase::Completed;
             state.counts_dirty = true;
@@ -13523,7 +13695,7 @@ mod tests {
                 unbounded.sitemap.observe_page(&pages[0]);
                 unbounded.search_index.push(page_search_text(&pages[0]));
                 unbounded.pages.push(pages[0].clone());
-                unbounded.audit.push(&pages[0]);
+                Arc::make_mut(&mut unbounded.audit).push(&pages[0]);
             }
             refresh_visible(&mut unbounded);
             let unbounded_burst = started.elapsed();
@@ -13603,7 +13775,7 @@ mod tests {
                         Arc::make_mut(&mut page.links).push(hub_url.clone());
                     }
                 }
-                state.audit = Audit::from_pages(&state.pages);
+                state.audit = Arc::new(Audit::from_pages(&state.pages));
                 invalidate_inspector(state);
                 switch_tab(state, Tab::Links);
                 select_scene_url(state, &hub_url);
@@ -13649,7 +13821,7 @@ mod tests {
                     .map(|page| page.url.clone())
                     .collect::<Vec<_>>();
                 state.pages[0].links = Arc::new(links);
-                state.audit = Audit::from_pages(&state.pages);
+                state.audit = Arc::new(Audit::from_pages(&state.pages));
                 invalidate_inspector(state);
                 state.relation_pages.outbound = 0;
             });
