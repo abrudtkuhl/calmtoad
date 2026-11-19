@@ -2076,7 +2076,11 @@ mod tests {
             canonical: String::new(),
             images: 0,
             images_missing_alt: 0,
-            links: Vec::new(),
+            links: Vec::new().into(),
+            link_evidence: Vec::new().into(),
+            link_evidence_limit: String::new(),
+            extraction: Vec::new().into(),
+            extraction_limit: String::new(),
             indexability: assessment,
         };
         report.observe_page(&page);

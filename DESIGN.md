@@ -169,7 +169,7 @@ The window is one column, top to bottom, with no outer container and no page mar
 
 1. **Top bar** — 44px: the existing small toad mark and ten tabs, after the platform titlebar inset. Tabs carry bare uppercase labels with no numeric suffix; counts belong to Overview and each view's summary. Crawl and update status stay in the footer or update strip rather than competing with the tabs. A hairline closes the bar.
 2. **Progress line** — 2px, only while crawling: a hairline track with an ink fill for pages found against the cap.
-3. **Command bar** — 12px above and 8px below a 40px strip: URL, Pages, Depth, HTML/Browser, **Use sitemap URLs** and CRAWL/STOP. Numeric fields are compact so the URL stays readable at 880px. A disclosure arrow beside the sitemap checkbox opens a compact explanation; it is not a permanent strip. In Browser mode a quiet line names the detected browser and offers **Choose browser…**. Paths and diagnostics stay behind **Details**; an unavailable browser keeps Crawl disabled but never blocks retained results. Settings remain disabled during a crawl.
+3. **Command bar** — 12px above and 8px below a 40px strip: URL, Pages, Depth, HTML/Browser, **Use sitemap URLs** and CRAWL/STOP. The disclosure also holds **Check external links and documents** and **Custom extraction…** so optional work does not become a second toolbar. Numeric fields are compact so the URL stays readable at 880px. A disclosure arrow beside the sitemap checkbox opens a compact explanation; it is not a permanent strip. In Browser mode a quiet line names the detected browser and offers **Choose browser…**. Paths and diagnostics stay behind **Details**; an unavailable browser keeps Crawl disabled but never blocks retained results. Settings remain disabled during a crawl.
 4. **Results toolbar** — 40px, on table views: one visible-versus-total count with findings and incomplete checks, a compact search field, All/Findings/Incomplete filters, **Run** details, Export, Copy visible URLs and the details toggle. Overview is not a table and has no search, sort or copy toolbar. Do not repeat the active tab as a second heading. Sitemaps adds compact URLs/Files controls; the full sitemap coverage breakdown and filter basis are available on hover, and Partial stays visible. Search and filter state is stored per tab and per Sitemaps view.
 5. **Results** — grows to fill the window: a full-bleed table and optional 320px details drawer. Both page and sitemap details have a bounded scroll region.
 6. **Status footer** — 30px: the crawl outcome and elapsed time, update status and version. Preserve the actual stopped/limit/error reason; truncate long text with the complete message available on hover. Do not replace coverage information with a generic completion message.
@@ -227,6 +227,18 @@ Not used. The command bar is the only enclosed rectangle, and it is a control gr
 
 ### Navigation
 Ten tabs in one row: Overview, Internal, Titles, Meta, H1, Response, Canonical, Images, Links, and Sitemaps. Each is a ghost button containing only an uppercase mono label; the old numeric suffixes mixed crawled URLs, findings and listed URLs under one unexplained style. The active tab alone gets a 2px-radius neutral fill. Tabs never wrap; at narrow widths the row compresses rather than becoming a menu. Tab labels are authored in normal case and uppercased visually.
+
+### Link evidence
+
+Links keeps its existing Pages table and adds a compact **Pages / Link evidence** switch in the results toolbar. Link evidence is a flat occurrence table: source, destination, anchor, HTTP and state, with the same All/Findings/Incomplete filter, search, sort, bounded rows, CSV export and copy behavior as other tables. Its inspector shows stage, raw href, fragment, truncation, check reason, redirect chain and source/destination actions; long values stay copyable. The counts are occurrence counts, not unique destinations. A URL bounded for evidence is labeled and never presented as a request that happened.
+
+### Inventory
+
+Overview and Internal expose a compact **Export inventory…** action. A temporary scope row offers **All captured URLs** (default) or **Visible Internal URLs**, then a notice says the immutable snapshot is being prepared and the native save dialog follows when it is ready. The export may run during a crawl; its snapshot column says **in-progress** and records the capture time. The inventory is one repeated-context row per captured URL; it is not a second table or a permanent export toolbar.
+
+### Custom extraction
+
+**Custom extraction…** opens a compact scrolling rule editor under the command bar: name, selector, Text/Attribute and First/All, with an attribute field when needed, errors beside the rule, and a one-page **Test on URL** preview with Stop. It is a disclosure, not a new tab or modal. A completed preview names the mode actually captured and the rule definitions actually used; editing drafts afterward marks the old preview stale rather than changing its labels. The Internal inspector shows a **Custom extraction** disclosure with retained rule values, stage and state. Values are monospaced measurements only where numeric; extracted page text remains sans.
 
 ### Overview
 

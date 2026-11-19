@@ -3,7 +3,10 @@
 
 pub mod crawl;
 pub mod export;
+pub mod extract;
 pub mod indexability;
+pub mod inventory;
+pub mod links;
 pub mod render;
 pub mod sitemap;
 pub mod update;

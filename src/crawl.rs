@@ -16,10 +16,12 @@ use std::time::{Duration, Instant};
 use scraper::{ElementRef, Html, Node};
 use url::Url;
 
+use crate::extract::{self, ExtractionOutcome};
 use crate::indexability::{
     self, Assessment, CanonicalDeclaration, CaptureInfo, CaptureMode, EvidenceStage,
     OmittedEvidence, PageEvidence, ReadState, RobotsDirective,
 };
+use crate::links::{self, LinkCheckResult, LinkCheckState, LinkOccurrence};
 use crate::render::{self, BrowserRenderer, Capture, RenderMode, RenderState, SourceState};
 use crate::sitemap;
 
@@ -130,7 +132,19 @@ pub struct Page {
     pub images: usize,
     pub images_missing_alt: usize,
     /// Same-host links found on the page, normalized like `url`.
-    pub links: Vec<String>,
+    ///
+    /// The vector is shared so an inventory snapshot can retain the page without copying a
+    /// potentially large link list. Pages are never mutated after publication except through
+    /// `Arc::make_mut` during the pre-publication check pass.
+    pub links: Arc<Vec<String>>,
+    /// Individual anchor occurrences, including skipped and external destinations.
+    pub link_evidence: Arc<Vec<LinkOccurrence>>,
+    /// Nonempty when this page's retained link evidence hit a page or run cap.
+    pub link_evidence_limit: String,
+    /// Custom CSS extraction outcomes for this page, in rule order.
+    pub extraction: Arc<Vec<ExtractionOutcome>>,
+    /// Nonempty when extraction stopped at a per-page or per-run cap.
+    pub extraction_limit: String,
     /// The one evidence-backed indexability assessment every view reads.
     pub indexability: Assessment,
 }
@@ -193,6 +207,10 @@ pub struct CrawlOptions {
     pub rendering: RenderMode,
     /// An explicit Chrome/Chromium for Browser mode. `None` discovers one.
     pub browser_path: Option<PathBuf>,
+    /// Check observed external anchors and same-host document downloads after the page crawl.
+    pub check_links: bool,
+    /// Draft rules are compiled once before any page work starts.
+    pub extraction_rules: Vec<extract::ExtractionRule>,
 }
 
 /// Everything the window streams while a crawl runs.
@@ -205,6 +223,10 @@ pub enum CrawlEvent {
     SitemapPartial(String),
     /// Discovery finished; page fetches for the listed URLs may still be running.
     SitemapDone,
+    /// Optional external/document checks started with this many unique destinations.
+    LinkCheckStarted(usize),
+    /// One optional destination check finished.
+    LinkCheck(String, LinkCheckResult),
 }
 
 /// The whole result of one crawl, including the sitemap report.
@@ -218,6 +240,8 @@ pub struct CrawlResult {
     /// A browser setup failure, separate from page/domain failures. The message stays short
     /// for the run summary; this detail belongs behind the browser setup disclosure.
     pub setup_failure: Option<String>,
+    /// The retained link-evidence tail hit the run cap.
+    pub link_evidence_limited: bool,
 }
 
 /// How a crawl ended.
@@ -499,7 +523,7 @@ impl Audit {
         }
         let has_broken = !audit.broken_targets.is_empty();
         for page in pages {
-            for link in &page.links {
+            for link in page.links.iter() {
                 let Some(count) = inbound.get_mut(link.as_str()) else {
                     continue;
                 };
@@ -559,7 +583,7 @@ impl Audit {
         }
         // Most crawls have no broken pages at all; skip the lookup for every link when so.
         let has_broken = !self.broken_targets.is_empty();
-        for link in &page.links {
+        for link in page.links.iter() {
             // Clone only when the link is new; most links repeat across pages.
             match self.inbound.get_mut(link.as_str()) {
                 Some(count) => *count += 1,
@@ -611,7 +635,7 @@ impl Audit {
             return;
         }
         for page in pages {
-            for link in &page.links {
+            for link in page.links.iter() {
                 if self.broken_targets.contains(link) {
                     self.record_broken_link(page, link);
                 }
@@ -981,6 +1005,7 @@ pub fn crawl_site(seed: &str) -> Outcome {
         CrawlOptions::default(),
         None,
         None,
+        None,
         &mut |_| {},
     );
     Outcome {
@@ -1006,6 +1031,7 @@ pub fn crawl_site_stream(
         true,
         CrawlOptions::default(),
         Some(cancel),
+        None,
         None,
         &mut |event| {
             if let CrawlEvent::Page(page) = event {
@@ -1049,6 +1075,7 @@ pub fn crawl_site_with(
                             sitemap: sitemap::SitemapReport::default(),
                             outcome: CrawlOutcome::Stopped,
                             setup_failure: None,
+                            link_evidence_limited: false,
                         };
                     }
                     return CrawlResult {
@@ -1057,6 +1084,7 @@ pub fn crawl_site_with(
                         sitemap: sitemap::SitemapReport::default(),
                         outcome: CrawlOutcome::Failed,
                         setup_failure: Some(reason),
+                        link_evidence_limited: false,
                     };
                 }
             }
@@ -1066,6 +1094,26 @@ pub fn crawl_site_with(
         renderer,
         cancel: cancel.clone(),
     });
+    let extraction = if options.extraction_rules.is_empty() {
+        None
+    } else {
+        match extract::CompiledRules::compile(&options.extraction_rules) {
+            Ok(compiled) => Some(compiled),
+            Err(errors) => {
+                return CrawlResult {
+                    message: format!(
+                        "Custom extraction rules are invalid: {}",
+                        errors
+                            .first()
+                            .map(|error| error.message.as_str())
+                            .unwrap_or("check the rule fields")
+                    ),
+                    outcome: CrawlOutcome::Failed,
+                    ..CrawlResult::default()
+                };
+            }
+        }
+    };
     let result = crawl_engine(
         seed,
         limits,
@@ -1075,6 +1123,7 @@ pub fn crawl_site_with(
         options,
         Some(&cancel),
         job,
+        extraction,
         &mut on_event,
     );
     drop(browser);
@@ -1113,6 +1162,14 @@ struct FetchedPage {
     /// The pre-script source document, kept only when the rendered DOM was also parsed.
     source: Option<Parsed>,
     capture: CaptureInfo,
+    extraction: ExtractionInput,
+}
+
+struct ExtractionInput {
+    html: Option<String>,
+    stage: EvidenceStage,
+    applicable: bool,
+    partial: bool,
 }
 
 /// Page results and sitemap discovery share one channel so the loop can end only after
@@ -1210,6 +1267,7 @@ pub fn crawl_with(seed: &str, limits: Limits, fetch: impl Fn(&str) -> Fetched + 
         CrawlOptions::default(),
         None,
         None,
+        None,
         &mut |_| {},
     );
     Outcome {
@@ -1240,8 +1298,486 @@ pub fn crawl_with_options(
         options,
         cancel,
         None,
+        None,
         &mut on_event,
     )
+}
+
+#[derive(Clone, Debug)]
+enum RobotsPolicy {
+    /// A known robots policy: `Some` when parsed, `None` for a confirmed absence.
+    Known(Option<Robots>),
+    /// The policy could not be read. This is unknown, not permission.
+    Unavailable(String),
+}
+
+enum CheckStop {
+    Cancelled,
+    Deadline,
+}
+
+enum RobotsFailure {
+    Stop(CheckStop),
+    Unavailable(String),
+}
+
+impl CheckStop {
+    fn limited(self) -> LinkCheckResult {
+        match self {
+            Self::Cancelled => LinkCheckResult::limited("Stopped during optional check"),
+            Self::Deadline => {
+                LinkCheckResult::limited("Optional check exceeded the 30 second deadline")
+            }
+        }
+    }
+}
+
+fn check_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(5))
+        .user_agent(USER_AGENT)
+        .build()
+}
+
+fn check_remaining(cancel: &AtomicBool, deadline: Instant) -> Result<Duration, CheckStop> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CheckStop::Cancelled);
+    }
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(CheckStop::Deadline);
+    }
+    Ok(deadline - now)
+}
+
+fn sleep_cancellable_until(
+    duration: Duration,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<(), CheckStop> {
+    let wake = Instant::now() + duration;
+    loop {
+        let remaining = check_remaining(cancel, deadline)?;
+        let now = Instant::now();
+        if now >= wake {
+            return Ok(());
+        }
+        let wait = wake.saturating_duration_since(now).min(remaining);
+        if wait.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(wait.min(Duration::from_millis(50)));
+    }
+}
+
+/// Read a robots body with an absolute deadline and cancellation. Reads are chunked so a
+/// server that trickles bytes cannot hold the check open past the chain deadline.
+fn read_robots_body(
+    mut reader: impl Read,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<String, RobotsFailure> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        check_remaining(cancel, deadline).map_err(RobotsFailure::Stop)?;
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let room = (256usize * 1024).saturating_sub(bytes.len());
+                if read > room {
+                    bytes.extend_from_slice(&buffer[..room]);
+                    return Err(RobotsFailure::Unavailable(
+                        "robots.txt exceeds the 256 KiB policy limit; the policy is unknown".into(),
+                    ));
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                if read == 0 || bytes.len() == 256 * 1024 {
+                    // The next read tells us whether a complete policy ended exactly at the cap.
+                    continue;
+                }
+            }
+            Err(error) => {
+                if let Err(stop) = check_remaining(cancel, deadline) {
+                    return Err(RobotsFailure::Stop(stop));
+                }
+                return Err(RobotsFailure::Unavailable(format!(
+                    "robots.txt read failed: {error}"
+                )));
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn check_robots_origin(
+    origin: &str,
+    agent: &ureq::Agent,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<Option<Robots>, RobotsFailure> {
+    let mut url = format!("{origin}/robots.txt");
+    for _ in 0..=links::MAX_REDIRECT_HOPS {
+        let remaining = check_remaining(cancel, deadline).map_err(RobotsFailure::Stop)?;
+        let response = match agent
+            .get(&url)
+            .set("Accept-Encoding", "identity")
+            .timeout(remaining.min(Duration::from_secs(10)))
+            .call()
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, _)) if (400..500).contains(&status) => {
+                return Ok(None);
+            }
+            Err(ureq::Error::Status(status, _)) => {
+                return Err(RobotsFailure::Unavailable(format!(
+                    "robots.txt returned HTTP {status}"
+                )));
+            }
+            Err(error) => {
+                return Err(RobotsFailure::Unavailable(format!(
+                    "robots.txt could not be read: {error}"
+                )));
+            }
+        };
+        let status = response.status();
+        if (300..400).contains(&status) {
+            let Some(location) = response.header("location") else {
+                return Err(RobotsFailure::Unavailable(format!(
+                    "robots.txt redirected without a location ({status})"
+                )));
+            };
+            let base =
+                Url::parse(&url).map_err(|error| RobotsFailure::Unavailable(error.to_string()))?;
+            let next = base
+                .join(location)
+                .map_err(|error| RobotsFailure::Unavailable(error.to_string()))?;
+            if next.scheme() != "http" && next.scheme() != "https" {
+                return Err(RobotsFailure::Unavailable(
+                    "robots.txt redirected outside HTTP(S)".into(),
+                ));
+            }
+            url = next.to_string();
+            continue;
+        }
+        if status == 200 {
+            let body = read_robots_body(response.into_reader(), cancel, deadline)?;
+            return Ok(Some(Robots::parse(&body, USER_AGENT)));
+        }
+        if (400..500).contains(&status) {
+            return Ok(None);
+        }
+        return Err(RobotsFailure::Unavailable(format!(
+            "robots.txt returned HTTP {status}"
+        )));
+    }
+    Err(RobotsFailure::Unavailable(
+        "robots.txt exceeded the redirect limit".into(),
+    ))
+}
+
+fn checked_with_retry_after(
+    status: u16,
+    final_url: String,
+    chain: Vec<String>,
+    retry_after: Option<&str>,
+) -> LinkCheckResult {
+    let mut result = LinkCheckResult::checked(status, final_url, chain);
+    if let Some(retry_after) = retry_after.filter(|value| !value.trim().is_empty()) {
+        result.reason = format!(
+            "HTTP {status}; Retry-After: {} (not retried)",
+            retry_after.trim()
+        );
+    }
+    result
+}
+
+fn retry_after_delay(value: Option<&str>, now: std::time::SystemTime) -> Option<Duration> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    httpdate::parse_http_date(value)
+        .ok()
+        .map(|date| date.duration_since(now).unwrap_or_default())
+}
+
+#[derive(Clone, Copy)]
+enum RetryCooldown {
+    Until(Instant),
+    /// A server delay beyond the monotonic clock's range must never become permission.
+    Unrepresentable,
+}
+
+fn record_retry_cooldown(
+    cooldowns: &mut HashMap<String, RetryCooldown>,
+    origin: &str,
+    header: Option<&str>,
+) {
+    if let Some(delay) = retry_after_delay(header, std::time::SystemTime::now()) {
+        let cooldown = Instant::now()
+            .checked_add(delay)
+            .map_or(RetryCooldown::Unrepresentable, RetryCooldown::Until);
+        cooldowns.insert(origin.to_string(), cooldown);
+    }
+}
+
+fn cache_actual_response(
+    checked: &mut FastMap<String, LinkCheckResult>,
+    url: &Url,
+    result: &LinkCheckResult,
+) {
+    if result.status == 0 {
+        return;
+    }
+    // Every requested redirect destination is reusable, including intermediate redirects.
+    // Its cached chain starts after that destination, so later sources retain only their own
+    // prefix followed by the shared suffix. A terminal response has an empty suffix.
+    for (index, destination) in result.redirect_chain.iter().enumerate() {
+        if let Ok(destination) = Url::parse(destination) {
+            let mut cached = result.clone();
+            cached.redirect_chain = result.redirect_chain[index + 1..].to_vec();
+            checked.insert(url_key(destination), cached);
+        }
+    }
+    let mut cached = result.clone();
+    cached.redirect_chain.clear();
+    checked.insert(url_key(url.clone()), cached);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn optional_check_result(
+    key: &str,
+    known_pages: &FastMap<String, LinkCheckResult>,
+    checked: &mut FastMap<String, LinkCheckResult>,
+    optional_checks: &FastSet<String>,
+    internal_host: &str,
+    agent: &ureq::Agent,
+    robots_cache: &mut HashMap<String, RobotsPolicy>,
+    last_start: &mut HashMap<String, Instant>,
+    retry_after_until: &mut HashMap<String, RetryCooldown>,
+    cancel: &AtomicBool,
+    budget: &mut usize,
+) -> LinkCheckResult {
+    if let Some(known) = known_pages.get(key) {
+        return known.clone();
+    }
+    if let Some(done) = checked.get(key) {
+        return done.clone();
+    }
+    if *budget == 0 {
+        return LinkCheckResult::limited("Optional check budget exhausted");
+    }
+    let Ok(mut current) = Url::parse(key) else {
+        return LinkCheckResult {
+            state: LinkCheckState::Invalid,
+            reason: "Invalid destination URL".into(),
+            ..LinkCheckResult::default()
+        };
+    };
+    if !current.username().is_empty() || current.password().is_some() {
+        return LinkCheckResult::limited("Embedded credentials are not checked");
+    }
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(30);
+    let mut chain = Vec::new();
+    let mut visited: FastSet<String> = fast_set(8);
+    visited.insert(url_key(current.clone()));
+    let mut final_url;
+    for _ in 0..=links::MAX_REDIRECT_HOPS {
+        if let Err(stop) = check_remaining(cancel, deadline) {
+            return stop.limited();
+        }
+        let origin = current.origin().ascii_serialization();
+        if !robots_cache.contains_key(&origin) {
+            let policy = match check_robots_origin(&origin, agent, cancel, deadline) {
+                Ok(policy) => RobotsPolicy::Known(policy),
+                Err(RobotsFailure::Stop(stop)) => return stop.limited(),
+                Err(RobotsFailure::Unavailable(reason)) => {
+                    robots_cache.insert(origin.clone(), RobotsPolicy::Unavailable(reason.clone()));
+                    return LinkCheckResult::blocked(format!(
+                        "robots.txt could not be read: {reason}"
+                    ));
+                }
+            };
+            robots_cache.insert(origin.clone(), policy);
+        }
+        match robots_cache.get(&origin) {
+            Some(RobotsPolicy::Unavailable(reason)) => {
+                return LinkCheckResult::blocked(format!("robots.txt could not be read: {reason}"));
+            }
+            Some(RobotsPolicy::Known(Some(robots))) if !robots.allows(&request_path(&current)) => {
+                return LinkCheckResult::blocked("robots.txt disallows this URL");
+            }
+            _ => {}
+        }
+        let delay = match robots_cache.get(&origin) {
+            Some(RobotsPolicy::Known(Some(robots))) => robots.crawl_delay(),
+            _ => None,
+        }
+        .unwrap_or_default()
+        .max(Duration::from_secs(1));
+        let now = Instant::now();
+        let delay_until = last_start
+            .get(&origin)
+            .map(|last| last.checked_add(delay).unwrap_or(deadline))
+            .unwrap_or(now);
+        let cooldown_until = match retry_after_until.get(&origin) {
+            Some(RetryCooldown::Until(until)) => *until,
+            Some(RetryCooldown::Unrepresentable) => {
+                return LinkCheckResult::limited(
+                    "Retry-After exceeds the supported time range; destination not requested",
+                );
+            }
+            None => now,
+        };
+        let wait_until = delay_until.max(cooldown_until);
+        if wait_until >= deadline {
+            return LinkCheckResult::limited(
+                "Origin cooldown exceeds the 30 second check deadline; destination not requested",
+            );
+        }
+        if wait_until > now
+            && let Err(stop) = sleep_cancellable_until(wait_until - now, cancel, deadline)
+        {
+            return stop.limited();
+        }
+        last_start.insert(origin.clone(), Instant::now());
+        if *budget == 0 {
+            return LinkCheckResult::limited("Optional check budget exhausted");
+        }
+        let remaining = match check_remaining(cancel, deadline) {
+            Ok(remaining) => remaining,
+            Err(stop) => return stop.limited(),
+        };
+        *budget -= 1;
+        let response = match agent
+            .get(current.as_str())
+            .set("Accept-Encoding", "identity")
+            .timeout(remaining.min(Duration::from_secs(10)))
+            .call()
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) if (300..400).contains(&status) => response,
+            Err(ureq::Error::Status(status, response)) => {
+                let retry_header = response.header("retry-after");
+                if matches!(status, 429 | 503) {
+                    record_retry_cooldown(retry_after_until, &origin, retry_header);
+                }
+                let result =
+                    checked_with_retry_after(status, current.to_string(), chain, retry_header);
+                cache_actual_response(checked, &current, &result);
+                return result;
+            }
+            Err(error) => {
+                if let Err(stop) = check_remaining(cancel, deadline) {
+                    return stop.limited();
+                }
+                return LinkCheckResult::unavailable(error.to_string());
+            }
+        };
+        let status = response.status();
+        let retry_header = response.header("retry-after");
+        if matches!(status, 429 | 503) {
+            record_retry_cooldown(retry_after_until, &origin, retry_header);
+        }
+        final_url = current.to_string();
+        if (300..400).contains(&status) {
+            let Some(location) = response.header("location") else {
+                let result = LinkCheckResult {
+                    state: LinkCheckState::Checked,
+                    reason: "Redirect without a Location header".into(),
+                    status,
+                    final_url,
+                    redirect_chain: chain,
+                    limited: false,
+                };
+                cache_actual_response(checked, &current, &result);
+                return result;
+            };
+            let Ok(next) = current.join(location) else {
+                let result = LinkCheckResult::limited("Redirect target is not a valid URL");
+                cache_actual_response(checked, &current, &result);
+                return result;
+            };
+            if next.scheme() != "http" && next.scheme() != "https" {
+                let result = LinkCheckResult::limited("Redirect target is not HTTP(S)");
+                cache_actual_response(checked, &current, &result);
+                return result;
+            }
+            if !next.username().is_empty() || next.password().is_some() {
+                let result = LinkCheckResult::limited("Redirect target embeds credentials");
+                cache_actual_response(checked, &current, &result);
+                return result;
+            }
+            let next_key = url_key(next.clone());
+            if !visited.insert(next_key.clone()) {
+                return LinkCheckResult::limited("Redirect loop");
+            }
+            if same_host(&next, internal_host)
+                && !known_pages.contains_key(&next_key)
+                && !optional_checks.contains(&next_key)
+            {
+                return LinkCheckResult::limited(
+                    "Redirect target is an internal page outside the page crawl",
+                );
+            }
+            if let Some(done) = known_pages
+                .get(&next_key)
+                .or_else(|| checked.get(&next_key))
+            {
+                // Keep the chain that belongs to this source and append the cached
+                // destination's own chain, including intermediate shared redirects.
+                let mut reused_chain = chain.clone();
+                reused_chain.push(next.to_string());
+                reused_chain.extend(done.redirect_chain.iter().cloned());
+                return LinkCheckResult {
+                    state: done.state,
+                    reason: done.reason.clone(),
+                    status: done.status,
+                    final_url: if done.final_url.is_empty() {
+                        next_key
+                    } else {
+                        done.final_url.clone()
+                    },
+                    redirect_chain: reused_chain,
+                    limited: done.limited,
+                };
+            }
+            chain.push(next.to_string());
+            current = next;
+            continue;
+        }
+        let result = checked_with_retry_after(status, final_url, chain, retry_header);
+        cache_actual_response(checked, &current, &result);
+        return result;
+    }
+    LinkCheckResult::limited("Redirect hop limit reached")
+}
+
+fn apply_link_checks(
+    pages: &mut [Page],
+    known_pages: &FastMap<String, LinkCheckResult>,
+    checked: &FastMap<String, LinkCheckResult>,
+) {
+    for page in pages {
+        for occurrence in Arc::make_mut(&mut page.link_evidence).iter_mut() {
+            if matches!(
+                occurrence.check.as_ref().map(|check| check.state),
+                Some(LinkCheckState::Blocked | LinkCheckState::Invalid | LinkCheckState::Fragment)
+            ) {
+                continue;
+            }
+            if let Some(result) = known_pages
+                .get(&occurrence.key)
+                .or_else(|| checked.get(&occurrence.key))
+            {
+                occurrence.check = Some(Box::new(result.clone()));
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1254,11 +1790,13 @@ fn crawl_engine(
     options: CrawlOptions,
     cancel: Option<&AtomicBool>,
     browser: Option<BrowserJob<'_>>,
+    compiled_extraction: Option<extract::CompiledRules>,
     on_event: &mut dyn FnMut(CrawlEvent),
 ) -> CrawlResult {
     let no_cancel = AtomicBool::new(false);
     let cancel = cancel.unwrap_or(&no_cancel);
     let cancelled = || cancel.load(Ordering::Relaxed);
+    let wants_extraction = !options.extraction_rules.is_empty();
     let seed = match normalize_seed(seed) {
         Ok(seed) => seed,
         Err(message) => {
@@ -1304,6 +1842,10 @@ fn crawl_engine(
     let mut committed = 1_usize;
     let mut over_cap = false;
     let mut stopped_early = false;
+    let mut link_evidence_total = 0_usize;
+    let mut link_evidence_limited = false;
+    let mut extraction_budget = extract::MAX_RUN_VALUE_BYTES;
+    let mut optional_checks: FastSet<String> = fast_set(64);
 
     let shared = Mutex::new(Work {
         queue: VecDeque::from([(seed, 0_u8)]),
@@ -1367,39 +1909,80 @@ fn crawl_engine(
                     }
                     // A panicking fetcher must still produce a result, or the crawl loop would
                     // wait forever for this URL.
-                    let (fetched, parsed, source, capture) = catch_unwind(AssertUnwindSafe(|| {
-                        if let (Some(job), Some(allowed)) = (browser, browser_allowed.as_ref()) {
-                            let capture =
-                                job.renderer
-                                    .render(&url, allowed.clone(), job.cancel.clone());
-                            browser_page(&capture)
-                        } else {
-                            let fetched = fetch(&url);
-                            let parsed = if fetched.status == 200
-                                && is_html(&fetched.content_type, &fetched.body)
+                    let (fetched, parsed, source, capture, extraction) =
+                        catch_unwind(AssertUnwindSafe(|| {
+                            if let (Some(job), Some(allowed)) = (browser, browser_allowed.as_ref())
                             {
-                                Some(parse_html(&fetched.body))
+                                let capture =
+                                    job.renderer
+                                        .render(&url, allowed.clone(), job.cancel.clone());
+                                let (fetched, parsed, source, capture_info) =
+                                    browser_page(&capture);
+                                let applicable =
+                                    capture.status == 200 && is_html(&capture.content_type, "");
+                                let partial = !capture_info.is_complete();
+                                (
+                                    fetched,
+                                    parsed,
+                                    source,
+                                    capture_info,
+                                    ExtractionInput {
+                                        html: wants_extraction
+                                            .then(|| capture.rendered_html.clone())
+                                            .flatten(),
+                                        stage: EvidenceStage::Rendered,
+                                        applicable,
+                                        partial,
+                                    },
+                                )
                             } else {
-                                None
-                            };
-                            // The body is no longer needed once parsed; dropping it here keeps
-                            // large pages from crossing the channel into the crawl loop.
-                            let mut fetched = fetched;
-                            fetched.body = String::new();
-                            (fetched, parsed, None, CaptureInfo::html())
-                        }
-                    }))
-                    .unwrap_or_else(|_| {
-                        (
-                            Fetched {
-                                error: "crawler worker panicked".into(),
-                                ..Fetched::default()
-                            },
-                            None,
-                            None,
-                            CaptureInfo::default(),
-                        )
-                    });
+                                let fetched = fetch(&url);
+                                let parsed = if fetched.status == 200
+                                    && is_html(&fetched.content_type, &fetched.body)
+                                {
+                                    Some(parse_html(&fetched.body))
+                                } else {
+                                    None
+                                };
+                                let partial = fetched.read != ReadState::Complete;
+                                let extraction_html = wants_extraction
+                                    .then(|| fetched.body.clone())
+                                    .filter(|body| !body.is_empty());
+                                let mut fetched = fetched;
+                                // The body is no longer needed once parsed; dropping it here keeps
+                                // large pages from crossing the channel into the crawl loop.
+                                fetched.body = String::new();
+                                (
+                                    fetched,
+                                    parsed,
+                                    None,
+                                    CaptureInfo::html(),
+                                    ExtractionInput {
+                                        html: extraction_html,
+                                        stage: EvidenceStage::Document,
+                                        applicable: true,
+                                        partial,
+                                    },
+                                )
+                            }
+                        }))
+                        .unwrap_or_else(|_| {
+                            (
+                                Fetched {
+                                    error: "crawler worker panicked".into(),
+                                    ..Fetched::default()
+                                },
+                                None,
+                                None,
+                                CaptureInfo::default(),
+                                ExtractionInput {
+                                    html: None,
+                                    stage: EvidenceStage::Document,
+                                    applicable: false,
+                                    partial: true,
+                                },
+                            )
+                        });
                     if fetched.status == 429 || fetched.status == 503 {
                         let wait =
                             Duration::from_millis(fetched.retry_after_ms.max(PAUSE_PUSHBACK_MS));
@@ -1419,6 +2002,7 @@ fn crawl_engine(
                             parsed,
                             source,
                             capture,
+                            extraction,
                         })))
                         .is_err()
                     {
@@ -1573,6 +2157,7 @@ fn crawl_engine(
                 parsed,
                 source,
                 capture,
+                extraction,
             } = *result;
             let page_url =
                 if parsed.is_some() || source.is_some() || (300..400).contains(&fetched.status) {
@@ -1583,14 +2168,151 @@ fn crawl_engine(
             let mut new_jobs: Vec<(String, u8)> = Vec::new();
             let mut page_links: Vec<String> = Vec::new();
             let mut canonicals: Vec<CanonicalDeclaration> = Vec::new();
+            let mut link_evidence: Vec<LinkOccurrence> = Vec::new();
+            let mut link_evidence_limit = String::new();
 
             // One policy path for every discovered link, whether it came from the rendered DOM
-            // or from the source document when no rendered DOM exists.
-            let mut discover_links = |links: &[String], link_base: &Url| {
-                for href in links {
-                    let Some(next) = resolve(link_base, href) else {
+            // or from the source document when no rendered DOM exists. Scheduling and evidence
+            // are separate: blocked, external and asset links remain evidence even when they are
+            // not page jobs.
+            let mut discover_links = |anchors: &[Anchor],
+                                      link_base: &Url,
+                                      scheduling: bool,
+                                      stage: EvidenceStage,
+                                      tail: &[LinkRef],
+                                      evidence: &mut Vec<LinkOccurrence>,
+                                      limit: &mut String| {
+                for anchor in anchors {
+                    let mut occurrence = LinkOccurrence {
+                        source: url.clone(),
+                        order: anchor.order,
+                        raw_href: anchor.href.clone(),
+                        anchor: anchor.text.clone(),
+                        stage,
+                        ..LinkOccurrence::default()
+                    };
+                    if anchor.overlong {
+                        occurrence.resolved = anchor.href.clone();
+                        occurrence.truncated = true;
+                        occurrence.check = Some(Box::new(LinkCheckResult::limited(
+                            "URL exceeds 8 KiB; not requested",
+                        )));
+                        occurrence.skip_reason = "URL exceeds 8 KiB; not requested".into();
+                        retain_occurrence(evidence, occurrence, limit);
+                        continue;
+                    }
+                    match resolve_evidence(link_base, &anchor.href) {
+                        EvidenceHref::Invalid(reason) => {
+                            occurrence.check = Some(Box::new(LinkCheckResult {
+                                state: LinkCheckState::Invalid,
+                                reason: reason.clone(),
+                                ..LinkCheckResult::default()
+                            }));
+                            occurrence.skip_reason = reason;
+                            retain_occurrence(evidence, occurrence, limit);
+                            continue;
+                        }
+                        EvidenceHref::Fragment { url, key, fragment } => {
+                            occurrence.truncated = url.as_str().len() > links::MAX_URL_BYTES;
+                            occurrence.resolved =
+                                links::truncate_bytes(url.as_str(), links::MAX_URL_BYTES);
+                            occurrence.key = key;
+                            occurrence.fragment = fragment;
+                            occurrence.check = Some(Box::new(LinkCheckResult {
+                                state: LinkCheckState::Fragment,
+                                reason: "Same-document fragment; not fetched".into(),
+                                ..LinkCheckResult::default()
+                            }));
+                            occurrence.skip_reason = "Same-document fragment".into();
+                            retain_occurrence(evidence, occurrence, limit);
+                            continue;
+                        }
+                        EvidenceHref::Url {
+                            url: next,
+                            key,
+                            fragment,
+                        } => {
+                            occurrence.truncated = next.as_str().len() > links::MAX_URL_BYTES;
+                            occurrence.resolved =
+                                links::truncate_bytes(next.as_str(), links::MAX_URL_BYTES);
+                            occurrence.key = key.clone();
+                            occurrence.fragment = fragment;
+                            let same = same_host(&next, &host);
+                            let asset = looks_like_asset(&next);
+                            let document = is_document_download(&next);
+                            let web_asset = is_web_asset(&next);
+                            let allowed = robots
+                                .as_ref()
+                                .is_none_or(|robots| robots.allows(&request_path(&next)));
+                            let optional_candidate = options.check_links
+                                && ((same && asset && document) || (!same && !web_asset));
+
+                            if scheduling && same && !asset {
+                                if !allowed {
+                                    occurrence.skip_reason = "Blocked by robots.txt".into();
+                                    occurrence.check = Some(Box::new(LinkCheckResult::blocked(
+                                        "robots.txt disallows this URL",
+                                    )));
+                                } else {
+                                    page_links.push(key.clone());
+                                    if depth >= limits.max_depth {
+                                        occurrence.skip_reason = "Not fetched (depth limit)".into();
+                                        occurrence.check =
+                                            Some(Box::new(LinkCheckResult::limited(
+                                                "Depth limit prevented a fetch",
+                                            )));
+                                    } else if !seen.insert(key.clone()) {
+                                        occurrence.skip_reason =
+                                            "Already discovered in this crawl".into();
+                                    } else if committed >= limits.max_pages {
+                                        over_cap = true;
+                                        occurrence.skip_reason = "Not fetched (page limit)".into();
+                                        occurrence.check =
+                                            Some(Box::new(LinkCheckResult::limited(
+                                                "Page limit prevented a fetch",
+                                            )));
+                                    } else {
+                                        committed += 1;
+                                        new_jobs.push((key, depth + 1));
+                                    }
+                                }
+                            } else if optional_candidate {
+                                occurrence.skip_reason = "Queued for optional check".into();
+                                optional_checks.insert(key.clone());
+                            } else if same && asset {
+                                occurrence.skip_reason = if document {
+                                    "Document download not checked".into()
+                                } else {
+                                    "Asset not checked".into()
+                                };
+                            } else if !same {
+                                occurrence.skip_reason = if web_asset {
+                                    "External asset not checked".into()
+                                } else if options.check_links {
+                                    "Queued for optional check".into()
+                                } else {
+                                    "External link; checking is off".into()
+                                };
+                            } else if !scheduling {
+                                occurrence.skip_reason =
+                                    "Source evidence; rendered document supplied discovery".into();
+                            }
+                            retain_occurrence(evidence, occurrence, limit);
+                        }
+                    }
+                }
+                // The retained evidence list is bounded; discovery after the cap still
+                // follows the same page scope, robots and budget rules.
+                for link in tail {
+                    if link.overlong {
+                        continue;
+                    }
+                    let Some(next) = resolve(link_base, &link.href) else {
                         continue;
                     };
+                    if !next.username().is_empty() || next.password().is_some() {
+                        continue;
+                    }
                     if !same_host(&next, &host) || looks_like_asset(&next) {
                         continue;
                     }
@@ -1600,8 +2322,6 @@ fn crawl_engine(
                     {
                         continue;
                     }
-                    // Every same-host link counts for the link audit, even when the page was
-                    // already seen or we are too deep to follow it.
                     let key = url_key(next);
                     page_links.push(key.clone());
                     if depth >= limits.max_depth || !seen.insert(key.clone()) {
@@ -1634,7 +2354,18 @@ fn crawl_engine(
                         stage,
                     ));
                 }
-                discover_links(&parsed.links, &link_base);
+                discover_links(
+                    &parsed.anchors,
+                    &link_base,
+                    true,
+                    stage,
+                    &parsed.links[parsed.anchors.len()..],
+                    &mut link_evidence,
+                    &mut link_evidence_limit,
+                );
+                if parsed.anchors_truncated {
+                    link_evidence_limit = "Page link evidence limited to 10,000 occurrences".into();
+                }
             }
 
             if let (Some(source), Some(page_url)) = (source.as_ref(), page_url.as_ref()) {
@@ -1654,11 +2385,34 @@ fn crawl_engine(
                 indexability::merge_canonicals(&mut canonicals, source_canonicals);
                 // Without a rendered document the source is the only document that can supply
                 // discovered links. Those links are still not a completed content audit.
-                if parsed.is_none() {
-                    discover_links(&source.links, &source_base);
+                let source_schedules = parsed.is_none();
+                let source_tail: &[LinkRef] = if source_schedules {
+                    &source.links[source.anchors.len()..]
+                } else {
+                    &[]
+                };
+                discover_links(
+                    &source.anchors,
+                    &source_base,
+                    source_schedules,
+                    EvidenceStage::Document,
+                    source_tail,
+                    &mut link_evidence,
+                    &mut link_evidence_limit,
+                );
+                if source.anchors_truncated && link_evidence_limit.is_empty() {
+                    link_evidence_limit = "Page link evidence limited to 10,000 occurrences".into();
                 }
             }
             drop(discover_links);
+
+            let remaining = links::MAX_RUN_OCCURRENCES.saturating_sub(link_evidence_total);
+            if link_evidence.len() > remaining {
+                link_evidence.truncate(remaining);
+                link_evidence_limit = "Run link evidence limited to 250,000 occurrences".into();
+                link_evidence_limited = true;
+            }
+            link_evidence_total += link_evidence.len();
 
             let redirect = if (300..400).contains(&fetched.status) {
                 page_url
@@ -1760,6 +2514,24 @@ fn crawl_engine(
                 evidence,
                 capture,
             );
+            let extraction_results =
+                compiled_extraction
+                    .as_ref()
+                    .map_or_else(Vec::new, |compiled| {
+                        extract::evaluate(
+                            compiled,
+                            extraction.html.as_deref(),
+                            extraction.stage,
+                            extraction.applicable,
+                            extraction.partial,
+                            &mut extraction_budget,
+                        )
+                    });
+            let extraction_limit = if extraction_results.iter().any(|outcome| outcome.limited) {
+                "Extraction stopped at a value cap".to_string()
+            } else {
+                String::new()
+            };
             let page = Page {
                 url,
                 status: fetched.status,
@@ -1778,7 +2550,11 @@ fn crawl_engine(
                     .to_string(),
                 images,
                 images_missing_alt,
-                links: page_links,
+                links: Arc::new(page_links),
+                link_evidence: Arc::new(link_evidence),
+                link_evidence_limit,
+                extraction: Arc::new(extraction_results),
+                extraction_limit,
                 indexability,
             };
             sitemap_report.observe_page(&page);
@@ -1798,6 +2574,74 @@ fn crawl_engine(
         }
     });
 
+    let mut known_pages: FastMap<String, LinkCheckResult> = fast_map(pages.len());
+    for page in &pages {
+        let result = if page.status == 0 {
+            LinkCheckResult::unavailable(if page.error.is_empty() {
+                "Page crawl could not fetch this URL".to_string()
+            } else {
+                page.error.clone()
+            })
+        } else {
+            LinkCheckResult::checked(page.status, page.url.clone(), Vec::new())
+        };
+        known_pages.insert(page.url.clone(), result);
+    }
+    let mut checked: FastMap<String, LinkCheckResult> = fast_map(optional_checks.len());
+    let mut check_limited = false;
+    let mut check_stopped = false;
+    if options.check_links && !optional_checks.is_empty() && !cancelled() {
+        let mut destinations: Vec<String> = optional_checks
+            .iter()
+            .filter(|key| !known_pages.contains_key(*key))
+            .cloned()
+            .collect();
+        destinations.sort();
+        if !destinations.is_empty() {
+            on_event(CrawlEvent::LinkCheckStarted(destinations.len()));
+            let agent = check_agent();
+            let mut robots_cache: HashMap<String, RobotsPolicy> = HashMap::new();
+            let mut last_start: HashMap<String, Instant> = HashMap::new();
+            let mut retry_after_until: HashMap<String, RetryCooldown> = HashMap::new();
+            let mut budget = links::MAX_CHECKED_DESTINATIONS;
+            for key in destinations {
+                if cancelled() {
+                    check_stopped = true;
+                    break;
+                }
+                let result = optional_check_result(
+                    &key,
+                    &known_pages,
+                    &mut checked,
+                    &optional_checks,
+                    &host,
+                    &agent,
+                    &mut robots_cache,
+                    &mut last_start,
+                    &mut retry_after_until,
+                    cancel,
+                    &mut budget,
+                );
+                if result.limited {
+                    check_limited = true;
+                }
+                checked.insert(key.clone(), result.clone());
+                on_event(CrawlEvent::LinkCheck(key, result));
+                if cancelled() {
+                    check_stopped = true;
+                    break;
+                }
+            }
+        }
+    }
+    if cancelled() {
+        check_stopped = true;
+    }
+    if check_stopped {
+        stopped_early = true;
+    }
+    apply_link_checks(&mut pages, &known_pages, &checked);
+
     let mut message = if stopped_early {
         format!("Stopped · {} pages on {host}", pages.len())
     } else {
@@ -1814,6 +2658,9 @@ fn crawl_engine(
             limits.max_pages
         ));
         outcome = CrawlOutcome::Limited;
+    }
+    if check_limited && !stopped_early {
+        message.push_str(" · link checks incomplete");
     }
     if !stopped_early && pages.iter().all(|page| page.status == 0) {
         let why = pages
@@ -1838,7 +2685,24 @@ fn crawl_engine(
         sitemap: sitemap_report,
         outcome,
         setup_failure: None,
+        link_evidence_limited,
     }
+}
+
+#[derive(Clone, Debug)]
+struct LinkRef {
+    /// The literal href when it fits the evidence bound; a bounded display form with
+    /// `overlong` set otherwise.
+    href: String,
+    overlong: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Anchor {
+    href: String,
+    overlong: bool,
+    text: String,
+    order: u32,
 }
 
 struct Parsed {
@@ -1846,7 +2710,10 @@ struct Parsed {
     meta: String,
     h1s: Vec<String>,
     words: usize,
-    links: Vec<String>,
+    /// Every anchor href in document order, independent of the evidence cap.
+    links: Vec<LinkRef>,
+    anchors: Vec<Anchor>,
+    anchors_truncated: bool,
     /// `<base href>`, resolved by the crawler against the page URL before joining links.
     base: Option<String>,
     /// Every robots meta declaration, in document order, including agent scopes.
@@ -1960,6 +2827,33 @@ fn browser_page(capture: &Capture) -> (Fetched, Option<Parsed>, Option<Parsed>, 
     )
 }
 
+/// Normalized descendant text for an anchor, excluding non-content elements. An image-only
+/// anchor intentionally has an empty label: alt text is not an accessibility name here.
+fn anchor_text(element: ElementRef<'_>) -> String {
+    let mut text = String::new();
+    for node in element.descendants() {
+        let Node::Text(value) = node.value() else {
+            continue;
+        };
+        let excluded = node.ancestors().skip(1).any(|ancestor| {
+            ancestor
+                .value()
+                .as_element()
+                .is_some_and(|element| matches!(element.name(), "script" | "style" | "template"))
+        });
+        if excluded {
+            continue;
+        }
+        for word in value.text.split_whitespace() {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(word);
+        }
+    }
+    text
+}
+
 fn parse_html(body: &str) -> Parsed {
     parse_html_staged(body, EvidenceStage::Document)
 }
@@ -1971,7 +2865,9 @@ fn parse_html_staged(body: &str, stage: EvidenceStage) -> Parsed {
     let mut meta = String::new();
     let mut saw_description = false;
     let mut h1s = Vec::new();
-    let mut links = Vec::new();
+    let mut links: Vec<LinkRef> = Vec::new();
+    let mut anchors = Vec::new();
+    let mut anchors_truncated = false;
     let mut base: Option<String> = None;
     let mut robots_directives: Vec<RobotsDirective> = Vec::new();
     let mut canonicals: Vec<Option<String>> = Vec::new();
@@ -2008,8 +2904,31 @@ fn parse_html_staged(body: &str, stage: EvidenceStage) -> Parsed {
                     }
                 }
                 "a" => {
-                    if let Some(href) = element.attr("href") {
-                        links.push(href.to_string());
+                    if let Some(raw) = element.attr("href") {
+                        // An overlong href is declined explicitly. It is never truncated into a
+                        // different destination and then requested as if it were the real one.
+                        let overlong = raw.len() > links::MAX_URL_BYTES;
+                        let href = if overlong {
+                            links::truncate_bytes(raw, links::MAX_URL_BYTES)
+                        } else {
+                            raw.to_string()
+                        };
+                        let text = ElementRef::wrap(node).map(anchor_text).unwrap_or_default();
+                        let order = links.len() as u32;
+                        links.push(LinkRef {
+                            href: href.clone(),
+                            overlong,
+                        });
+                        if anchors.len() < links::MAX_PAGE_OCCURRENCES {
+                            anchors.push(Anchor {
+                                href,
+                                overlong,
+                                text: links::truncate_chars(&text, links::MAX_ANCHOR_CHARS),
+                                order,
+                            });
+                        } else {
+                            anchors_truncated = true;
+                        }
                     }
                 }
                 "base" => {
@@ -2058,6 +2977,8 @@ fn parse_html_staged(body: &str, stage: EvidenceStage) -> Parsed {
         h1s,
         words,
         links,
+        anchors,
+        anchors_truncated,
         base,
         robots_directives,
         canonicals,
@@ -2305,6 +3226,105 @@ fn sleep_cancellable(duration: Duration, cancel: Option<&AtomicBool>) -> bool {
     }
 }
 
+fn retain_occurrence(
+    evidence: &mut Vec<LinkOccurrence>,
+    occurrence: LinkOccurrence,
+    limit: &mut String,
+) {
+    if evidence.len() < links::MAX_PAGE_OCCURRENCES {
+        evidence.push(occurrence);
+    } else if limit.is_empty() {
+        *limit = "Page link evidence limited to 10,000 occurrences".into();
+    }
+}
+
+/// Resolve an anchor for evidence without silently dropping malformed or non-network links.
+enum EvidenceHref {
+    Url {
+        url: Url,
+        key: String,
+        fragment: String,
+    },
+    Fragment {
+        url: Url,
+        key: String,
+        fragment: String,
+    },
+    Invalid(String),
+}
+
+fn resolve_evidence(page: &Url, href: &str) -> EvidenceHref {
+    let raw = href.trim();
+    if raw.is_empty() {
+        return EvidenceHref::Invalid("Empty href".into());
+    }
+    if let Some(fragment) = raw.strip_prefix('#') {
+        let mut url = page.clone();
+        url.set_fragment(None);
+        return EvidenceHref::Fragment {
+            key: url_key(url.clone()),
+            url,
+            fragment: links::truncate_chars(fragment, links::MAX_ANCHOR_CHARS),
+        };
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("mailto:")
+        || lower.starts_with("javascript:")
+        || lower.starts_with("tel:")
+        || lower.starts_with("data:")
+    {
+        return EvidenceHref::Invalid(format!(
+            "Non-HTTP scheme ({})",
+            lower.split(':').next().unwrap_or("unknown")
+        ));
+    }
+    let mut url = match page.join(raw) {
+        Ok(url) => url,
+        Err(_) => return EvidenceHref::Invalid("Invalid URL".into()),
+    };
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return EvidenceHref::Invalid(format!("Non-HTTP scheme ({})", url.scheme()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return EvidenceHref::Invalid("Embedded credentials are not checked".into());
+    }
+    let fragment = url.fragment().unwrap_or("").to_string();
+    url.set_fragment(None);
+    let key = url_key(url.clone());
+    EvidenceHref::Url {
+        url,
+        key,
+        fragment: links::truncate_chars(&fragment, links::MAX_ANCHOR_CHARS),
+    }
+}
+
+/// Document downloads that the optional checker may request without turning them into pages.
+fn is_document_download(url: &Url) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "csv",
+        "txt", "zip", "gz", "tar", "tgz", "7z", "rar", "epub",
+    ];
+    extension_is(url, EXTENSIONS)
+}
+
+/// Image, script, font, style, and media assets that are never optional link checks.
+fn is_web_asset(url: &Url) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "css", "js", "mjs", "map", "mp4", "mp3",
+        "wav", "ogg", "woff", "woff2", "ttf", "eot", "xml", "json", "rss", "atom",
+    ];
+    extension_is(url, EXTENSIONS)
+}
+
+fn extension_is(url: &Url, extensions: &[&str]) -> bool {
+    let last = url.path().rsplit('/').next().unwrap_or("");
+    last.rsplit_once('.').is_some_and(|(_, ext)| {
+        extensions
+            .iter()
+            .any(|known| ext.eq_ignore_ascii_case(known))
+    })
+}
+
 fn resolve(page: &Url, href: &str) -> Option<Url> {
     let href = href.trim();
     if href.is_empty()
@@ -2495,7 +3515,11 @@ pub fn sample_pages() -> Vec<Page> {
         canonical: String::new(),
         images: 0,
         images_missing_alt: 0,
-        links: Vec::new(),
+        links: Arc::new(Vec::new()),
+        link_evidence: Arc::new(Vec::new()),
+        link_evidence_limit: String::new(),
+        extraction: Arc::new(Vec::new()),
+        extraction_limit: String::new(),
         indexability: Assessment::default(),
     };
     let ok_meta =
@@ -2578,15 +3602,15 @@ pub fn sample_pages() -> Vec<Page> {
     pages[0].images_missing_alt = 1;
     pages[2].images = 3;
     pages[2].images_missing_alt = 3;
-    pages[0].links = vec![
+    pages[0].links = Arc::new(vec![
         "https://example.com/pricing".into(),
         "https://example.com/promo".into(),
         "https://example.com/blog/calm".into(),
-    ];
-    pages[3].links = vec![
+    ]);
+    pages[3].links = Arc::new(vec![
         "https://example.com/blog/notes".into(),
         "https://example.com/guides/launch".into(),
-    ];
+    ]);
     for page in &mut pages {
         page.indexability = sample_assessment(page);
         page.noindex = page.indexability.has_noindex();
@@ -2595,6 +3619,30 @@ pub fn sample_pages() -> Vec<Page> {
             .first_valid_canonical()
             .unwrap_or_default()
             .to_string();
+        page.link_evidence = Arc::new(
+            page.links
+                .iter()
+                .enumerate()
+                .map(|(order, link)| {
+                    let anchor = link
+                        .rsplit('/')
+                        .next()
+                        .filter(|part| !part.is_empty())
+                        .unwrap_or("Home")
+                        .replace('-', " ");
+                    LinkOccurrence {
+                        source: page.url.clone(),
+                        order: order as u32,
+                        raw_href: link.clone(),
+                        resolved: link.clone(),
+                        key: link.clone(),
+                        anchor,
+                        stage: EvidenceStage::Document,
+                        ..LinkOccurrence::default()
+                    }
+                })
+                .collect(),
+        );
     }
     pages
 }
@@ -2617,7 +3665,11 @@ pub fn indexability_sample_pages() -> Vec<Page> {
         canonical: String::new(),
         images: 0,
         images_missing_alt: 0,
-        links: Vec::new(),
+        links: Arc::new(Vec::new()),
+        link_evidence: Arc::new(Vec::new()),
+        link_evidence_limit: String::new(),
+        extraction: Arc::new(Vec::new()),
+        extraction_limit: String::new(),
         indexability: Assessment::default(),
     };
     let generic = |raw: &str| indexability::parse_meta_directive("robots", raw).unwrap();
@@ -2801,6 +3853,74 @@ fn sample_assessment(page: &Page) -> Assessment {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn optional_retry_after_parses_seconds_http_dates_and_past_dates() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let date = UNIX_EPOCH + Duration::from_secs(784111777);
+        for header in [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+        ] {
+            assert_eq!(
+                retry_after_delay(Some(header), date - Duration::from_secs(7)),
+                Some(Duration::from_secs(7))
+            );
+            assert_eq!(
+                retry_after_delay(Some(header), date + Duration::from_secs(7)),
+                Some(Duration::ZERO)
+            );
+        }
+        assert_eq!(
+            retry_after_delay(Some(" 7 "), date),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(retry_after_delay(Some("nonsense"), date), None);
+    }
+
+    #[test]
+    fn optional_huge_crawl_delay_is_limited_without_a_request() {
+        let origin = "https://example.test";
+        let mut robots = HashMap::from([(
+            origin.to_string(),
+            RobotsPolicy::Known(Some(Robots {
+                crawl_delay_ms: u64::MAX,
+                ..Robots::default()
+            })),
+        )]);
+        let mut starts = HashMap::from([(origin.to_string(), Instant::now())]);
+        let mut budget = 1;
+        let result = optional_check_result(
+            "https://example.test/target",
+            &fast_map(0),
+            &mut fast_map(0),
+            &fast_set(0),
+            "internal.test",
+            &check_agent(),
+            &mut robots,
+            &mut starts,
+            &mut HashMap::new(),
+            &AtomicBool::new(false),
+            &mut budget,
+        );
+        assert_eq!(result.state, LinkCheckState::Limited);
+        assert_eq!(budget, 1, "an impossible delay must not issue a request");
+    }
+
+    #[test]
+    fn optional_retry_after_huge_seconds_is_explicitly_unrepresentable() {
+        let mut cooldowns = HashMap::new();
+        record_retry_cooldown(
+            &mut cooldowns,
+            "https://example.test",
+            Some("18446744073709551615"),
+        );
+        assert!(matches!(
+            cooldowns.get("https://example.test"),
+            Some(RetryCooldown::Unrepresentable)
+        ));
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -2836,6 +3956,214 @@ mod tests {
     }
 
     #[test]
+    fn source_only_browser_capture_keeps_document_stage_link_evidence() {
+        let capture = Capture {
+            status: 200,
+            content_type: "text/html".into(),
+            source_html: Some("<a href=\"/from-source\">Source link</a>".into()),
+            source_state: SourceState::Captured,
+            rendered_html: None,
+            state: RenderState::Captured,
+            ..Capture::default()
+        };
+        let (_, parsed, source, info) = browser_page(&capture);
+        assert!(parsed.is_none(), "no rendered DOM is audited");
+        let source = source.expect("source fallback is retained");
+        assert_eq!(source.anchors.len(), 1);
+        assert_eq!(source.anchors[0].href, "/from-source");
+        assert!(!info.is_complete(), "the HTML capture remains incomplete");
+    }
+
+    #[test]
+    fn anchor_evidence_caps_without_truncating_page_discovery_links() {
+        let body = (0..links::MAX_PAGE_OCCURRENCES + 1)
+            .map(|index| format!("<a href=\"/p{index}\">Page</a>"))
+            .collect::<String>();
+        let parsed = parse_html(&body);
+        assert_eq!(parsed.anchors.len(), links::MAX_PAGE_OCCURRENCES);
+        assert!(parsed.anchors_truncated);
+        assert_eq!(parsed.links.len(), links::MAX_PAGE_OCCURRENCES + 1);
+    }
+
+    #[test]
+    fn optional_waits_honor_the_absolute_deadline_and_cancellation() {
+        let cancel = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_millis(60);
+        let started = Instant::now();
+        let stopped = sleep_cancellable_until(Duration::from_secs(60), &cancel, deadline);
+        assert!(matches!(stopped, Err(CheckStop::Deadline)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        cancel.store(true, Ordering::Relaxed);
+        let stopped = sleep_cancellable_until(
+            Duration::from_secs(60),
+            &cancel,
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(matches!(stopped, Err(CheckStop::Cancelled)));
+    }
+
+    #[test]
+    fn combined_rendered_and_source_evidence_share_the_page_cap() {
+        let mut evidence = Vec::new();
+        let mut limit = String::new();
+        for order in 0..6_000 {
+            retain_occurrence(
+                &mut evidence,
+                LinkOccurrence {
+                    order,
+                    stage: EvidenceStage::Rendered,
+                    ..LinkOccurrence::default()
+                },
+                &mut limit,
+            );
+        }
+        for order in 6_000..11_000 {
+            retain_occurrence(
+                &mut evidence,
+                LinkOccurrence {
+                    order,
+                    stage: EvidenceStage::Document,
+                    ..LinkOccurrence::default()
+                },
+                &mut limit,
+            );
+        }
+        assert_eq!(evidence.len(), links::MAX_PAGE_OCCURRENCES);
+        assert!(limit.contains("10,000"));
+        assert_eq!(
+            evidence.last().map(|occurrence| occurrence.stage),
+            Some(EvidenceStage::Document)
+        );
+    }
+
+    #[test]
+    fn evidence_cap_does_not_cut_ordinary_page_discovery() {
+        let body = format!(
+            "{}<a href='/tail'>Tail</a>",
+            "<a href='/'>Home</a>".repeat(links::MAX_PAGE_OCCURRENCES)
+        );
+        let out = crawl_with(
+            "http://example.test/",
+            Limits {
+                max_pages: 2,
+                max_depth: 1,
+            },
+            |url| Fetched {
+                status: 200,
+                content_type: "text/html".into(),
+                body: if url.ends_with("/tail") {
+                    "<p>Tail</p>".into()
+                } else {
+                    body.clone()
+                },
+                read: ReadState::Complete,
+                ..Fetched::default()
+            },
+        );
+        assert!(
+            out.pages.iter().any(|page| page.url.ends_with("/tail")),
+            "evidence cap removed ordinary discovery: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn discovery_beyond_the_evidence_cap_still_rejects_embedded_credentials() {
+        use std::sync::{Arc, Mutex};
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let seen = requested.clone();
+        let body = format!(
+            "{}<a href='http://user:pass@example.test/secret'>Secret</a>",
+            "<a href='/'>Home</a>".repeat(links::MAX_PAGE_OCCURRENCES)
+        );
+        let _ = crawl_with(
+            "http://example.test/",
+            Limits {
+                max_pages: 2,
+                max_depth: 1,
+            },
+            move |url| {
+                seen.lock().unwrap().push(url.to_string());
+                Fetched {
+                    status: 200,
+                    content_type: "text/html".into(),
+                    body: body.clone(),
+                    read: ReadState::Complete,
+                    ..Fetched::default()
+                }
+            },
+        );
+        assert!(
+            requested
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|url| !url.contains("user:pass")),
+            "credentials in a tail anchor were requested"
+        );
+    }
+
+    #[test]
+    fn overlong_hrefs_are_declined_without_requesting_a_truncated_destination() {
+        use std::sync::{Arc, Mutex};
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let seen = requested.clone();
+        let long = format!(
+            "https://example.test/{}/{}",
+            "segment".repeat(links::MAX_URL_BYTES / 7),
+            "tail-marker"
+        );
+        let body = format!("<a href='{long}'>Long</a><a href='/real'>Real</a>");
+        let out = crawl_with(
+            "https://example.test/",
+            Limits {
+                max_pages: 4,
+                max_depth: 1,
+            },
+            move |url| {
+                seen.lock().unwrap().push(url.to_string());
+                Fetched {
+                    status: 200,
+                    content_type: "text/html".into(),
+                    body: if url.ends_with("/real") {
+                        "<p>Real</p>".into()
+                    } else {
+                        body.clone()
+                    },
+                    read: ReadState::Complete,
+                    ..Fetched::default()
+                }
+            },
+        );
+        assert!(out.pages.iter().any(|page| page.url.ends_with("/real")));
+        let requested = requested.lock().unwrap();
+        assert!(
+            requested
+                .iter()
+                .all(|url| url.len() <= links::MAX_URL_BYTES && !url.contains('…')),
+            "a truncated URL was requested: {:?}",
+            requested
+                .iter()
+                .filter(|url| url.len() > links::MAX_URL_BYTES || url.contains('…'))
+                .collect::<Vec<_>>()
+        );
+        let home = out
+            .pages
+            .iter()
+            .find(|page| page.url == "https://example.test/")
+            .expect("home");
+        let long = home
+            .link_evidence
+            .iter()
+            .find(|link| link.anchor == "Long")
+            .expect("overlong evidence");
+        assert_eq!(long.check_state(), LinkCheckState::Limited);
+        assert!(long.truncated);
+        assert!(long.state_reason().contains("8 KiB"));
+    }
+
+    #[test]
     fn parses_the_fields_the_audits_need() {
         let body = r#"<!doctype html><html><head>
             <title>  Hello   there </title>
@@ -2865,8 +4193,13 @@ mod tests {
         assert_eq!(parsed.canonicals, vec![Some("/canonical".to_string())]);
         assert_eq!(parsed.images, 3);
         assert_eq!(parsed.images_missing_alt, 2);
-        assert!(parsed.links.contains(&"/pricing".to_string()));
-        assert!(parsed.links.iter().any(|href| href.contains("other.test")));
+        assert!(parsed.links.iter().any(|link| link.href == "/pricing"));
+        assert!(
+            parsed
+                .links
+                .iter()
+                .any(|link| link.href.contains("other.test"))
+        );
         assert!(resolve(&Url::parse("https://example.com/").unwrap(), "mailto:a@b.c").is_none());
         assert_eq!(
             resolve(
@@ -3156,6 +4489,7 @@ mod tests {
             CrawlOptions::default(),
             Some(&no_stop),
             None,
+            None,
             &mut |event| {
                 if let CrawlEvent::Page(page) = event {
                     all.borrow_mut().push(page.url.clone());
@@ -3186,6 +4520,7 @@ mod tests {
             false,
             CrawlOptions::default(),
             Some(&stop_after_one),
+            None,
             None,
             &mut |event| {
                 if let CrawlEvent::Page(page) = event {

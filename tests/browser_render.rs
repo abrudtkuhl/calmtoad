@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use calmtoad::crawl::{
     CrawlOptions, CrawlOutcome, Limits, auditable, crawl_site_with, title_issue,
 };
+use calmtoad::extract::{ExtractionOutput, ExtractionRule, ExtractionState, MatchMode};
 use calmtoad::indexability::{CaptureInfo, EvidenceStage, FindingCode, Label};
 use calmtoad::render::{
     BrowserRenderer, Capture, RenderConfig, RenderMode, RenderState, SourceState, discover_browser,
@@ -611,6 +612,45 @@ fn process_commands() -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("UTF-8 process commands")
+}
+
+#[test]
+fn browser_extraction_uses_the_rendered_dom_not_source_html() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(_renderer) = renderer() else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let rules = vec![ExtractionRule {
+        id: "heading".into(),
+        name: "Heading".into(),
+        selector: "#heading".into(),
+        output: ExtractionOutput::Text,
+        attribute: String::new(),
+        mode: MatchMode::First,
+    }];
+    let outcome = crawl_site_with(
+        &format!("{}/plain", fixture.base()),
+        Limits {
+            max_pages: 1,
+            max_depth: 0,
+        },
+        CrawlOptions {
+            rendering: RenderMode::Browser,
+            extraction_rules: rules,
+            ..CrawlOptions::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
+    let page = outcome
+        .pages
+        .first()
+        .unwrap_or_else(|| panic!("no page: {}", outcome.message));
+    assert_eq!(page.extraction.len(), 1);
+    assert_eq!(page.extraction[0].state, ExtractionState::Matched);
+    assert_eq!(page.extraction[0].values, vec!["Hydrated heading"]);
+    assert_eq!(page.extraction[0].stage, Some(EvidenceStage::Rendered));
 }
 
 #[test]
@@ -1584,6 +1624,7 @@ fn browser_mode_crawl_audits_rendered_documents_and_keeps_source_evidence() {
         sitemaps: false,
         rendering: RenderMode::Browser,
         browser_path: Some(info.path.clone()),
+        ..CrawlOptions::default()
     };
     let outcome = crawl_site_with(
         &seed,

@@ -7,7 +7,8 @@
 use std::borrow::Cow;
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -18,10 +19,13 @@ use calmtoad::crawl::{
     auditable, canonical_issue, content_issue, counts_with, h1_issue, image_issue, links_issue,
     meta_issue, redirect_issue, response_issue, title_issue,
 };
+use calmtoad::extract::{self, ExtractionRule};
 use calmtoad::indexability::{
     Assessment, CaptureInfo, CaptureMode, EvidenceStage, FindingCode, Label, ReadState,
     RenderSummary, Severity,
 };
+use calmtoad::inventory;
+use calmtoad::links::{LinkCheckResult, LinkOccurrence};
 use calmtoad::render::{self, RenderMode, RenderState, SourceState};
 use calmtoad::sitemap::{FileState, SitemapFile, SitemapKind, SitemapReport, SitemapUrl, UrlState};
 use calmtoad::update;
@@ -61,6 +65,18 @@ enum Tab {
 enum SitemapView {
     Urls,
     Files,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinksView {
+    Pages,
+    Evidence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InventoryScope {
+    All,
+    VisibleInternal,
 }
 
 /// What the results toolbar is asking to see.
@@ -151,6 +167,9 @@ struct RunContext {
     limits: Limits,
     rendering: RenderMode,
     sitemaps: bool,
+    check_links: bool,
+    started_utc: String,
+    extraction_rules: Vec<ExtractionRule>,
 }
 
 /// The workflow state of the current crawl.
@@ -406,6 +425,8 @@ struct OverviewCounts {
     incomplete: usize,
     sitemap_incomplete: usize,
     sitemap_file_findings: usize,
+    link_findings: usize,
+    link_incomplete: usize,
 }
 
 impl OverviewCounts {
@@ -489,7 +510,12 @@ impl OverviewGroup {
     }
 }
 
-fn overview_counts(pages: &[Page], counts: &Counts, sitemap: &SitemapReport) -> OverviewCounts {
+fn overview_counts(
+    pages: &[Page],
+    counts: &Counts,
+    sitemap: &SitemapReport,
+    link_checks: &HashMap<String, LinkCheckResult>,
+) -> OverviewCounts {
     OverviewCounts {
         pages: counts.pages,
         response: counts.response,
@@ -505,6 +531,26 @@ fn overview_counts(pages: &[Page], counts: &Counts, sitemap: &SitemapReport) -> 
         incomplete: pages.iter().filter(|page| page_incomplete(page)).count(),
         sitemap_incomplete: sitemap_incomplete(sitemap),
         sitemap_file_findings: sitemap_file_findings(sitemap),
+        link_findings: pages
+            .iter()
+            .flat_map(|page| page.link_evidence.iter())
+            .filter(|occurrence| {
+                link_checks
+                    .get(&occurrence.key)
+                    .or(occurrence.check.as_deref())
+                    .is_some_and(LinkCheckResult::is_finding)
+            })
+            .count(),
+        link_incomplete: pages
+            .iter()
+            .flat_map(|page| page.link_evidence.iter())
+            .filter(|occurrence| {
+                link_checks
+                    .get(&occurrence.key)
+                    .or(occurrence.check.as_deref())
+                    .is_none_or(|check| check.state.is_incomplete())
+            })
+            .count(),
     }
 }
 
@@ -543,6 +589,8 @@ enum CrawlEvent {
     SitemapUrl(SitemapUrl),
     SitemapPartial(String),
     SitemapDone,
+    LinkCheckStarted(usize),
+    LinkCheck(String, LinkCheckResult),
     /// The controlled browser process failed to start. This is setup, not a page/domain
     /// failure, so the Browser strip can offer Retry, Choose browser…, and Use HTML.
     BrowserSetupFailed(String),
@@ -647,6 +695,135 @@ fn probe_browser(path: Option<PathBuf>) -> mpsc::Receiver<BrowserChoice> {
     rx
 }
 
+struct ExtractionDraft {
+    id: String,
+    name: TextEdit,
+    selector: TextEdit,
+    attribute: TextEdit,
+    output: extract::ExtractionOutput,
+    mode: extract::MatchMode,
+}
+
+impl ExtractionDraft {
+    fn from_rule(rule: &ExtractionRule) -> Self {
+        Self {
+            id: rule.id.clone(),
+            name: TextEdit::new(&rule.name),
+            selector: TextEdit::new(&rule.selector),
+            attribute: TextEdit::new(&rule.attribute),
+            output: rule.output,
+            mode: rule.mode,
+        }
+    }
+
+    fn blank() -> Self {
+        Self {
+            id: new_extraction_id(),
+            name: TextEdit::new(""),
+            selector: TextEdit::new(""),
+            attribute: TextEdit::new(""),
+            output: extract::ExtractionOutput::Text,
+            mode: extract::MatchMode::First,
+        }
+    }
+
+    fn rule(&self) -> ExtractionRule {
+        ExtractionRule {
+            id: self.id.clone(),
+            name: self.name.text.trim().to_string(),
+            selector: self.selector.text.trim().to_string(),
+            output: self.output,
+            attribute: self.attribute.text.trim().to_string(),
+            mode: self.mode,
+        }
+    }
+}
+
+fn new_extraction_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("rule-{nanos}")
+}
+
+fn draft_rules(drafts: &[ExtractionDraft]) -> Vec<ExtractionRule> {
+    drafts.iter().map(ExtractionDraft::rule).collect()
+}
+
+#[derive(Debug)]
+enum ExtractionPreviewUi {
+    Idle,
+    Running,
+    Done {
+        url: String,
+        message: String,
+        outcomes: Vec<extract::ExtractionOutcome>,
+        /// Actual capture mode at preview time, frozen with the result.
+        mode: RenderMode,
+        /// Rule definitions at preview time, frozen with the result.
+        rules: Vec<ExtractionRule>,
+    },
+    Failed(String),
+}
+
+struct ExtractionPreviewJob {
+    rx: mpsc::Receiver<ExtractionPreviewResult>,
+    cancel: Arc<AtomicBool>,
+}
+
+struct ExtractionPreviewResult {
+    url: String,
+    message: String,
+    outcomes: Vec<extract::ExtractionOutcome>,
+    mode: RenderMode,
+    rules: Vec<ExtractionRule>,
+}
+
+struct InventorySnapshot {
+    pages: Vec<Page>,
+    audit: Audit,
+    indices: Vec<usize>,
+    run: inventory::InventoryRun,
+    link_checks: HashMap<String, LinkCheckResult>,
+    scope: InventoryScope,
+}
+
+struct InventoryPrepareJob {
+    scope: InventoryScope,
+    source_indices: Vec<usize>,
+    next: usize,
+    pages: Vec<Page>,
+    run: inventory::InventoryRun,
+    audit: Audit,
+    link_checks: HashMap<String, LinkCheckResult>,
+    epoch: u64,
+}
+
+struct InventoryExportJob {
+    rx: mpsc::Receiver<InventoryExportResult>,
+    cancel: Arc<AtomicBool>,
+}
+
+struct InventoryExportResult {
+    csv: String,
+    row_count: usize,
+    scope_text: String,
+}
+
+#[derive(Debug)]
+enum InventoryWriteOutcome {
+    Complete(String),
+    Cancelled,
+    Failed(String),
+}
+
+struct InventoryWriteJob {
+    rx: mpsc::Receiver<InventoryWriteOutcome>,
+    cancel: Arc<AtomicBool>,
+    temp_path: PathBuf,
+}
+
 struct State {
     url: TextEdit,
     rendering: RenderMode,
@@ -656,7 +833,18 @@ struct State {
     pages_limit: TextEdit,
     depth_limit: TextEdit,
     use_sitemaps: bool,
+    check_links: bool,
+    extraction_rules: Vec<ExtractionRule>,
+    extraction_drafts: Vec<ExtractionDraft>,
+    extraction_editor_open: bool,
+    extraction_errors: Vec<extract::RuleError>,
+    extraction_message: Option<String>,
+    extraction_open: bool,
+    extraction_preview_url: TextEdit,
+    extraction_preview: ExtractionPreviewUi,
+    extraction_preview_job: Option<ExtractionPreviewJob>,
     crawl_options_open: bool,
+    inventory_scope_open: bool,
     tab: Tab,
     /// One search/filter/sort/selection state per tab and per sitemap view.
     views: Vec<ViewState>,
@@ -687,6 +875,18 @@ struct State {
     overview: OverviewCounts,
     sitemap: SitemapReport,
     sitemap_view: SitemapView,
+    links_view: LinksView,
+    link_view: ViewState,
+    /// Rows into (page index, occurrence index), appended as pages arrive.
+    link_rows: Vec<(usize, usize)>,
+    link_row_keys: Vec<String>,
+    link_visible: Vec<usize>,
+    link_search_index: Vec<String>,
+    /// Optional destination results keyed by normalized URL. Page occurrences read this map.
+    link_checks: HashMap<String, LinkCheckResult>,
+    link_check_search: HashMap<String, String>,
+    link_check_total: usize,
+    link_check_done: usize,
     sitemap_visible: Vec<usize>,
     sitemap_file_visible: Vec<usize>,
     sitemap_discovering: bool,
@@ -701,6 +901,11 @@ struct State {
     crawl_started: Option<Instant>,
     crawl_elapsed: Option<Duration>,
     export_notice: Option<Result<String, String>>,
+    inventory_export_job: Option<InventoryExportJob>,
+    inventory_prepare: Option<InventoryPrepareJob>,
+    inventory_write: Option<InventoryWriteJob>,
+    pages_epoch: u64,
+    inventory_dialog_open: bool,
     /// A short notice from search, selection or clipboard actions.
     action_notice: Option<String>,
     max_pages: usize,
@@ -719,6 +924,11 @@ fn init() -> State {
     table.set_sort("indexability", SortDir::Ascending);
     let settings = update::Settings::load();
     let remembered = settings.browser_path.as_ref().map(PathBuf::from);
+    let (extraction_rules, extraction_message) = extract::load();
+    let extraction_drafts = extraction_rules
+        .iter()
+        .map(ExtractionDraft::from_rule)
+        .collect::<Vec<_>>();
     State {
         url: TextEdit::new("https://example.com/"),
         rendering: RenderMode::Html,
@@ -731,7 +941,18 @@ fn init() -> State {
         pages_limit: TextEdit::new(DEFAULT_MAX_PAGES.to_string()),
         depth_limit: TextEdit::new(MAX_DEPTH.to_string()),
         use_sitemaps: true,
+        check_links: false,
+        extraction_rules,
+        extraction_drafts,
+        extraction_editor_open: false,
+        extraction_errors: Vec::new(),
+        extraction_message,
+        extraction_open: false,
+        extraction_preview_url: TextEdit::new("https://example.com/"),
+        extraction_preview: ExtractionPreviewUi::Idle,
+        extraction_preview_job: None,
         crawl_options_open: false,
+        inventory_scope_open: false,
         tab: Tab::Overview,
         views: vec![
             ViewState::new("indexability"),
@@ -769,6 +990,16 @@ fn init() -> State {
         overview: OverviewCounts::default(),
         sitemap: SitemapReport::default(),
         sitemap_view: SitemapView::Urls,
+        links_view: LinksView::Pages,
+        link_view: ViewState::new("state"),
+        link_rows: Vec::new(),
+        link_row_keys: Vec::new(),
+        link_visible: Vec::new(),
+        link_search_index: Vec::new(),
+        link_checks: HashMap::new(),
+        link_check_search: HashMap::new(),
+        link_check_total: 0,
+        link_check_done: 0,
         sitemap_visible: Vec::new(),
         sitemap_file_visible: Vec::new(),
         sitemap_discovering: false,
@@ -781,6 +1012,11 @@ fn init() -> State {
         crawl_started: None,
         crawl_elapsed: None,
         export_notice: None,
+        inventory_export_job: None,
+        inventory_prepare: None,
+        inventory_write: None,
+        pages_epoch: 0,
+        inventory_dialog_open: false,
         action_notice: None,
         max_pages: DEFAULT_MAX_PAGES,
         job: None,
@@ -818,10 +1054,16 @@ fn view_slot(tab: Tab, sitemap_view: SitemapView) -> usize {
 
 impl State {
     fn view(&self) -> &ViewState {
+        if self.tab == Tab::Links && self.links_view == LinksView::Evidence {
+            return &self.link_view;
+        }
         &self.views[view_slot(self.tab, self.sitemap_view)]
     }
 
     fn view_mut(&mut self) -> &mut ViewState {
+        if self.tab == Tab::Links && self.links_view == LinksView::Evidence {
+            return &mut self.link_view;
+        }
         let slot = view_slot(self.tab, self.sitemap_view);
         &mut self.views[slot]
     }
@@ -837,13 +1079,170 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
     let browser_changed = poll_browser(state);
     let update_changed = poll_updates(state, tx);
     let crawl_changed = poll_crawl(state);
+    let preview_changed = poll_extraction_preview(state);
+    let inventory_changed = poll_inventory_prepare(state)
+        | poll_inventory_export(state, tx)
+        | poll_inventory_write(state);
+    if state.inventory_prepare.is_some() {
+        tx.wake_after(Duration::from_millis(1));
+    }
     if state.crawl_more {
         state.crawl_more = false;
         tx.wake_after(Duration::from_millis(1));
     } else if let Some(wait) = deferred_counts_wait(state) {
         tx.wake_after(wait);
     }
-    browser_changed || update_changed || crawl_changed
+    browser_changed || update_changed || crawl_changed || preview_changed || inventory_changed
+}
+
+fn poll_inventory_write(state: &mut State) -> bool {
+    let Some(job) = state.inventory_write.take() else {
+        return false;
+    };
+    match job.rx.try_recv() {
+        Ok(InventoryWriteOutcome::Complete(message)) => {
+            state.export_notice = Some(Ok(message));
+            true
+        }
+        Ok(InventoryWriteOutcome::Cancelled) => {
+            state.export_notice = Some(Ok(
+                "Inventory export cancelled; the destination was left unchanged.".into(),
+            ));
+            true
+        }
+        Ok(InventoryWriteOutcome::Failed(error)) => {
+            state.export_notice = Some(Err(error));
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            state.inventory_write = Some(job);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            state.export_notice = Some(Err(
+                "The inventory file writer stopped without a result.".into()
+            ));
+            true
+        }
+    }
+}
+
+fn poll_inventory_export(state: &mut State, tx: &mut Tx) -> bool {
+    let Some(job) = state.inventory_export_job.take() else {
+        return false;
+    };
+    match job.rx.try_recv() {
+        Ok(result) => {
+            save_prepared_csv(
+                state,
+                tx,
+                result.csv,
+                result.row_count,
+                result.scope_text,
+                "content-inventory",
+                true,
+            );
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            state.inventory_export_job = Some(job);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            state.export_notice = Some(Err(
+                "The inventory worker stopped without producing a CSV.".into(),
+            ));
+            true
+        }
+    }
+}
+
+fn poll_extraction_preview(state: &mut State) -> bool {
+    let Some(job) = &state.extraction_preview_job else {
+        return false;
+    };
+    match job.rx.try_recv() {
+        Ok(result) => {
+            state.extraction_preview = ExtractionPreviewUi::Done {
+                url: result.url,
+                message: result.message,
+                outcomes: result.outcomes,
+                mode: result.mode,
+                rules: result.rules,
+            };
+            state.extraction_preview_job = None;
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => false,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            state.extraction_preview =
+                ExtractionPreviewUi::Failed("The preview worker stopped without a result.".into());
+            state.extraction_preview_job = None;
+            true
+        }
+    }
+}
+
+fn start_extraction_preview(state: &mut State) {
+    if state.phase.active() || state.extraction_preview_job.is_some() {
+        return;
+    }
+    let rules = draft_rules(&state.extraction_drafts);
+    if let Err(errors) = extract::CompiledRules::compile(&rules) {
+        state.extraction_errors = errors;
+        state.extraction_preview =
+            ExtractionPreviewUi::Failed("Fix the rule errors before previewing.".into());
+        return;
+    }
+    let url = match crawl::normalize_seed(state.extraction_preview_url.text.trim()) {
+        Ok(url) => url,
+        Err(error) => {
+            state.extraction_preview = ExtractionPreviewUi::Failed(error);
+            return;
+        }
+    };
+    state.extraction_errors.clear();
+    state.extraction_preview = ExtractionPreviewUi::Running;
+    let rendering = state.rendering;
+    let browser_path = state.browser.path.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let waker = state.waker.clone();
+    let worker_cancel = cancel.clone();
+    state.extraction_preview_job = Some(ExtractionPreviewJob { rx, cancel });
+    std::thread::spawn(move || {
+        let result = crawl::crawl_site_with(
+            &url,
+            Limits {
+                max_pages: 1,
+                max_depth: 0,
+            },
+            crawl::CrawlOptions {
+                sitemaps: false,
+                rendering,
+                browser_path,
+                check_links: false,
+                extraction_rules: rules.clone(),
+            },
+            worker_cancel,
+            |_| {},
+        );
+        let outcomes = result
+            .pages
+            .first()
+            .map(|page| page.extraction.as_ref().clone())
+            .unwrap_or_default();
+        let _ = tx.send(ExtractionPreviewResult {
+            url,
+            message: result.message,
+            outcomes,
+            mode: rendering,
+            rules,
+        });
+        if let Some(wake) = &waker {
+            wake();
+        }
+    });
 }
 
 fn poll_browser(state: &mut State) -> bool {
@@ -983,7 +1382,11 @@ fn poll_crawl(state: &mut State) -> bool {
             Ok(CrawlEvent::Page(page)) => {
                 state.sitemap.observe_page(&page);
                 state.search_index.push(page_search_text(&page));
+                let page_check = page_link_result(&page);
+                let page_url = page.url.clone();
                 state.pages.push(*page);
+                record_link_check(state, page_url, page_check);
+                append_link_rows(state, state.pages.len() - 1);
                 changed = true;
                 sitemap_changed = true;
                 if state.phase == RunPhase::Preparing {
@@ -1006,6 +1409,31 @@ fn poll_crawl(state: &mut State) -> bool {
                 state.sitemap.discovery_done = true;
                 state.sitemap_discovering = false;
                 sitemap_changed = true;
+            }
+            Ok(CrawlEvent::LinkCheckStarted(total)) => {
+                state.link_check_total = total;
+                state.link_check_done = 0;
+                state.message = format!("Checking {total} link destinations…");
+                changed = true;
+            }
+            Ok(CrawlEvent::LinkCheck(key, result)) => {
+                state.link_check_done += 1;
+                state.link_check_search.insert(
+                    key.clone(),
+                    format!(
+                        "{} {} {}",
+                        result.state.label(),
+                        result.reason,
+                        result.status
+                    )
+                    .to_lowercase(),
+                );
+                state.link_checks.insert(key, result);
+                state.message = format!(
+                    "Checking links · {} of {} destinations…",
+                    state.link_check_done, state.link_check_total
+                );
+                changed = true;
             }
             Ok(CrawlEvent::BrowserSetupFailed(detail)) => {
                 apply_browser_setup_failure(state, detail);
@@ -1175,7 +1603,13 @@ fn skip_update(state: &mut State) {
 }
 
 fn can_install(state: &State) -> bool {
-    !state.phase.active() && matches!(state.update, UpdateUi::Ready(_))
+    !state.phase.active()
+        && state.extraction_preview_job.is_none()
+        && state.inventory_export_job.is_none()
+        && state.inventory_prepare.is_none()
+        && state.inventory_write.is_none()
+        && !state.inventory_dialog_open
+        && matches!(state.update, UpdateUi::Ready(_))
 }
 
 fn start_install(state: &mut State, tx: &mut Tx) {
@@ -1268,6 +1702,18 @@ fn start_crawl(state: &mut State) {
     if state.phase.active() {
         return;
     }
+    if state.extraction_preview_job.is_some() {
+        state.message = "Stop the extraction preview before starting a crawl.".into();
+        return;
+    }
+    if state.inventory_prepare.is_some()
+        || state.inventory_export_job.is_some()
+        || state.inventory_write.is_some()
+        || state.inventory_dialog_open
+    {
+        state.message = "Finish the inventory export before starting a crawl.".into();
+        return;
+    }
     let (seed, limits) = match validate_start(state) {
         Ok(plan) => plan,
         Err(errors) => {
@@ -1281,6 +1727,14 @@ fn start_crawl(state: &mut State) {
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_else(|| seed.clone());
+    let extraction_rules = draft_rules(&state.extraction_drafts);
+    if let Err(errors) = extract::CompiledRules::compile(&extraction_rules) {
+        state.extraction_errors = errors;
+        state.extraction_editor_open = true;
+        state.message = "Fix the custom extraction rule errors before crawling.".into();
+        return;
+    }
+    state.extraction_rules = extraction_rules;
     state.field_errors.clear();
     state.run_outcome = None;
     // A valid new crawl starts on Overview. Later streaming, completion and manual tab
@@ -1292,6 +1746,9 @@ fn start_crawl(state: &mut State) {
         limits,
         rendering: state.rendering,
         sitemaps: state.use_sitemaps,
+        check_links: state.check_links,
+        started_utc: inventory::utc_now(),
+        extraction_rules: state.extraction_rules.clone(),
     });
     state.max_pages = limits.max_pages;
     state.phase = RunPhase::Preparing;
@@ -1299,6 +1756,8 @@ fn start_crawl(state: &mut State) {
     state.crawl_elapsed = None;
     state.export_notice = None;
     state.action_notice = None;
+    state.inventory_scope_open = false;
+    state.pages_epoch = state.pages_epoch.wrapping_add(1);
     state.pages.clear();
     reset_inspector_dataset(state);
     state.search_index.clear();
@@ -1311,6 +1770,14 @@ fn start_crawl(state: &mut State) {
     state.view_counts = ViewCounts::default();
     state.overview = OverviewCounts::default();
     state.sitemap = SitemapReport::default();
+    state.link_checks.clear();
+    state.link_check_search.clear();
+    state.link_rows.clear();
+    state.link_row_keys.clear();
+    state.link_search_index.clear();
+    state.link_visible.clear();
+    state.link_check_total = 0;
+    state.link_check_done = 0;
     state.sitemap.discovery_done = !state.use_sitemaps;
     state.sitemap_discovering = state.use_sitemaps;
     state.sitemap_visible.clear();
@@ -1326,6 +1793,8 @@ fn start_crawl(state: &mut State) {
         sitemaps: state.use_sitemaps,
         rendering: state.rendering,
         browser_path: state.browser.path.clone(),
+        check_links: state.check_links,
+        extraction_rules: state.extraction_rules.clone(),
     };
     state.job = Some(CrawlJob {
         rx,
@@ -1342,6 +1811,8 @@ fn start_crawl(state: &mut State) {
                 crawl::CrawlEvent::SitemapUrl(url) => CrawlEvent::SitemapUrl(url),
                 crawl::CrawlEvent::SitemapPartial(reason) => CrawlEvent::SitemapPartial(reason),
                 crawl::CrawlEvent::SitemapDone => CrawlEvent::SitemapDone,
+                crawl::CrawlEvent::LinkCheckStarted(total) => CrawlEvent::LinkCheckStarted(total),
+                crawl::CrawlEvent::LinkCheck(key, result) => CrawlEvent::LinkCheck(key, result),
             };
             let _ = event_tx.send(event);
             if let Some(wake) = &wake {
@@ -1395,6 +1866,17 @@ fn app_close(state: &mut State, _tx: &mut Tx) {
 fn stop_owned_work(state: &mut State) {
     if let Some(job) = &state.job {
         job.cancel.store(true, Ordering::Relaxed);
+    }
+    if let Some(job) = &state.extraction_preview_job {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+    state.inventory_prepare = None;
+    if let Some(job) = &state.inventory_export_job {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+    if let Some(job) = &state.inventory_write {
+        job.cancel.store(true, Ordering::Relaxed);
+        let _ = std::fs::remove_file(&job.temp_path);
     }
 }
 
@@ -1532,6 +2014,10 @@ fn sitemap_file_has_finding(file: &SitemapFile) -> bool {
 }
 
 fn visible_id_ref(state: &State, row: usize) -> Option<&str> {
+    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        let row = *state.link_visible.get(row)?;
+        return state.link_row_keys.get(row).map(String::as_str);
+    }
     if state.tab == Tab::Sitemaps {
         return match state.sitemap_view {
             SitemapView::Urls => state
@@ -1561,6 +2047,26 @@ fn visible_id(state: &State, row: usize) -> Option<String> {
 /// selection was filtered out and clearing it when nothing is visible.
 fn sync_selection(state: &mut State) {
     if state.tab == Tab::Overview {
+        return;
+    }
+    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        let count = visible_len(state);
+        let chosen = state
+            .link_view
+            .selected
+            .clone()
+            .filter(|id| (0..count).any(|row| visible_id_ref(state, row) == Some(id.as_str())))
+            .or_else(|| visible_id(state, 0));
+        match chosen {
+            Some(id) => {
+                state.link_view.selected = Some(id.clone());
+                state.table.select(id);
+            }
+            None => {
+                state.link_view.selected = None;
+                state.table.clear_selection();
+            }
+        }
         return;
     }
     let count = visible_len(state);
@@ -1605,6 +2111,10 @@ fn refresh_visible_forced(state: &mut State) {
 }
 
 fn refresh_visible_inner(state: &mut State, force: bool) {
+    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        refresh_link_visible_inner(state, force);
+        return;
+    }
     if state.tab == Tab::Overview {
         // Overview is a summary, not a URL table. The dedicated tables keep their own filters,
         // searches and selections until a person explicitly opens one.
@@ -1652,6 +2162,91 @@ fn refresh_visible_inner(state: &mut State, force: bool) {
         apply_page_sort(state, force);
     }
     sync_selection(state);
+}
+
+fn refresh_link_visible_inner(state: &mut State, force: bool) {
+    let filter = state.view().filter;
+    let needle = normalized_query(&state.view().query.text);
+    let mut findings = 0;
+    let mut incomplete = 0;
+    let mut matching = Vec::new();
+    for row in 0..state.link_rows.len() {
+        let Some(occurrence) = link_occurrence_by_row(state, row) else {
+            continue;
+        };
+        let is_finding = link_is_finding(state, occurrence);
+        let is_incomplete = link_is_incomplete(state, occurrence);
+        findings += usize::from(is_finding);
+        incomplete += usize::from(is_incomplete);
+        let keep = match filter {
+            CheckFilter::All => true,
+            CheckFilter::Findings => is_finding,
+            CheckFilter::Incomplete => is_incomplete,
+        };
+        if !keep {
+            continue;
+        }
+        if !needle.is_empty() {
+            let check_text = state
+                .link_check_search
+                .get(&occurrence.key)
+                .map(String::as_str)
+                .unwrap_or("");
+            if !state.link_search_index[row].contains(&needle) && !check_text.contains(&needle) {
+                continue;
+            }
+        }
+        matching.push(row);
+    }
+    state.view_counts = ViewCounts {
+        total: state.link_rows.len(),
+        findings,
+        incomplete,
+    };
+    if !force && state.phase.active() {
+        state.link_visible = merge_streaming_order(&state.link_visible, &matching);
+    } else {
+        state.link_visible = matching;
+        sort_link_evidence(state);
+    }
+    sync_selection(state);
+}
+
+fn compare_link(state: &State, left: usize, right: usize, column: &str) -> std::cmp::Ordering {
+    let (Some(left), Some(right)) = (
+        link_occurrence_by_row(state, left),
+        link_occurrence_by_row(state, right),
+    ) else {
+        return std::cmp::Ordering::Equal;
+    };
+    match column {
+        "destination" => left.resolved.cmp(&right.resolved),
+        "anchor" => left.anchor.cmp(&right.anchor),
+        "state" => link_state_label(state, left).cmp(link_state_label(state, right)),
+        "status" => link_status(state, left).cmp(&link_status(state, right)),
+        _ => left
+            .source
+            .cmp(&right.source)
+            .then_with(|| left.order.cmp(&right.order)),
+    }
+}
+
+fn sort_link_evidence(state: &mut State) {
+    if !state.phase.active() || state.view().sort.0 == "source" {
+        let (column, dir) = state.view().sort.clone();
+        let visible = std::mem::take(&mut state.link_visible);
+        state.link_visible = {
+            let mut visible = visible;
+            visible.sort_by(|left, right| dir.apply(compare_link(state, *left, *right, &column)));
+            visible
+        };
+    }
+}
+
+fn set_link_sort(state: &mut State, column: &str, dir: SortDir) {
+    state.link_view.sort = (column.to_string(), dir);
+    state.table.set_sort(column, dir);
+    refresh_visible_forced(state);
 }
 
 fn merge_streaming_order(previous: &[usize], matching: &[usize]) -> Vec<usize> {
@@ -1860,7 +2455,12 @@ fn refresh_counts(state: &mut State, force: bool) -> bool {
         return false;
     }
     state.counts = counts_with(&state.pages, &state.audit);
-    state.overview = overview_counts(&state.pages, &state.counts, &state.sitemap);
+    state.overview = overview_counts(
+        &state.pages,
+        &state.counts,
+        &state.sitemap,
+        &state.link_checks,
+    );
     state.counts_at = Some(Instant::now());
     state.counts_dirty = false;
     state.counts_deferred = false;
@@ -1880,6 +2480,7 @@ fn deferred_counts_wait(state: &State) -> Option<Duration> {
 }
 
 fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
+    state.pages_epoch = state.pages_epoch.wrapping_add(1);
     let seed = pages
         .first()
         .map(|page| page.url.clone())
@@ -1897,12 +2498,24 @@ fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
         },
         rendering: state.rendering,
         sitemaps: state.use_sitemaps,
+        check_links: state.check_links,
+        started_utc: inventory::utc_now(),
+        extraction_rules: state.extraction_rules.clone(),
     });
     state.run_outcome = Some(message.clone());
     state.pages = pages;
     reset_inspector_dataset(state);
     state.search_index = state.pages.iter().map(page_search_text).collect();
     state.audit = Audit::from_pages(&state.pages);
+    let page_checks = state
+        .pages
+        .iter()
+        .map(|page| (page.url.clone(), page_link_result(page)))
+        .collect::<Vec<_>>();
+    for (key, result) in page_checks {
+        record_link_check(state, key, result);
+    }
+    rebuild_link_rows(state);
     state.message = message;
     state.counts_dirty = true;
     let _ = refresh_counts(state, true);
@@ -1970,7 +2583,9 @@ fn set_sitemap_sort(state: &mut State, column: &str, dir: SortDir) {
 }
 
 fn sort_pages(state: &mut State) {
-    if matches!(state.tab, Tab::Overview | Tab::Sitemaps) {
+    if matches!(state.tab, Tab::Overview | Tab::Sitemaps)
+        || (state.tab == Tab::Links && state.links_view == LinksView::Evidence)
+    {
         sort_sitemap(state);
         return;
     }
@@ -2052,7 +2667,27 @@ fn visible_index(state: &State, row: usize) -> usize {
     state.visible.get(row).copied().unwrap_or(0)
 }
 
+fn link_row_index(state: &State, row: usize) -> Option<usize> {
+    state.link_visible.get(row).copied()
+}
+
+fn link_occurrence_by_row(state: &State, row: usize) -> Option<&LinkOccurrence> {
+    let (page_index, occurrence_index) = *state.link_rows.get(row)?;
+    state
+        .pages
+        .get(page_index)?
+        .link_evidence
+        .get(occurrence_index)
+}
+
+fn link_occurrence_at(state: &State, row: usize) -> Option<&LinkOccurrence> {
+    link_occurrence_by_row(state, link_row_index(state, row)?)
+}
+
 fn visible_len(state: &State) -> usize {
+    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        return state.link_visible.len();
+    }
     if state.tab == Tab::Sitemaps {
         return match state.sitemap_view {
             SitemapView::Urls => state.sitemap_visible.len(),
@@ -2060,6 +2695,130 @@ fn visible_len(state: &State) -> usize {
         };
     }
     state.visible.len()
+}
+
+fn effective_link_check<'a>(
+    state: &'a State,
+    occurrence: &'a LinkOccurrence,
+) -> Option<&'a LinkCheckResult> {
+    state
+        .link_checks
+        .get(&occurrence.key)
+        .or(occurrence.check.as_deref())
+}
+
+fn link_is_finding(state: &State, occurrence: &LinkOccurrence) -> bool {
+    effective_link_check(state, occurrence).is_some_and(LinkCheckResult::is_finding)
+}
+
+fn link_is_incomplete(state: &State, occurrence: &LinkOccurrence) -> bool {
+    effective_link_check(state, occurrence).is_none_or(|check| check.state.is_incomplete())
+}
+
+fn link_state_label<'a>(state: &'a State, occurrence: &'a LinkOccurrence) -> &'a str {
+    effective_link_check(state, occurrence)
+        .map(|check| check.state.label())
+        .unwrap_or("Not checked")
+}
+
+fn link_state_reason<'a>(state: &'a State, occurrence: &'a LinkOccurrence) -> &'a str {
+    effective_link_check(state, occurrence)
+        .map(|check| check.reason.as_str())
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or(occurrence.skip_reason.as_str())
+}
+
+fn link_status(state: &State, occurrence: &LinkOccurrence) -> Option<u16> {
+    effective_link_check(state, occurrence)
+        .and_then(|check| (check.status != 0).then_some(check.status))
+}
+
+fn link_final_url<'a>(state: &'a State, occurrence: &'a LinkOccurrence) -> &'a str {
+    effective_link_check(state, occurrence)
+        .map(|check| check.final_url.as_str())
+        .filter(|url| !url.is_empty())
+        .unwrap_or(occurrence.resolved.as_str())
+}
+
+fn link_chain<'a>(state: &'a State, occurrence: &'a LinkOccurrence) -> &'a [String] {
+    effective_link_check(state, occurrence)
+        .map(|check| check.redirect_chain.as_slice())
+        .unwrap_or(&[])
+}
+
+fn link_search_text(occurrence: &LinkOccurrence) -> String {
+    format!(
+        "{} {} {} {} {} {} {}",
+        occurrence.source,
+        occurrence.raw_href,
+        occurrence.resolved,
+        occurrence.anchor,
+        occurrence.fragment,
+        occurrence.stage.label(),
+        occurrence.skip_reason
+    )
+    .to_lowercase()
+}
+
+fn page_link_result(page: &Page) -> LinkCheckResult {
+    if page.status == 0 {
+        LinkCheckResult::unavailable(if page.error.is_empty() {
+            "Page crawl could not fetch this URL".to_string()
+        } else {
+            page.error.clone()
+        })
+    } else {
+        LinkCheckResult::checked(page.status, page.url.clone(), Vec::new())
+    }
+}
+
+fn record_link_check(state: &mut State, key: String, result: LinkCheckResult) {
+    state.link_check_search.insert(
+        key.clone(),
+        format!(
+            "{} {} {}",
+            result.state.label(),
+            result.reason,
+            result.status
+        )
+        .to_lowercase(),
+    );
+    state.link_checks.insert(key, result);
+}
+
+fn rebuild_link_rows(state: &mut State) {
+    state.link_rows.clear();
+    state.link_row_keys.clear();
+    state.link_search_index.clear();
+    for (page_index, page) in state.pages.iter().enumerate() {
+        for occurrence_index in 0..page.link_evidence.len() {
+            let occurrence = &page.link_evidence[occurrence_index];
+            state.link_rows.push((page_index, occurrence_index));
+            state.link_row_keys.push(occurrence.row_key());
+            state.link_search_index.push(link_search_text(occurrence));
+        }
+    }
+    state.link_visible.clear();
+}
+
+fn append_link_rows(state: &mut State, page_index: usize) {
+    let Some(page) = state.pages.get(page_index) else {
+        return;
+    };
+    for occurrence_index in 0..page.link_evidence.len() {
+        let occurrence = &page.link_evidence[occurrence_index];
+        state.link_rows.push((page_index, occurrence_index));
+        state.link_row_keys.push(occurrence.row_key());
+        state.link_search_index.push(link_search_text(occurrence));
+    }
+}
+
+fn selected_link(state: &State) -> Option<&LinkOccurrence> {
+    let id = state.link_view.selected.as_deref()?;
+    state.link_rows.iter().find_map(|(page, occurrence)| {
+        let found = state.pages.get(*page)?.link_evidence.get(*occurrence)?;
+        (found.row_key() == id).then_some(found)
+    })
 }
 
 fn issue_for(tab: Tab, page: &Page, audit: &Audit) -> String {
@@ -2174,6 +2933,7 @@ fn tab_title(tab: Tab) -> &'static str {
 
 fn active_title(state: &State) -> &'static str {
     match (state.tab, state.sitemap_view) {
+        (Tab::Links, _) if state.links_view == LinksView::Evidence => "Link evidence",
         (Tab::Sitemaps, SitemapView::Urls) => "Sitemap URLs",
         (Tab::Sitemaps, SitemapView::Files) => "Sitemap files",
         _ => tab_title(state.tab),
@@ -2199,6 +2959,9 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     if state.crawl_options_open {
         app = app.child(crawl_options_note(&k, state));
     }
+    if state.extraction_editor_open {
+        app = app.child(extraction_editor_panel(&k, state));
+    }
     if state.rendering == RenderMode::Browser {
         app = app.child(browser_strip(&k, state));
     }
@@ -2207,9 +2970,15 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     }
     if state.tab == Tab::Overview {
         app = app.child(overview_view(&k, state));
+        if state.inventory_scope_open {
+            app = app.child(inventory_scope_bar(&k, state));
+        }
     } else {
         if !state.pages.is_empty() || state.tab == Tab::Sitemaps {
             app = app.child(section_header(&k, state));
+        }
+        if state.inventory_scope_open {
+            app = app.child(inventory_scope_bar(&k, state));
         }
         if state.run_details_open {
             app = app.child(run_details_panel(&k, state));
@@ -2273,7 +3042,9 @@ fn focus_search_state(state: &mut State) -> bool {
         state.table.set_sort(column, dir);
         refresh_visible_forced(state);
     }
-    let has_data = if state.tab == Tab::Sitemaps {
+    let has_data = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        !state.link_rows.is_empty()
+    } else if state.tab == Tab::Sitemaps {
         match state.sitemap_view {
             SitemapView::Urls => !state.sitemap.urls.is_empty(),
             SitemapView::Files => !state.sitemap.files.is_empty(),
@@ -2304,12 +3075,24 @@ fn run_details_panel(k: &Kit, state: &State) -> El {
     if let Some(run) = &state.run {
         lines.push(format!("Seed {}", run.seed));
         lines.push(format!(
-            "{} pages · depth {} · {} · Sitemaps {}",
+            "{} pages · depth {} · {} · Sitemaps {} · Link checks {}",
             run.limits.max_pages,
             run.limits.max_depth,
             run.rendering.label(),
-            if run.sitemaps { "on" } else { "off" }
+            if run.sitemaps { "on" } else { "off" },
+            if run.check_links { "on" } else { "off" }
         ));
+        if !run.extraction_rules.is_empty() {
+            lines.push(format!(
+                "Custom extraction: {} rules · {}",
+                run.extraction_rules.len(),
+                run.extraction_rules
+                    .iter()
+                    .map(|rule| rule.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     } else {
         lines.push("No run details yet.".into());
     }
@@ -2332,6 +3115,12 @@ fn run_details_panel(k: &Kit, state: &State) -> El {
         }
     ));
     lines.push(sitemap_coverage_line(state));
+    if state.link_check_total > 0 {
+        lines.push(format!(
+            "Link checks {} of {} destinations",
+            state.link_check_done, state.link_check_total
+        ));
+    }
     col()
         .key("run-details-panel")
         .w_full()
@@ -2948,6 +3737,395 @@ fn crawl_option_note_text(on: bool) -> &'static str {
     }
 }
 
+fn preview_matches_current_drafts(
+    state: &State,
+    mode: RenderMode,
+    rules: &[ExtractionRule],
+) -> bool {
+    mode == state.rendering && rules == draft_rules(&state.extraction_drafts)
+}
+
+fn extraction_editor_panel(k: &Kit, state: &State) -> El {
+    let mut rows = col().w_full().gap(8.0);
+    for (index, draft) in state.extraction_drafts.iter().enumerate() {
+        let mut row = col()
+            .w_full()
+            .gap(4.0)
+            .pb(6.0)
+            .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+            .child(
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .center_y()
+                    .child(
+                        rune_kit::TextInput::new(&draft.name)
+                            .plain()
+                            .height(26.0)
+                            .width(Some(150.0))
+                            .text_style(TextStyle::new(11.5, 400.0).lh(16.0))
+                            .placeholder("Rule name")
+                            .label("Rule name")
+                            .on_edit(move |state: &mut State| {
+                                &mut state.extraction_drafts[index].name
+                            })
+                            .on_change(|state: &mut State, _| state.extraction_errors.clear())
+                            .build(k)
+                            .key(format!("extract-name-{index}")),
+                    )
+                    .child(
+                        rune_kit::TextInput::new(&draft.selector)
+                            .plain()
+                            .height(26.0)
+                            .text_style(TextStyle::new(11.5, 400.0).lh(16.0))
+                            .placeholder("CSS selector")
+                            .label("CSS selector")
+                            .on_edit(move |state: &mut State| {
+                                &mut state.extraction_drafts[index].selector
+                            })
+                            .on_change(|state: &mut State, _| state.extraction_errors.clear())
+                            .build(k)
+                            .grow(1.0)
+                            .min_w(120.0)
+                            .key(format!("extract-selector-{index}")),
+                    )
+                    .child(
+                        SegmentedControl::new(
+                            &["Text", "Attribute"],
+                            Some(if draft.output == extract::ExtractionOutput::Text {
+                                0
+                            } else {
+                                1
+                            }),
+                        )
+                        .label("Extraction output")
+                        .fit()
+                        .on_pick(move |state: &mut State, picked, _tx| {
+                            state.extraction_drafts[index].output = if picked == 0 {
+                                extract::ExtractionOutput::Text
+                            } else {
+                                extract::ExtractionOutput::Attribute
+                            };
+                        })
+                        .build(k)
+                        .key(format!("extract-output-{index}")),
+                    )
+                    .child(
+                        SegmentedControl::new(
+                            &["First", "All"],
+                            Some(if draft.mode == extract::MatchMode::First {
+                                0
+                            } else {
+                                1
+                            }),
+                        )
+                        .label("Match mode")
+                        .fit()
+                        .on_pick(move |state: &mut State, picked, _tx| {
+                            state.extraction_drafts[index].mode = if picked == 0 {
+                                extract::MatchMode::First
+                            } else {
+                                extract::MatchMode::All
+                            };
+                        })
+                        .build(k)
+                        .key(format!("extract-mode-{index}")),
+                    )
+                    .child(
+                        IconButton::new(k.glyph.close)
+                            .variant(IconButtonVariant::GhostMuted)
+                            .label("Remove rule")
+                            .on_press(move |state: &mut State| {
+                                if index < state.extraction_drafts.len() {
+                                    state.extraction_drafts.remove(index);
+                                    state.extraction_errors.clear();
+                                }
+                            })
+                            .build(k)
+                            .key(format!("extract-remove-{index}")),
+                    ),
+            );
+        if state.extraction_drafts.len() > 1 {
+            row = row.child(
+                col()
+                    .gap(2.0)
+                    .child(
+                        Button::new("Move up")
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Mini)
+                            .disabled(index == 0)
+                            .on_press(move |state: &mut State| {
+                                if index > 0 && index < state.extraction_drafts.len() {
+                                    state.extraction_drafts.swap(index - 1, index);
+                                }
+                            })
+                            .build(k)
+                            .key(format!("extract-up-{index}")),
+                    )
+                    .child(
+                        Button::new("Move down")
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Mini)
+                            .disabled(index + 1 >= state.extraction_drafts.len())
+                            .on_press(move |state: &mut State| {
+                                if index + 1 < state.extraction_drafts.len() {
+                                    state.extraction_drafts.swap(index, index + 1);
+                                }
+                            })
+                            .build(k)
+                            .key(format!("extract-down-{index}")),
+                    ),
+            );
+        }
+        if draft.output == extract::ExtractionOutput::Attribute {
+            row = row.child(
+                rune_kit::TextInput::new(&draft.attribute)
+                    .plain()
+                    .height(26.0)
+                    .width(Some(160.0))
+                    .text_style(TextStyle::new(11.5, 400.0).lh(16.0))
+                    .placeholder("Attribute name")
+                    .label("Attribute name")
+                    .on_edit(move |state: &mut State| &mut state.extraction_drafts[index].attribute)
+                    .on_change(|state: &mut State, _| state.extraction_errors.clear())
+                    .build(k)
+                    .key(format!("extract-attribute-{index}")),
+            );
+        }
+        for error in state
+            .extraction_errors
+            .iter()
+            .filter(|error| error.index == index)
+        {
+            row = row.child(
+                text(format!("{}: {}", error.field, error.message))
+                    .font(k.ty.text_xsmall)
+                    .color(k.c.danger.fg)
+                    .wrap()
+                    .w_full(),
+            );
+        }
+        rows = rows.child(row);
+    }
+    let mut preview = col().w_full().gap(4.0);
+    preview = preview.child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .center_y()
+            .child(
+                rune_kit::TextInput::new(&state.extraction_preview_url)
+                    .plain()
+                    .height(26.0)
+                    .text_style(TextStyle::new(11.5, 400.0).lh(16.0))
+                    .placeholder("https://example.com/page")
+                    .label("Preview URL")
+                    .on_edit(|state: &mut State| &mut state.extraction_preview_url)
+                    .build(k)
+                    .grow(1.0)
+                    .min_w(160.0)
+                    .key("extract-preview-url"),
+            )
+            .child(
+                Button::new(if state.extraction_preview_job.is_some() {
+                    "Stop preview"
+                } else {
+                    "Test on URL"
+                })
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .disabled(
+                    state.phase.active()
+                        || (state.extraction_preview_job.is_none()
+                            && state.extraction_drafts.is_empty()),
+                )
+                .on_press_tx(|state: &mut State, _tx: &mut Tx| {
+                    if let Some(job) = &state.extraction_preview_job {
+                        job.cancel.store(true, Ordering::Relaxed);
+                    } else {
+                        start_extraction_preview(state);
+                    }
+                })
+                .build(k)
+                .key("extract-preview"),
+            ),
+    );
+    match &state.extraction_preview {
+        ExtractionPreviewUi::Idle => {}
+        ExtractionPreviewUi::Running => {
+            preview = preview.child(
+                text("Capturing one page with the current mode and rules…")
+                    .font(k.ty.text_xsmall)
+                    .color(k.c.text_muted),
+            );
+        }
+        ExtractionPreviewUi::Failed(error) => {
+            preview = preview.child(
+                text(error.clone())
+                    .font(k.ty.text_xsmall)
+                    .color(k.c.danger.fg)
+                    .wrap()
+                    .w_full()
+                    .key("extract-preview-error"),
+            );
+        }
+        ExtractionPreviewUi::Done {
+            url,
+            message,
+            outcomes,
+            mode,
+            rules,
+        } => {
+            preview = preview.child(
+                text(format!("{url} · {message} · {}", mode.label()))
+                    .font(k.ty.text_xsmall)
+                    .color(k.c.text_muted)
+                    .wrap()
+                    .w_full()
+                    .key("extract-preview-status"),
+            );
+            if !preview_matches_current_drafts(state, *mode, rules) {
+                preview = preview.child(
+                    text("Current mode or drafts differ from this capture. Test again to refresh; these values keep their captured definitions.")
+                        .font(k.ty.text_xsmall)
+                        .color(k.c.warning.fg)
+                        .wrap()
+                        .w_full()
+                        .key("extract-preview-stale"),
+                );
+            }
+            for outcome in outcomes.iter() {
+                let name = rules
+                    .iter()
+                    .find(|rule| rule.id == outcome.rule_id)
+                    .map(|rule| rule.name.clone())
+                    .unwrap_or_else(|| outcome.rule_id.clone());
+                preview = preview.child(
+                    text(format!(
+                        "{} · {} · {}",
+                        name,
+                        outcome.state.label(),
+                        if outcome.values.is_empty() {
+                            outcome.reason.clone()
+                        } else {
+                            outcome.values.join(" · ")
+                        }
+                    ))
+                    .font(k.ty.text_xsmall)
+                    .color(if outcome.state == extract::ExtractionState::Matched {
+                        k.c.text_muted
+                    } else {
+                        k.c.warning.fg
+                    })
+                    .wrap()
+                    .w_full(),
+                );
+            }
+        }
+    }
+    let mut header_actions = row().gap(6.0).center_y();
+    header_actions = header_actions.child(
+        Button::new("Add rule")
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .disabled(state.extraction_drafts.len() >= extract::MAX_RULES)
+            .on_press(|state: &mut State| {
+                state.extraction_drafts.push(ExtractionDraft::blank());
+                state.extraction_errors.clear();
+            })
+            .build(k)
+            .key("extract-add"),
+    );
+    header_actions = header_actions
+        .child(
+            Button::new("Save")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press(save_extraction_drafts)
+                .build(k)
+                .key("extract-save"),
+        )
+        .child(
+            Button::new("Close")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(|state: &mut State| {
+                    save_extraction_drafts(state);
+                    if state.extraction_errors.is_empty() {
+                        state.extraction_editor_open = false;
+                    }
+                })
+                .build(k)
+                .key("extract-close"),
+        );
+    let mut panel = col()
+        .w_full()
+        .gap(6.0)
+        .px(GUTTER)
+        .pb(8.0)
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .gap(8.0)
+                .child(micro(k, "Custom extraction"))
+                .child(
+                    text(format!(
+                        "{} of {} rules",
+                        state.extraction_drafts.len(),
+                        extract::MAX_RULES
+                    ))
+                    .font(k.ty.text_xsmall)
+                    .color(k.c.text_muted),
+                )
+                .child(el().grow(1.0))
+                .child(header_actions),
+        )
+        .child(
+            text("Text or literal attribute values from the selected HTML/DOM snapshot. Rules are not SEO findings by default.")
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        );
+    if let Some(message) = &state.extraction_message {
+        panel = panel.child(
+            text(message.clone())
+                .font(k.ty.text_xsmall)
+                .color(k.c.warning.fg)
+                .wrap()
+                .w_full(),
+        );
+    }
+    panel
+        .child(
+            col()
+                .w_full()
+                .max_h(300.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .gap(6.0)
+                .child(rows),
+        )
+        .child(preview)
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+}
+
+fn save_extraction_drafts(state: &mut State) {
+    let rules = draft_rules(&state.extraction_drafts);
+    match extract::CompiledRules::compile(&rules) {
+        Ok(_) => {
+            state.extraction_errors.clear();
+            state.extraction_rules = rules;
+            state.extraction_message = extract::save(&state.extraction_rules).err().map(|error| {
+                format!("Rules are active for this session but could not be saved: {error}")
+            });
+        }
+        Err(errors) => state.extraction_errors = errors,
+    }
+}
+
 fn crawl_options_note(k: &Kit, state: &State) -> El {
     let detail = if state.use_sitemaps {
         "Listed URLs enter at depth 0 and robots.txt still applies. This does not create or submit a sitemap."
@@ -2973,6 +4151,56 @@ fn crawl_options_note(k: &Kit, state: &State) -> El {
                 .color(k.c.text_muted)
                 .wrap()
                 .w_full(),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    Checkbox::new(state.check_links)
+                        .label("Check external links and documents")
+                        .disabled(state.phase.active())
+                        .on_toggle(|state: &mut State| state.check_links ^= true)
+                        .build(k)
+                        .key("check-links"),
+                )
+                .child(
+                    text("Optional bounded status checks after the page crawl. Document contents are not downloaded or audited.")
+                        .font(k.ty.text_xsmall)
+                        .color(k.c.text_muted)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                ),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    Button::new("Custom extraction…")
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Small)
+                        .disabled(state.phase.active())
+                        .on_press(|state: &mut State| {
+                            state.extraction_editor_open = true;
+                            state.crawl_options_open = false;
+                            state.extraction_errors.clear();
+                        })
+                        .build(k)
+                        .key("open-extraction"),
+                )
+                .child(
+                    text(format!(
+                        "{} of {} rules",
+                        state.extraction_drafts.len(),
+                        extract::MAX_RULES
+                    ))
+                    .font(k.ty.text_xsmall)
+                    .color(k.c.text_muted),
+                ),
         )
 }
 
@@ -3432,6 +4660,65 @@ fn overview_coverage(k: &Kit, state: &State) -> El {
             },
         ));
     }
+    if state.link_check_total > 0 {
+        gaps += 1;
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-link-checks",
+            format!(
+                "{} of {} optional link {} checked",
+                state.link_check_done,
+                state.link_check_total,
+                if state.link_check_total == 1 {
+                    "destination"
+                } else {
+                    "destinations"
+                }
+            ),
+            "Optional external and document checks. This is separate from the page crawl.",
+            |state: &mut State| {
+                state.links_view = LinksView::Evidence;
+                open_overview_target(state, Tab::Links, CheckFilter::All);
+            },
+        ));
+    }
+    if state.run.as_ref().is_some_and(|run| run.check_links) && counts.link_findings > 0 {
+        gaps += 1;
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-link-findings",
+            format!("{} link {} need review", counts.link_findings, if counts.link_findings == 1 { "occurrence" } else { "occurrences" }),
+            "Observed anchors whose destination returned a finding. Occurrence counts are not unique destinations.",
+            |state: &mut State| {
+                state.links_view = LinksView::Evidence;
+                open_overview_target(state, Tab::Links, CheckFilter::Findings);
+            },
+        ));
+    }
+    if state.run.as_ref().is_some_and(|run| run.check_links)
+        && counts.link_incomplete > 0
+        && !state.phase.active()
+    {
+        gaps += 1;
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-link-incomplete",
+            format!(
+                "{} link {} incomplete",
+                counts.link_incomplete,
+                if counts.link_incomplete == 1 {
+                    "occurrence is"
+                } else {
+                    "occurrences are"
+                }
+            ),
+            "Occurrences without a completed optional check. They are not confirmed broken links.",
+            |state: &mut State| {
+                state.links_view = LinksView::Evidence;
+                open_overview_target(state, Tab::Links, CheckFilter::Incomplete);
+            },
+        ));
+    }
     if let Some(partial) = &state.sitemap.partial {
         gaps += 1;
         rows = rows.child(
@@ -3556,6 +4843,21 @@ fn overview_actions(k: &Kit, state: &State) -> El {
                 .build(k)
                 .key("overview-export-csv"),
         )
+        .child(
+            Button::new("Export inventory…")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Regular)
+                .disabled(
+                    !has_pages
+                        || state.inventory_export_job.is_some()
+                        || state.inventory_prepare.is_some()
+                        || state.inventory_write.is_some(),
+                )
+                .help("Choose all captured URLs or the visible Internal URL set")
+                .on_press(|state: &mut State| state.inventory_scope_open = true)
+                .build(k)
+                .key("overview-export-inventory"),
+        )
         .child(el().grow(1.0));
     if has_pages {
         row = row.child(
@@ -3582,6 +4884,329 @@ fn open_overview_target(state: &mut State, tab: Tab, filter: CheckFilter) {
     let (column, dir) = state.view().sort.clone();
     state.table.set_sort(column, dir);
     refresh_visible_forced(state);
+}
+
+fn inventory_scope_bar(k: &Kit, state: &State) -> El {
+    let scope = |label: &'static str, scope: InventoryScope, key: &'static str| {
+        Button::new(label)
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .disabled(
+                state.inventory_export_job.is_some()
+                    || state.inventory_prepare.is_some()
+                    || state.inventory_write.is_some()
+                    || state.inventory_dialog_open,
+            )
+            .on_press_tx(move |state: &mut State, tx: &mut Tx| {
+                state.inventory_scope_open = false;
+                export_inventory_csv(state, tx, scope);
+            })
+            .build(k)
+            .key(key)
+    };
+    row()
+        .w_full()
+        .px(GUTTER)
+        .pb(6.0)
+        .gap(8.0)
+        .center_y()
+        .child(micro(k, "Inventory scope"))
+        .child(scope(
+            "All captured URLs",
+            InventoryScope::All,
+            "inventory-all",
+        ))
+        .child(scope(
+            "Visible Internal URLs",
+            InventoryScope::VisibleInternal,
+            "inventory-visible",
+        ))
+        .child(
+            Button::new("Cancel")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(|state: &mut State| state.inventory_scope_open = false)
+                .build(k)
+                .key("inventory-cancel"),
+        )
+        .child(el().grow(1.0))
+        .child(
+            text(if state.tab == Tab::Internal {
+                "Visible uses this table's saved search, filter and sort."
+            } else {
+                "Visible uses the Internal table's saved search, filter and sort."
+            })
+            .font(k.ty.text_xsmall)
+            .color(k.c.text_muted),
+        )
+}
+
+fn internal_inventory_indices(state: &State) -> Vec<usize> {
+    let view = &state.views[view_slot(Tab::Internal, SitemapView::Urls)];
+    let needle = normalized_query(&view.query.text);
+    let mut indices = Vec::new();
+    for (index, page) in state.pages.iter().enumerate() {
+        let is_incomplete = page_incomplete(page);
+        let is_finding = page_has_finding(Tab::Internal, page, &state.audit);
+        let keep = match view.filter {
+            CheckFilter::All => true,
+            CheckFilter::Findings => is_finding,
+            CheckFilter::Incomplete => is_incomplete,
+        };
+        if !keep {
+            continue;
+        }
+        if !needle.is_empty() && !page_matches_query(state, index, Tab::Internal, &needle) {
+            continue;
+        }
+        indices.push(index);
+    }
+    let (column, dir) = view.sort.clone();
+    indices.sort_by(|left, right| {
+        dir.apply(compare(
+            &state.pages[*left],
+            &state.pages[*right],
+            Tab::Internal,
+            &column,
+            &state.audit,
+        ))
+    });
+    indices
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn inventory_indices(state: &State, scope: InventoryScope) -> Vec<usize> {
+    match scope {
+        InventoryScope::VisibleInternal => internal_inventory_indices(state),
+        InventoryScope::All => {
+            let mut indices = (0..state.pages.len()).collect::<Vec<_>>();
+            indices.sort_by(|left, right| state.pages[*left].url.cmp(&state.pages[*right].url));
+            indices
+        }
+    }
+}
+
+fn inventory_run(state: &State) -> inventory::InventoryRun {
+    let run = state.run.as_ref();
+    inventory::InventoryRun {
+        seed: run.map(|run| run.seed.clone()).unwrap_or_default(),
+        started_utc: run.map(|run| run.started_utc.clone()).unwrap_or_default(),
+        page_limit: run.map(|run| run.limits.max_pages).unwrap_or(0),
+        depth_limit: run.map(|run| run.limits.max_depth).unwrap_or(0),
+        sitemaps: run.is_some_and(|run| run.sitemaps),
+        check_links: run.is_some_and(|run| run.check_links),
+        outcome: run_report_reason(state),
+        captured_urls: state.pages.len(),
+        incomplete: state.overview.incomplete,
+        sitemap_incomplete: state.overview.sitemap_incomplete,
+        sitemap_file_findings: state.overview.sitemap_file_findings,
+        link_evidence_limited: state
+            .pages
+            .iter()
+            .any(|page| page.link_evidence_limit.contains("Run")),
+        snapshot: inventory_snapshot_label(state),
+        extraction_rules: run
+            .map(|run| run.extraction_rules.clone())
+            .unwrap_or_default(),
+    }
+}
+
+fn inventory_snapshot_label(state: &State) -> String {
+    format!(
+        "{} snapshot at {}",
+        if state.phase.active() {
+            "in-progress"
+        } else {
+            "complete"
+        },
+        inventory::utc_now()
+    )
+}
+
+/// Copy the facts an inventory export will read. The snapshot is immutable, so a crawl that
+/// keeps streaming after this point cannot produce a torn row set.
+#[cfg_attr(not(test), allow(dead_code))]
+fn inventory_snapshot(state: &State, scope: InventoryScope) -> Result<InventorySnapshot, String> {
+    if state.pages.is_empty() {
+        return Err("No captured URLs to inventory.".into());
+    }
+    // Pages share their heavy evidence lists through `Arc`, so this copies page metadata and
+    // reference-counted facts, not every anchor/extraction value. Visible keeps only the
+    // selected rows; All sorting happens in the background worker.
+    let (pages, indices) = match scope {
+        InventoryScope::All => (
+            state.pages.clone(),
+            (0..state.pages.len()).collect::<Vec<_>>(),
+        ),
+        InventoryScope::VisibleInternal => {
+            let selected = internal_inventory_indices(state);
+            if selected.is_empty() {
+                return Err("No URLs match the selected inventory scope.".into());
+            }
+            let pages = selected
+                .iter()
+                .filter_map(|index| state.pages.get(*index).cloned())
+                .collect::<Vec<_>>();
+            let count = pages.len();
+            (pages, (0..count).collect())
+        }
+    };
+    if indices.is_empty() {
+        return Err("No URLs match the selected inventory scope.".into());
+    }
+    Ok(InventorySnapshot {
+        pages,
+        audit: state.audit.clone(),
+        indices,
+        run: inventory_run(state),
+        link_checks: state.link_checks.clone(),
+        scope,
+    })
+}
+
+fn build_inventory_csv(
+    snapshot: InventorySnapshot,
+    cancel: &AtomicBool,
+) -> Option<InventoryExportResult> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let InventorySnapshot {
+        pages,
+        audit,
+        indices,
+        run,
+        link_checks,
+        scope,
+    } = snapshot;
+    let summary = inventory::InventorySummary {
+        run: &run,
+        link_checks: &link_checks,
+    };
+    let mut indices = indices;
+    if matches!(scope, InventoryScope::All) {
+        indices.sort_by(|left, right| pages[*left].url.cmp(&pages[*right].url));
+    }
+    let rows = inventory::rows(&pages, &audit, &indices, &summary);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let headers = inventory::headers_with_extraction(&run.extraction_rules);
+    let header_refs = headers.iter().map(String::as_str).collect::<Vec<_>>();
+    let row_count = rows.len();
+    let scope_label = match scope {
+        InventoryScope::All => "all captured URL",
+        InventoryScope::VisibleInternal => "visible Internal URL",
+    };
+    let scope_text = format!(
+        "{row_count} {scope_label} inventory rows · {}",
+        run.snapshot
+    );
+    Some(InventoryExportResult {
+        csv: calmtoad::export::to_csv(&header_refs, &rows),
+        row_count,
+        scope_text,
+    })
+}
+
+fn start_inventory_export(state: &mut State, scope: InventoryScope) -> Result<usize, String> {
+    if state.inventory_export_job.is_some()
+        || state.inventory_prepare.is_some()
+        || state.inventory_write.is_some()
+        || state.inventory_dialog_open
+    {
+        return Err("An inventory export is already being prepared or written.".into());
+    }
+    if state.pages.is_empty() {
+        return Err("No captured URLs to inventory.".into());
+    }
+    let source_indices = match scope {
+        InventoryScope::All => (0..state.pages.len()).collect::<Vec<_>>(),
+        InventoryScope::VisibleInternal => internal_inventory_indices(state),
+    };
+    if source_indices.is_empty() {
+        return Err("No URLs match the selected inventory scope.".into());
+    }
+    let captured = source_indices.len();
+    state.inventory_prepare = Some(InventoryPrepareJob {
+        scope,
+        source_indices,
+        next: 0,
+        pages: Vec::with_capacity(captured),
+        run: inventory_run(state),
+        audit: state.audit.clone(),
+        link_checks: state.link_checks.clone(),
+        epoch: state.pages_epoch,
+    });
+    state.export_notice = Some(Ok(format!(
+        "Preparing an inventory snapshot of {captured} captured URLs…"
+    )));
+    Ok(captured)
+}
+
+/// Clone a bounded slice of pages per frame, then hand the coherent snapshot to the CSV worker.
+fn poll_inventory_prepare(state: &mut State) -> bool {
+    let Some(mut job) = state.inventory_prepare.take() else {
+        return false;
+    };
+    if job.epoch != state.pages_epoch {
+        state.export_notice = Some(Err(
+            "Crawl results changed while the inventory snapshot was being prepared. Start the export again."
+                .into(),
+        ));
+        return true;
+    }
+    let mut remaining = 512_usize;
+    while remaining > 0 && job.next < job.source_indices.len() {
+        let Some(page) = state.pages.get(job.source_indices[job.next]).cloned() else {
+            state.export_notice = Some(Err(
+                "Crawl results changed while the inventory snapshot was being prepared. Start the export again."
+                    .into(),
+            ));
+            return true;
+        };
+        job.pages.push(page);
+        job.next += 1;
+        remaining -= 1;
+    }
+    if job.next < job.source_indices.len() {
+        state.inventory_prepare = Some(job);
+        return false;
+    }
+    let count = job.pages.len();
+    let snapshot = InventorySnapshot {
+        pages: job.pages,
+        audit: job.audit,
+        indices: (0..count).collect(),
+        run: job.run,
+        link_checks: job.link_checks,
+        scope: job.scope,
+    };
+    spawn_inventory_build(state, snapshot);
+    true
+}
+
+fn spawn_inventory_build(state: &mut State, snapshot: InventorySnapshot) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let waker = state.waker.clone();
+    let worker_cancel = cancel.clone();
+    state.inventory_export_job = Some(InventoryExportJob { rx, cancel });
+    state.export_notice = Some(Ok("Building the inventory CSV snapshot…".into()));
+    std::thread::spawn(move || {
+        if let Some(result) = build_inventory_csv(snapshot, &worker_cancel) {
+            let _ = tx.send(result);
+        }
+        if let Some(wake) = &waker {
+            wake();
+        }
+    });
+}
+
+fn export_inventory_csv(state: &mut State, _tx: &mut Tx, scope: InventoryScope) {
+    if let Err(error) = start_inventory_export(state, scope) {
+        state.export_notice = Some(Err(error));
+    }
 }
 
 fn export_overview_csv(state: &mut State, tx: &mut Tx) {
@@ -3620,6 +5245,35 @@ fn export_overview_csv(state: &mut State, tx: &mut Tx) {
     );
 }
 
+fn links_view_controls(k: &Kit, state: &State) -> El {
+    let button = |label: &'static str, view: LinksView, key: &'static str| {
+        Button::new(label)
+            .variant(if state.links_view == view {
+                ButtonVariant::Neutral
+            } else {
+                ButtonVariant::Ghost
+            })
+            .control_size(ControlSize::Small)
+            .on_press(move |state: &mut State| {
+                state.links_view = view;
+                let (column, dir) = state.view().sort.clone();
+                state.table.set_sort(column, dir);
+                refresh_visible_forced(state);
+            })
+            .build(k)
+            .key(key)
+    };
+    row()
+        .gap(1.0)
+        .center_y()
+        .child(button("Pages", LinksView::Pages, "links-pages"))
+        .child(button(
+            "Link evidence",
+            LinksView::Evidence,
+            "links-evidence",
+        ))
+}
+
 fn section_header(k: &Kit, state: &State) -> El {
     if state.tab == Tab::Sitemaps {
         return sitemap_section_header(k, state);
@@ -3627,7 +5281,12 @@ fn section_header(k: &Kit, state: &State) -> El {
     let total = state.view_counts.total;
     let shown = visible_len(state);
     let query_active = !state.view().query.text.trim().is_empty();
-    let mut summary = format!("{shown} of {total} URLs");
+    let noun = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        "link occurrences"
+    } else {
+        "URLs"
+    };
+    let mut summary = format!("{shown} of {total} {noun}");
     if query_active {
         summary.push_str(" shown");
     }
@@ -3647,6 +5306,11 @@ fn section_header(k: &Kit, state: &State) -> El {
         .px(GUTTER)
         .center_y()
         .gap(10.0)
+        .children(if state.tab == Tab::Links {
+            vec![links_view_controls(k, state)]
+        } else {
+            Vec::new()
+        })
         .child(
             text(summary)
                 .font(k.ty.text_xsmall)
@@ -3668,6 +5332,24 @@ fn section_header(k: &Kit, state: &State) -> El {
         .child(run_details_button(k, state))
         .children(search_field(k, state))
         .child(check_filter(k, state))
+        .children(if state.tab == Tab::Internal {
+            vec![
+                Button::new("Inventory")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .disabled(shown == 0
+                        || state.inventory_export_job.is_some()
+                        || state.inventory_prepare.is_some()
+                        || state.inventory_write.is_some()
+                        || state.inventory_dialog_open)
+                    .help("Export a complete content inventory for all captured URLs or the visible Internal set")
+                    .on_press(|state: &mut State| state.inventory_scope_open = true)
+                    .build(k)
+                    .key("export-inventory"),
+            ]
+        } else {
+            Vec::new()
+        })
         .child(export_button(k, state, shown))
         .child(copy_urls_button(k, state, shown))
         .child(details_toggle(k, state))
@@ -3694,6 +5376,7 @@ fn run_report_reason(state: &State) -> String {
 
 fn run_view_noun(state: &State) -> &'static str {
     match state.tab {
+        Tab::Links if state.links_view == LinksView::Evidence => "link occurrences",
         Tab::Sitemaps => match state.sitemap_view {
             SitemapView::Urls => "URLs",
             SitemapView::Files => "files",
@@ -3727,7 +5410,9 @@ fn run_details_button(k: &Kit, state: &State) -> El {
 }
 
 fn search_field(k: &Kit, state: &State) -> Option<El> {
-    let has_data = if state.tab == Tab::Sitemaps {
+    let has_data = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        !state.link_rows.is_empty()
+    } else if state.tab == Tab::Sitemaps {
         match state.sitemap_view {
             SitemapView::Urls => !state.sitemap.urls.is_empty(),
             SitemapView::Files => !state.sitemap.files.is_empty(),
@@ -3864,6 +5549,24 @@ fn sitemap_section_header(k: &Kit, state: &State) -> El {
         .child(run_details_button(k, state))
         .children(search_field(k, state))
         .child(check_filter(k, state))
+        .children(if state.tab == Tab::Internal {
+            vec![
+                Button::new("Inventory")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .disabled(shown == 0
+                        || state.inventory_export_job.is_some()
+                        || state.inventory_prepare.is_some()
+                        || state.inventory_write.is_some()
+                        || state.inventory_dialog_open)
+                    .help("Export a complete content inventory for all captured URLs or the visible Internal set")
+                    .on_press(|state: &mut State| state.inventory_scope_open = true)
+                    .build(k)
+                    .key("export-inventory"),
+            ]
+        } else {
+            Vec::new()
+        })
         .child(export_button(k, state, shown))
         .child(copy_urls_button(k, state, shown))
         .child(details_toggle(k, state))
@@ -3980,6 +5683,12 @@ fn copy_urls_button(k: &Kit, state: &State, shown: usize) -> El {
 }
 
 fn visible_ids(state: &State) -> Vec<String> {
+    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        return (0..visible_len(state))
+            .filter_map(|row| link_occurrence_at(state, row))
+            .map(|occurrence| link_final_url(state, occurrence).to_string())
+            .collect();
+    }
     (0..visible_len(state))
         .filter_map(|row| visible_id(state, row))
         .collect()
@@ -4033,6 +5742,29 @@ fn export_csv(state: &mut State, tx: &mut Tx) {
         return;
     }
     state.action_notice = None;
+    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        let headers = link_evidence_headers();
+        let rows = state
+            .link_visible
+            .iter()
+            .filter_map(|row| link_occurrence_by_row(state, *row))
+            .map(|occurrence| link_evidence_row(state, occurrence))
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return;
+        }
+        let scope = export_scope(state, rows.len(), "Link evidence");
+        save_csv(
+            state,
+            tx,
+            headers,
+            rows,
+            "Link evidence",
+            "link-evidence",
+            scope,
+        );
+        return;
+    }
     if state.tab == Tab::Sitemaps {
         let view = state.sitemap_view;
         let headers = sitemap_export_headers(view);
@@ -4096,7 +5828,7 @@ fn export_scope(state: &State, rows: usize, title: &str) -> String {
 fn save_csv(
     state: &mut State,
     tx: &mut Tx,
-    headers: &'static [&'static str],
+    headers: &[&str],
     rows: Vec<Vec<String>>,
     _title: &'static str,
     slug: &'static str,
@@ -4104,6 +5836,76 @@ fn save_csv(
 ) {
     let csv = calmtoad::export::to_csv(headers, &rows);
     let row_count = rows.len();
+    save_prepared_csv(state, tx, csv, row_count, scope, slug, false);
+}
+
+fn inventory_temp_file(destination: &Path) -> Result<tempfile::NamedTempFile, String> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("Could not prepare a safe inventory file: {error}"))
+}
+
+/// Write through a temporary file in the destination directory, then replace the destination
+/// only after the complete CSV is flushed. A cancelled or interrupted write drops the temporary
+/// file and leaves an existing destination untouched.
+fn write_inventory_temp(
+    mut temp: tempfile::NamedTempFile,
+    destination: &Path,
+    csv: &[u8],
+    cancel: &AtomicBool,
+) -> InventoryWriteOutcome {
+    let file = temp.as_file_mut();
+    for chunk in csv.chunks(1024 * 1024) {
+        if cancel.load(Ordering::Relaxed) {
+            return InventoryWriteOutcome::Cancelled;
+        }
+        if let Err(error) = file.write_all(chunk) {
+            return InventoryWriteOutcome::Failed(format!("Could not save CSV: {error}"));
+        }
+    }
+    if let Err(error) = file.flush() {
+        return InventoryWriteOutcome::Failed(format!("Could not save CSV: {error}"));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return InventoryWriteOutcome::Cancelled;
+    }
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("CSV file")
+        .to_string();
+    match temp.persist(destination) {
+        Ok(_) => InventoryWriteOutcome::Complete(name),
+        // tempfile already replaces existing files on supported platforms, including Windows.
+        // If replacement fails, preserve the destination rather than deleting it and retrying.
+        Err(error) => InventoryWriteOutcome::Failed(format!("Could not save CSV: {}", error.error)),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_inventory_file(
+    csv: &[u8],
+    destination: &Path,
+    cancel: &AtomicBool,
+) -> InventoryWriteOutcome {
+    match inventory_temp_file(destination) {
+        Ok(temp) => write_inventory_temp(temp, destination, csv, cancel),
+        Err(error) => InventoryWriteOutcome::Failed(error),
+    }
+}
+
+fn save_prepared_csv(
+    state: &mut State,
+    tx: &mut Tx,
+    csv: String,
+    row_count: usize,
+    scope: String,
+    slug: &'static str,
+    background_write: bool,
+) {
     let options = FileDialogOptions {
         title: format!("Export {scope} as CSV"),
         file_name: Some(format!("calmtoad-{slug}.csv")),
@@ -4112,22 +5914,61 @@ fn save_csv(
     .filter("CSV files", &["csv"]);
 
     state.export_notice = None;
-    tx.save_file(
-        options,
-        move |state: &mut State, result, _tx| match result {
+    if background_write {
+        state.inventory_dialog_open = true;
+    }
+    tx.save_file(options, move |state: &mut State, result, _tx| {
+        state.inventory_dialog_open = false;
+        match result {
             Ok(Some(path)) => {
                 let path = csv_path(path);
-                match std::fs::write(&path, csv.as_bytes()) {
-                    Ok(()) => {
-                        let name = path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("CSV file");
-                        state.export_notice =
-                            Some(Ok(format!("Exported {row_count} visible rows to {name}")));
-                    }
-                    Err(error) => {
-                        state.export_notice = Some(Err(format!("Could not save CSV: {error}")));
+                if background_write {
+                    let temp = match inventory_temp_file(&path) {
+                        Ok(temp) => temp,
+                        Err(error) => {
+                            state.export_notice = Some(Err(error));
+                            return;
+                        }
+                    };
+                    let temp_path = temp.path().to_path_buf();
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let (tx, rx) = mpsc::channel();
+                    let waker = state.waker.clone();
+                    let worker_cancel = cancel.clone();
+                    state.inventory_write = Some(InventoryWriteJob {
+                        rx,
+                        cancel,
+                        temp_path,
+                    });
+                    std::thread::spawn(move || {
+                        let result =
+                            match write_inventory_temp(temp, &path, csv.as_bytes(), &worker_cancel)
+                            {
+                                InventoryWriteOutcome::Complete(name) => {
+                                    InventoryWriteOutcome::Complete(format!(
+                                        "Exported {row_count} inventory rows to {name}"
+                                    ))
+                                }
+                                other => other,
+                            };
+                        let _ = tx.send(result);
+                        if let Some(wake) = &waker {
+                            wake();
+                        }
+                    });
+                } else {
+                    match std::fs::write(&path, csv.as_bytes()) {
+                        Ok(()) => {
+                            let name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("CSV file");
+                            state.export_notice =
+                                Some(Ok(format!("Exported {row_count} visible rows to {name}")));
+                        }
+                        Err(error) => {
+                            state.export_notice = Some(Err(format!("Could not save CSV: {error}")));
+                        }
                     }
                 }
             }
@@ -4135,8 +5976,8 @@ fn save_csv(
             Err(error) => {
                 state.export_notice = Some(Err(format!("Could not open save dialog: {error}")));
             }
-        },
-    );
+        }
+    });
 }
 
 fn csv_path(mut path: std::path::PathBuf) -> std::path::PathBuf {
@@ -4163,6 +6004,52 @@ fn tab_slug(tab: Tab) -> &'static str {
         Tab::Links => "links",
         Tab::Sitemaps => "sitemaps",
     }
+}
+
+fn link_evidence_headers() -> &'static [&'static str] {
+    &[
+        "SOURCE",
+        "RAW HREF",
+        "DESTINATION",
+        "FRAGMENT",
+        "ANCHOR",
+        "STAGE",
+        "CHECK STATE",
+        "CHECK REASON",
+        "STATUS",
+        "FINAL URL",
+        "REDIRECTS",
+        "TRUNCATED",
+        "EVIDENCE LIMITED",
+    ]
+}
+
+fn link_evidence_row(state: &State, occurrence: &LinkOccurrence) -> Vec<String> {
+    let redirects = link_chain(state, occurrence)
+        .iter()
+        .map(|url| serde_json::Value::String(url.clone()))
+        .collect::<Vec<_>>();
+    vec![
+        occurrence.source.clone(),
+        occurrence.raw_href.clone(),
+        occurrence.resolved.clone(),
+        occurrence.fragment.clone(),
+        occurrence.anchor.clone(),
+        occurrence.stage.label().to_string(),
+        link_state_label(state, occurrence).to_string(),
+        link_state_reason(state, occurrence).to_string(),
+        link_status(state, occurrence)
+            .map(|status| status.to_string())
+            .unwrap_or_default(),
+        link_final_url(state, occurrence).to_string(),
+        serde_json::Value::Array(redirects).to_string(),
+        if occurrence.truncated { "yes" } else { "" }.to_string(),
+        if link_is_incomplete(state, occurrence) {
+            "incomplete".into()
+        } else {
+            String::new()
+        },
+    ]
 }
 
 fn export_headers(tab: Tab) -> &'static [&'static str] {
@@ -4357,7 +6244,9 @@ fn export_row(tab: Tab, page: &Page, audit: &Audit) -> Vec<String> {
 
 fn results(k: &Kit, state: &State) -> El {
     let frame = row().key("frame").w_full().grow(1.0).min_h(0.0);
-    let has_data = if state.tab == Tab::Sitemaps {
+    let has_data = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        !state.link_rows.is_empty()
+    } else if state.tab == Tab::Sitemaps {
         match state.sitemap_view {
             SitemapView::Urls => !state.sitemap.urls.is_empty(),
             SitemapView::Files => !state.sitemap.files.is_empty(),
@@ -4476,7 +6365,20 @@ fn filtered_empty(k: &Kit, state: &State) -> El {
 }
 
 fn empty(k: &Kit, state: &State) -> El {
-    let (title, copy) = if state.tab == Tab::Sitemaps {
+    let (title, copy) = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        if state.phase.active() {
+            (
+                "Collecting link evidence".to_string(),
+                "Anchor occurrences appear as pages are parsed.".to_string(),
+            )
+        } else {
+            (
+                "No link evidence".to_string(),
+                "Crawl a page with anchors to retain their source, destination and check state."
+                    .to_string(),
+            )
+        }
+    } else if state.tab == Tab::Sitemaps {
         sitemap_empty(state)
     } else if state.phase == RunPhase::Preparing {
         (
@@ -4610,6 +6512,9 @@ fn sitemap_empty(state: &State) -> (String, String) {
 }
 
 fn table(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        return link_table(k, state);
+    }
     if state.tab == Tab::Sitemaps {
         return sitemap_table(k, state);
     }
@@ -4814,6 +6719,80 @@ fn table(k: &Kit, state: &State) -> El {
             cell(&kit, state.tab, page, &state.audit, column)
         })
         .build(state, k)
+}
+
+fn link_table(k: &Kit, state: &State) -> El {
+    let kit = k.clone();
+    Table::new(
+        |state: &State| &state.table,
+        |state: &mut State| &mut state.table,
+        |state: &State| state.link_visible.len(),
+        |state: &State, row| Cow::Borrowed(visible_id_ref(state, row).unwrap_or("")),
+    )
+    .name("Link evidence")
+    .style(table_style(k))
+    .zebra(false)
+    .column(
+        TableColumn::new("source", "SOURCE")
+            .flex(1.3)
+            .min(150.0)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("destination", "DESTINATION")
+            .flex(1.6)
+            .min(170.0)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("anchor", "ANCHOR")
+            .flex(1.1)
+            .min(110.0)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("status", "HTTP")
+            .width(70.0)
+            .align(Align::End)
+            .sortable(),
+    )
+    .column(TableColumn::new("state", "STATE").width(112.0).sortable())
+    .on_sort(|state: &mut State, column, dir, _| set_link_sort(state, column, dir))
+    .on_select(|state: &mut State, id, _tx| {
+        state.link_view.selected = Some(id.to_string());
+        state.details_open = true;
+    })
+    .cell(move |state: &State, row, column| {
+        let Some(occurrence) = link_occurrence_at(state, row) else {
+            return Cell::text("");
+        };
+        cell_link_occurrence(&kit, state, occurrence, column)
+    })
+    .build(state, k)
+}
+
+fn cell_link_occurrence(k: &Kit, state: &State, occurrence: &LinkOccurrence, column: &str) -> Cell {
+    match column {
+        "source" => Cell::text(occurrence.source.clone()),
+        "destination" => Cell::text(occurrence.resolved.clone()),
+        "anchor" => Cell::text(occurrence.anchor.clone()),
+        "status" => match link_status(state, occurrence) {
+            Some(status) => Cell::text(status.to_string()).mono(),
+            None => Cell::text("—").mono().muted(),
+        },
+        "state" => {
+            let label = link_state_label(state, occurrence);
+            let color = if link_is_finding(state, occurrence) {
+                k.c.danger.fg
+            } else if link_is_incomplete(state, occurrence) {
+                k.c.warning.fg
+            } else {
+                k.c.text_muted
+            };
+            Cell::text(label).color(color)
+        }
+        _ => Cell::text(""),
+    }
 }
 
 fn sitemap_table(k: &Kit, state: &State) -> El {
@@ -5131,6 +7110,9 @@ fn selected_page(state: &State) -> Option<&Page> {
 }
 
 fn detail(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        return link_detail(k, state);
+    }
     if state.tab == Tab::Sitemaps {
         return sitemap_detail(k, state);
     }
@@ -5215,6 +7197,11 @@ fn detail(k: &Kit, state: &State) -> El {
             stick_bottom: false,
         })
         .child(inspector_lead(k, state, page))
+        .children(if state.tab == Tab::Internal {
+            vec![extraction_disclosure(k, state, page)]
+        } else {
+            Vec::new()
+        })
         .child(el().w_full().h(1.0).fill(k.c.border_weak))
         .child(page_fields(k, state, page))
         .child(indexability_disclosure(k, state, page));
@@ -5268,8 +7255,12 @@ fn move_selection(state: &mut State, tx: &mut Tx, delta: i32) {
     let Some(id) = visible_id(state, target) else {
         return;
     };
-    sync_relation_selection(state, Some(&id));
-    state.view_mut().selected = Some(id.clone());
+    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+        state.link_view.selected = Some(id.clone());
+    } else {
+        sync_relation_selection(state, Some(&id));
+        state.view_mut().selected = Some(id.clone());
+    }
     state.table.select(id.clone());
     state.table.reveal(id, tx);
     state.details_open = true;
@@ -6230,6 +8221,88 @@ fn assessment_detail(
     block
 }
 
+fn extraction_disclosure(k: &Kit, state: &State, page: &Page) -> El {
+    let Some(run) = &state.run else {
+        return col();
+    };
+    if run.extraction_rules.is_empty() {
+        return col();
+    }
+    let mut content = col().w_full().gap(8.0);
+    for rule in &run.extraction_rules {
+        let outcome = page
+            .extraction
+            .iter()
+            .find(|outcome| outcome.rule_id == rule.id);
+        let mut block = col()
+            .w_full()
+            .gap(2.0)
+            .child(
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .center_y()
+                    .child(
+                        text(rule.name.clone())
+                            .font(k.ty.small_medium)
+                            .color(k.c.text_base)
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .truncate(),
+                    )
+                    .child(
+                        text(
+                            outcome
+                                .map(|outcome| outcome.state.label())
+                                .unwrap_or("Not evaluated"),
+                        )
+                        .font(k.ty.text_xsmall)
+                        .color(k.c.text_muted),
+                    ),
+            )
+            .child(muted_note(
+                k,
+                match outcome.and_then(|outcome| outcome.stage) {
+                    Some(stage) => format!(
+                        "{} · {} · {}",
+                        rule.selector,
+                        rule.output.label(),
+                        stage.label()
+                    ),
+                    None => format!("{} · {}", rule.selector, rule.output.label()),
+                },
+            ));
+        if let Some(outcome) = outcome {
+            if !outcome.reason.is_empty() {
+                block = block.child(muted_note(k, outcome.reason.clone()));
+            }
+            if !outcome.values.is_empty() {
+                let values = outcome.values.join("\n");
+                block = block.child(value_with_copy(
+                    k,
+                    "Values",
+                    &values,
+                    "Copy extracted values",
+                ));
+            }
+        }
+        content = content.child(block);
+    }
+    detail_disclosure(
+        k,
+        "Custom extraction",
+        state.extraction_open,
+        "extraction-content",
+        "extraction-toggle",
+        if state.extraction_open {
+            content
+        } else {
+            col()
+        },
+        |state| state.extraction_open ^= true,
+    )
+}
+
 fn detail_disclosure(
     k: &Kit,
     title: &'static str,
@@ -6334,6 +8407,192 @@ fn capture_detail(k: &Kit, capture: &CaptureInfo, page_url: &str) -> El {
         block = block.child(muted_note(k, render.source_note.clone()));
     }
     block
+}
+
+fn link_detail(k: &Kit, state: &State) -> El {
+    let panel = col()
+        .key("detail")
+        .w(320.0)
+        .h_full()
+        .gap(10.0)
+        .px(14.0)
+        .py(12.0)
+        .border_sides([0.0, 0.0, 0.0, 1.0], k.c.border_weak);
+    let Some(occurrence) = selected_link(state) else {
+        return panel.child(micro(k, "Link evidence")).child(
+            text("Select a visible link occurrence to inspect its provenance and check.")
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        );
+    };
+    let position = state
+        .table
+        .cursor()
+        .and_then(|id| (0..visible_len(state)).find(|row| visible_id_ref(state, *row) == Some(id)));
+    let prev = Button::new("Previous")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(position.is_none_or(|position| position == 0))
+        .on_press_tx(|state: &mut State, tx: &mut Tx| move_selection(state, tx, -1))
+        .build(k)
+        .key("detail-prev");
+    let next = Button::new("Next")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(position.is_none_or(|position| position + 1 >= visible_len(state)))
+        .on_press_tx(|state: &mut State, tx: &mut Tx| move_selection(state, tx, 1))
+        .build(k)
+        .key("detail-next");
+    let close = IconButton::new(k.glyph.close)
+        .variant(IconButtonVariant::GhostMuted)
+        .label("Close link details")
+        .on_press(|state: &mut State| state.details_open = false)
+        .build(k)
+        .key("detail-close");
+    let destination = link_final_url(state, occurrence).to_string();
+    let source = occurrence.source.clone();
+    let open = IconButton::new(&OPEN_LINK)
+        .variant(IconButtonVariant::GhostMuted)
+        .label("Open destination in browser")
+        .on_press_tx({
+            let url = destination.clone();
+            move |_: &mut State, tx: &mut Tx| {
+                let _ = tx.open_url(&url);
+            }
+        })
+        .build(k);
+    let mut body = col()
+        .key("link-detail-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(10.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(
+            row()
+                .w_full()
+                .gap(6.0)
+                .center_y()
+                .child(
+                    text(link_state_label(state, occurrence))
+                        .font(k.ty.body_medium)
+                        .color(if link_is_finding(state, occurrence) {
+                            k.c.danger.fg
+                        } else if link_is_incomplete(state, occurrence) {
+                            k.c.warning.fg
+                        } else {
+                            k.c.text_muted
+                        }),
+                )
+                .child(el().grow(1.0))
+                .child(open),
+        );
+    let reason = link_state_reason(state, occurrence);
+    if !reason.is_empty() {
+        body = body.child(
+            text(reason.to_string())
+                .font(k.ty.text_small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full()
+                .key("link-detail-reason"),
+        );
+    }
+    body = body
+        .child(value_with_copy(
+            k,
+            "Destination",
+            &destination,
+            "Copy destination",
+        ))
+        .child(value_with_copy(
+            k,
+            "Source page",
+            &source,
+            "Copy source page",
+        ))
+        .child(
+            Button::new("Show source page")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press({
+                    let source = source.clone();
+                    move |state: &mut State| {
+                        inspect_url_state(state, &source);
+                    }
+                })
+                .build(k)
+                .key("link-source-page"),
+        )
+        .child(value_with_copy(
+            k,
+            "Anchor text",
+            &occurrence.anchor,
+            "Copy anchor text",
+        ))
+        .child(value_with_copy(
+            k,
+            "Raw href",
+            &occurrence.raw_href,
+            "Copy raw href",
+        ))
+        .child(value_with_copy(
+            k,
+            "Fragment",
+            &occurrence.fragment,
+            "Copy fragment",
+        ))
+        .child(value_with_copy(
+            k,
+            "Capture stage",
+            occurrence.stage.label(),
+            "Copy capture stage",
+        ))
+        .child(value_with_copy(
+            k,
+            "Observed status",
+            &link_status(state, occurrence)
+                .map(|status| status.to_string())
+                .unwrap_or_default(),
+            "Copy observed status",
+        ));
+    if occurrence.truncated {
+        body = body.child(muted_note(
+            k,
+            "The raw or resolved URL was bounded for evidence and was not treated as a fetch target.",
+        ));
+    }
+    let chain = link_chain(state, occurrence);
+    if !chain.is_empty() {
+        body = body.child(value_with_copy(
+            k,
+            "Redirect chain",
+            &chain.join("\n"),
+            "Copy redirect chain",
+        ));
+    }
+    if let Some(page) = state.pages.iter().find(|page| page.url == source)
+        && !page.link_evidence_limit.is_empty()
+    {
+        body = body.child(muted_note(k, page.link_evidence_limit.clone()));
+    }
+    panel
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .gap(4.0)
+                .child(micro(k, "Link evidence"))
+                .child(el().grow(1.0))
+                .child(prev)
+                .child(next)
+                .child(close),
+        )
+        .child(body)
 }
 
 fn sitemap_detail(k: &Kit, state: &State) -> El {
@@ -6846,7 +9105,7 @@ fn scene_overview_clean(state: &mut State) {
         .nth(3)
         .expect("the sample keeps a clean page");
     clean.h1s = vec!["Why a calm homepage converts better".into()];
-    clean.links.clear();
+    Arc::make_mut(&mut clean.links).clear();
     clean.images = 0;
     clean.images_missing_alt = 0;
     set_pages(state, vec![clean], "1 page on example.com".into());
@@ -6904,6 +9163,111 @@ fn scene_images(state: &mut State) {
 fn scene_links(state: &mut State) {
     load_sample(state);
     switch_tab(state, Tab::Links);
+}
+fn scene_link_evidence(state: &mut State) {
+    load_sample(state);
+    state.links_view = LinksView::Evidence;
+    switch_tab(state, Tab::Links);
+    refresh_visible_forced(state);
+}
+fn scene_link_evidence_detail(state: &mut State) {
+    scene_link_evidence(state);
+    if let Some(id) = state.link_row_keys.first().cloned() {
+        state.link_view.selected = Some(id.clone());
+        state.table.select(id);
+        state.details_open = true;
+    }
+}
+fn scene_inventory_scope(state: &mut State) {
+    load_sample(state);
+    state.inventory_scope_open = true;
+    switch_tab(state, Tab::Overview);
+}
+fn scene_extraction_editor(state: &mut State) {
+    load_sample(state);
+    state.extraction_drafts = vec![
+        ExtractionDraft {
+            id: "rule-price".into(),
+            name: TextEdit::new("Price"),
+            selector: TextEdit::new(".price"),
+            attribute: TextEdit::new(""),
+            output: extract::ExtractionOutput::Text,
+            mode: extract::MatchMode::First,
+        },
+        ExtractionDraft {
+            id: "rule-link".into(),
+            name: TextEdit::new("Primary link"),
+            selector: TextEdit::new("a.primary"),
+            attribute: TextEdit::new("href"),
+            output: extract::ExtractionOutput::Attribute,
+            mode: extract::MatchMode::All,
+        },
+    ];
+    state.extraction_editor_open = true;
+    state.crawl_options_open = false;
+}
+fn scene_extraction_results(state: &mut State) {
+    load_sample(state);
+    let rules = vec![ExtractionRule {
+        id: "rule-price".into(),
+        name: "Price".into(),
+        selector: ".price".into(),
+        output: extract::ExtractionOutput::Text,
+        attribute: String::new(),
+        mode: extract::MatchMode::First,
+    }];
+    if let Some(run) = state.run.as_mut() {
+        run.extraction_rules = rules.clone();
+    }
+    if let Some(page) = state.pages.first_mut() {
+        page.extraction = Arc::new(vec![extract::ExtractionOutcome {
+            rule_id: "rule-price".into(),
+            state: extract::ExtractionState::Matched,
+            values: vec!["$49".into()],
+            stage: Some(EvidenceStage::Document),
+            reason: String::new(),
+            limited: false,
+        }]);
+    }
+    switch_tab(state, Tab::Internal);
+    state.url.replace_text("https://example.com/");
+    if let Some(page) = state.pages.first() {
+        let url = page.url.clone();
+        state.view_mut().selected = Some(url.clone());
+        state.table.select(url);
+    }
+    state.details_open = true;
+    state.extraction_open = true;
+}
+fn scene_extraction_preview(state: &mut State) {
+    scene_extraction_editor(state);
+    state
+        .extraction_preview_url
+        .replace_text("https://example.com/");
+    state.extraction_preview = ExtractionPreviewUi::Done {
+        url: "https://example.com/".into(),
+        message: "1 page on example.com".into(),
+        outcomes: vec![
+            extract::ExtractionOutcome {
+                rule_id: "rule-price".into(),
+                state: extract::ExtractionState::Matched,
+                values: vec!["$49".into()],
+                stage: Some(EvidenceStage::Document),
+                reason: String::new(),
+                limited: false,
+            },
+            extract::ExtractionOutcome {
+                rule_id: "rule-link".into(),
+                state: extract::ExtractionState::NoMatch,
+                values: Vec::new(),
+                stage: Some(EvidenceStage::Document),
+                reason: "No element matched".into(),
+                limited: false,
+            },
+        ],
+        mode: RenderMode::Html,
+        rules: draft_rules(&state.extraction_drafts),
+    };
 }
 fn scene_sitemaps(state: &mut State) {
     load_sample(state);
@@ -7067,6 +9431,9 @@ fn scene_failed(state: &mut State) {
         },
         rendering: RenderMode::Html,
         sitemaps: true,
+        check_links: false,
+        started_utc: inventory::utc_now(),
+        extraction_rules: Vec::new(),
     });
     state.message = "Crawl failed · no response".into();
 }
@@ -7420,6 +9787,12 @@ fn main() {
             ("canonical", scene_canonical),
             ("images", scene_images),
             ("links", scene_links),
+            ("link-evidence", scene_link_evidence),
+            ("link-evidence-detail", scene_link_evidence_detail),
+            ("inventory-scope", scene_inventory_scope),
+            ("extraction-editor", scene_extraction_editor),
+            ("extraction-preview", scene_extraction_preview),
+            ("extraction-results", scene_extraction_results),
             ("sitemaps", scene_sitemaps),
             ("sitemap-files", scene_sitemap_files),
             ("sitemap-files-findings", scene_sitemap_files_findings),
@@ -7663,6 +10036,9 @@ mod tests {
             limits: Limits::default(),
             rendering: RenderMode::Html,
             sitemaps: false,
+            check_links: false,
+            started_utc: inventory::utc_now(),
+            extraction_rules: Vec::new(),
         });
         let (tx, rx) = mpsc::channel();
         state.job = Some(CrawlJob {
@@ -8037,6 +10413,490 @@ mod tests {
     }
 
     #[test]
+    fn link_evidence_view_filters_inspects_and_exports_occurrences() {
+        let mut state = init();
+        scene_link_evidence(&mut state);
+        let total = state.link_rows.len();
+        assert!(total > 0);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("links-pages").is_some());
+        assert!(rt.find("links-evidence").is_some());
+        assert_eq!(visible_len(&rt.state), total);
+        click_key(&mut rt, "filter-findings");
+        assert_eq!(rt.state.view().filter, CheckFilter::Findings);
+        assert_eq!(
+            visible_len(&rt.state),
+            rt.state.view_counts.findings,
+            "the visible occurrence set uses the finding predicate"
+        );
+        if visible_len(&rt.state) > 0 {
+            let (x, y) = rt.find("grid").expect("evidence table");
+            let _ = (x, y);
+            let id = visible_id(&rt.state, 0).expect("first visible occurrence");
+            rt.update(|state: &mut State, _| {
+                state.link_view.selected = Some(id.clone());
+                state.table.select(id);
+                state.details_open = true;
+            });
+            rt.frame(0.016);
+            assert!(rt.find("link-source-page").is_some());
+            assert!(rt.find("link-detail-reason").is_some() || rt.find("detail").is_some());
+        }
+        let headers = link_evidence_headers();
+        assert_eq!(headers[0], "SOURCE".to_string().as_str());
+        assert!(headers.contains(&"DESTINATION"));
+        let rows = rt
+            .state
+            .link_visible
+            .iter()
+            .filter_map(|row| link_occurrence_by_row(&rt.state, *row))
+            .map(|occurrence| link_evidence_row(&rt.state, occurrence))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), visible_len(&rt.state));
+        assert!(rows.iter().all(|row| row.len() == headers.len()));
+
+        click_key(&mut rt, "links-pages");
+        assert_eq!(rt.state.links_view, LinksView::Pages);
+        assert!(rt.find("export-csv").is_some());
+    }
+
+    #[test]
+    fn optional_link_checks_are_an_off_by_default_crawl_option() {
+        let mut state = init();
+        load_sample(&mut state);
+        assert!(!state.check_links);
+        state.crawl_options_open = true;
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("check-links").is_some());
+        click_key(&mut rt, "check-links");
+        assert!(rt.state.check_links);
+        assert_eq!(
+            rt.state.run.as_ref().map(|run| run.check_links),
+            Some(false),
+            "the saved run keeps its own setting"
+        );
+    }
+
+    #[test]
+    fn inventory_export_snapshots_an_active_run_and_builds_off_the_ui_thread() {
+        let mut state = init();
+        load_sample(&mut state);
+        state.phase = RunPhase::Crawling;
+        let snapshot = inventory_snapshot(&state, InventoryScope::All).expect("snapshot");
+        let captured = snapshot.pages.len();
+        assert!(captured > 0);
+        assert!(snapshot.run.snapshot.starts_with("in-progress snapshot"));
+        assert!(snapshot.run.snapshot.chars().any(|ch| ch.is_ascii_digit()));
+
+        // Streaming continues after the snapshot is taken; the prepared CSV must not see it.
+        let mut later = state.pages[0].clone();
+        later.url = "https://example.com/after-snapshot".into();
+        state.pages.push(later);
+        state.overview.incomplete += 1;
+
+        let cancel = AtomicBool::new(false);
+        let result = build_inventory_csv(snapshot, &cancel).expect("csv");
+        assert_eq!(result.row_count, captured);
+        assert!(result.scope_text.contains("in-progress"));
+        assert!(result.scope_text.contains("all captured URL"));
+        let header = result.csv.lines().next().unwrap_or_default();
+        assert!(header.contains("RUN SNAPSHOT"));
+        assert!(!result.csv.contains("after-snapshot"));
+
+        switch_tab(&mut state, Tab::Internal);
+        state.view_mut().query.replace_text("private");
+        state.view_mut().filter = CheckFilter::Findings;
+        refresh_visible_forced(&mut state);
+        let visible_count = visible_len(&state);
+        let visible_snapshot =
+            inventory_snapshot(&state, InventoryScope::VisibleInternal).expect("visible snapshot");
+        assert_eq!(visible_snapshot.pages.len(), visible_count);
+        assert!(visible_snapshot.pages.len() < state.pages.len());
+        state.phase = RunPhase::Crawling;
+        let captured = start_inventory_export(&mut state, InventoryScope::All).expect("start");
+        assert!(captured > 0);
+        assert!(state.inventory_prepare.is_some());
+        assert!(state.export_notice.as_ref().is_some_and(|notice| {
+            notice
+                .as_ref()
+                .is_ok_and(|message| message.contains("Preparing an inventory snapshot"))
+        }));
+        // The bounded preparation runs one chunk per poll, then starts the CSV worker.
+        while state.inventory_export_job.is_none() && state.inventory_prepare.is_some() {
+            poll_inventory_prepare(&mut state);
+        }
+        let job_cancel = state
+            .inventory_export_job
+            .as_ref()
+            .expect("job")
+            .cancel
+            .clone();
+        stop_owned_work(&mut state);
+        assert!(job_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn inventory_snapshot_preparation_is_chunked_and_coherent() {
+        let mut state = init();
+        let template = crawl::sample_pages().remove(0);
+        let pages = (0..600)
+            .map(|index| {
+                let mut page = template.clone();
+                page.url = format!("https://example.com/chunk/page-{index}");
+                page.title = format!("Chunk page {index} title long enough");
+                page
+            })
+            .collect::<Vec<_>>();
+        set_pages(&mut state, pages, "600 pages on example.com".into());
+        let captured = start_inventory_export(&mut state, InventoryScope::All).expect("start");
+        assert_eq!(captured, 600);
+        assert!(!poll_inventory_prepare(&mut state));
+        let prepared = state.inventory_prepare.as_ref().expect("still preparing");
+        assert_eq!(
+            prepared.pages.len(),
+            512,
+            "each poll clones a bounded chunk"
+        );
+        assert_eq!(prepared.next, 512);
+        while state.inventory_export_job.is_none() && state.inventory_prepare.is_some() {
+            poll_inventory_prepare(&mut state);
+        }
+        assert_eq!(
+            state
+                .inventory_export_job
+                .as_ref()
+                .map(|_| state.inventory_prepare.is_none()),
+            Some(true)
+        );
+        stop_owned_work(&mut state);
+    }
+
+    #[test]
+    fn inventory_writer_is_safe_and_gates_install_until_finished() {
+        let dir = tempfile::TempDir::new().expect("dir");
+        let destination = dir.path().join("inventory.csv");
+        std::fs::write(&destination, b"original").expect("seed");
+
+        let cancel = AtomicBool::new(false);
+        let outcome = write_inventory_file(b"replacement", &destination, &cancel);
+        assert!(matches!(outcome, InventoryWriteOutcome::Complete(_)));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+
+        let cancel = AtomicBool::new(true);
+        let outcome = write_inventory_file(b"must not land", &destination, &cancel);
+        assert!(matches!(outcome, InventoryWriteOutcome::Cancelled));
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"replacement",
+            "a cancelled write leaves the destination unchanged"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "the temporary file is removed"
+        );
+
+        let mut state = init();
+        scene_update_ready(&mut state);
+        assert!(can_install(&state));
+        state.inventory_dialog_open = true;
+        assert!(!can_install(&state), "the save dialog owns the export");
+        state.inventory_dialog_open = false;
+
+        let temp_path = dir.path().join("inventory.csv.tmp");
+        std::fs::write(&temp_path, b"temp").expect("temp");
+        let (_tx, rx) = mpsc::channel();
+        let job_cancel = Arc::new(AtomicBool::new(false));
+        state.inventory_write = Some(InventoryWriteJob {
+            rx,
+            cancel: job_cancel.clone(),
+            temp_path: temp_path.clone(),
+        });
+        assert!(!can_install(&state), "install waits for the file writer");
+        stop_owned_work(&mut state);
+        assert!(job_cancel.load(Ordering::Relaxed));
+        assert!(!temp_path.exists(), "close removes the abandoned temp file");
+    }
+
+    #[test]
+    #[ignore = "local inventory trigger-latency measurement"]
+    fn inventory_trigger_latency_with_heavy_shared_evidence() {
+        use calmtoad::indexability::EvidenceStage;
+        use calmtoad::links::{LinkCheckResult, LinkOccurrence};
+
+        let mut state = init();
+        let template = crawl::sample_pages().remove(0);
+        let mut pages = Vec::new();
+        for index in 0..2_000 {
+            let mut page = template.clone();
+            page.url = format!("https://example.com/group-{}/page-{index}", index % 20);
+            page.title = format!("Inventory page {index} title long enough");
+            page.links = Arc::new(vec![format!(
+                "https://example.com/group-{}/child",
+                index % 20
+            )]);
+            page.link_evidence = Arc::new(
+                (0..250)
+                    .map(|order| LinkOccurrence {
+                        source: page.url.clone(),
+                        order,
+                        raw_href: format!("/child-{order}"),
+                        resolved: format!("https://example.com/group-{}/child-{order}", index % 20),
+                        key: format!("https://example.com/group-{}/child-{order}", index % 20),
+                        anchor: format!("Child {order}"),
+                        stage: EvidenceStage::Document,
+                        check: Some(Box::new(LinkCheckResult::checked(
+                            200,
+                            format!("https://example.com/group-{}/child-{order}", index % 20),
+                            Vec::new(),
+                        ))),
+                        ..LinkOccurrence::default()
+                    })
+                    .collect(),
+            );
+            page.extraction = Arc::new(
+                (0..10)
+                    .map(|rule| extract::ExtractionOutcome {
+                        rule_id: format!("rule-{rule}"),
+                        state: extract::ExtractionState::Matched,
+                        values: vec![format!("value-{index}-{rule}")],
+                        stage: Some(EvidenceStage::Document),
+                        reason: String::new(),
+                        limited: false,
+                    })
+                    .collect(),
+            );
+            pages.push(page);
+        }
+        state.pages = pages;
+        state.search_index = state.pages.iter().map(page_search_text).collect();
+        state.audit = Audit::from_pages(&state.pages);
+        state.phase = RunPhase::Completed;
+        state.max_pages = state.pages.len();
+        state.run = Some(RunContext {
+            seed: "https://example.com/".into(),
+            host: "example.com".into(),
+            limits: Limits {
+                max_pages: state.pages.len(),
+                max_depth: MAX_DEPTH,
+            },
+            rendering: RenderMode::Html,
+            sitemaps: true,
+            check_links: true,
+            started_utc: inventory::utc_now(),
+            extraction_rules: Vec::new(),
+        });
+        switch_tab(&mut state, Tab::Internal);
+        state.view_mut().query.replace_text("group-0/");
+        refresh_visible_forced(&mut state);
+        let visible_count = visible_len(&state);
+        assert!(visible_count > 0 && visible_count < state.pages.len());
+
+        let started = Instant::now();
+        let audit_copy = state.audit.clone();
+        let audit_time = started.elapsed();
+        let started = Instant::now();
+        let all = inventory_snapshot(&state, InventoryScope::All).expect("all snapshot");
+        let all_time = started.elapsed();
+        let started = Instant::now();
+        let visible =
+            inventory_snapshot(&state, InventoryScope::VisibleInternal).expect("visible snapshot");
+        let visible_time = started.elapsed();
+        eprintln!(
+            "pages {} evidence {} extraction {} · audit clone {audit_time:?} · all snapshot {all_time:?} ({} pages) · visible subset {visible_time:?} ({} pages)",
+            state.pages.len(),
+            state
+                .pages
+                .iter()
+                .map(|page| page.link_evidence.len())
+                .sum::<usize>(),
+            state
+                .pages
+                .iter()
+                .map(|page| page.extraction.len())
+                .sum::<usize>(),
+            all.pages.len(),
+            visible.pages.len(),
+        );
+        assert_eq!(all.pages.len(), state.pages.len());
+        assert_eq!(visible.pages.len(), visible_count);
+        drop(audit_copy);
+        let started = Instant::now();
+        let _ = start_inventory_export(&mut state, InventoryScope::All).expect("trigger all");
+        let trigger_all = started.elapsed();
+        state.inventory_prepare = None;
+        let started = Instant::now();
+        let _ = start_inventory_export(&mut state, InventoryScope::VisibleInternal)
+            .expect("trigger visible");
+        let trigger_visible = started.elapsed();
+        state.inventory_prepare = None;
+        eprintln!("trigger latency: all {trigger_all:?}, visible subset {trigger_visible:?}");
+        assert!(all_time < Duration::from_secs(1));
+        assert!(visible_time < Duration::from_millis(250));
+        assert!(trigger_all < Duration::from_millis(250));
+        assert!(trigger_visible < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn inventory_scope_choices_are_visible_and_cancellable() {
+        let mut state = init();
+        scene_inventory_scope(&mut state);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("overview-export-inventory").is_some());
+        assert!(rt.find("inventory-all").is_some());
+        assert!(rt.find("inventory-visible").is_some());
+        click_key(&mut rt, "inventory-cancel");
+        assert!(!rt.state.inventory_scope_open);
+        assert!(rt.find("inventory-all").is_none());
+    }
+
+    #[test]
+    fn inventory_export_is_available_while_a_crawl_is_streaming() {
+        let mut state = init();
+        load_sample(&mut state);
+        state.phase = RunPhase::Crawling;
+        state.tab = Tab::Overview;
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        click_key(&mut rt, "overview-export-inventory");
+        assert!(
+            rt.state.inventory_scope_open,
+            "an active crawl can start a snapshot export"
+        );
+        click_key(&mut rt, "inventory-cancel");
+        assert!(!rt.state.inventory_scope_open);
+    }
+
+    #[test]
+    fn stale_preview_is_visibly_marked_after_draft_edits() {
+        let mut state = init();
+        scene_extraction_preview(&mut state);
+        state.rendering = RenderMode::Browser;
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("extract-preview-stale").is_some());
+        assert!(rt.find("extract-preview-status").is_some());
+    }
+
+    #[test]
+    fn extraction_editor_adds_rules_and_reports_validation_without_touching_results() {
+        let mut state = init();
+        scene_extraction_editor(&mut state);
+        let pages = state.pages.len();
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("extract-name-0").is_some());
+        assert!(rt.find("extract-selector-0").is_some());
+        assert!(rt.find("extract-preview").is_some());
+        assert!(rt.find("extract-add").is_some());
+        click_key(&mut rt, "extract-add");
+        assert_eq!(rt.state.extraction_drafts.len(), 3);
+        assert!(rt.find("extract-name-2").is_some());
+        let first_id = rt.state.extraction_drafts[0].id.clone();
+        click_key(&mut rt, "extract-down-0");
+        assert_eq!(
+            rt.state.extraction_drafts[1].id, first_id,
+            "rules reorder without changing IDs"
+        );
+        assert_eq!(
+            rt.state.pages.len(),
+            pages,
+            "editor state does not mutate results"
+        );
+
+        rt.state.extraction_drafts[0]
+            .name
+            .replace_text("Primary link");
+        rt.state.extraction_drafts[1]
+            .name
+            .replace_text("Primary link");
+        save_extraction_drafts(&mut rt.state);
+        assert!(!rt.state.extraction_errors.is_empty());
+        assert_eq!(
+            rt.state.extraction_rules.len(),
+            0,
+            "invalid rules are not snapshotted"
+        );
+    }
+
+    #[test]
+    fn extraction_preview_validates_before_network_and_keeps_results_isolated() {
+        let mut state = init();
+        scene_extraction_editor(&mut state);
+        let pages = state.pages.len();
+        state.extraction_preview_url.replace_text("not a url");
+        start_extraction_preview(&mut state);
+        assert!(matches!(
+            state.extraction_preview,
+            ExtractionPreviewUi::Failed(_)
+        ));
+        assert!(state.extraction_preview_job.is_none());
+        assert_eq!(
+            state.pages.len(),
+            pages,
+            "preview cannot mutate retained results"
+        );
+
+        state.url.replace_text("https://example.com/");
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("extract-preview-error").is_some());
+    }
+
+    #[test]
+    fn extraction_inspector_shows_retained_rule_values_and_stages() {
+        let mut state = init();
+        scene_extraction_results(&mut state);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("extraction-toggle").is_some());
+        assert!(rt.find("extraction-content").is_some());
+        assert!(rt.state.details_open);
+        assert!(rt.state.extraction_open);
+    }
+
+    #[test]
+    fn inventory_scope_uses_all_or_the_saved_internal_view_and_a_frozen_run() {
+        let mut state = init();
+        load_sample(&mut state);
+        let all = inventory_indices(&state, InventoryScope::All);
+        let urls = all
+            .iter()
+            .map(|index| state.pages[*index].url.clone())
+            .collect::<Vec<_>>();
+        let mut sorted = urls.clone();
+        sorted.sort();
+        assert_eq!(urls, sorted);
+        assert_eq!(all.len(), state.pages.len());
+
+        switch_tab(&mut state, Tab::Internal);
+        state.view_mut().filter = CheckFilter::Findings;
+        state.view_mut().query.replace_text("private");
+        refresh_visible_forced(&mut state);
+        let expected = state.visible.clone();
+        let visible = inventory_indices(&state, InventoryScope::VisibleInternal);
+        assert_eq!(visible, expected);
+
+        let snapshot = inventory_run(&state);
+        assert!(snapshot.sitemaps);
+        assert!(!snapshot.check_links);
+        state.use_sitemaps = false;
+        state.check_links = true;
+        state.url.replace_text("https://other.example/");
+        let after = inventory_run(&state);
+        assert!(
+            after.sitemaps,
+            "next-run controls do not rewrite the saved run"
+        );
+        assert!(!after.check_links);
+        assert_eq!(after.seed, "https://example.com/");
+        assert!(!after.started_utc.is_empty());
+    }
+
+    #[test]
     fn browser_non_html_is_complete_but_missing_html_dom_and_truncation_are_not() {
         let mut pdf = crawl::indexability_sample_pages()
             .into_iter()
@@ -8227,6 +11087,51 @@ mod tests {
             csv_path("crawl.txt".into()),
             std::path::PathBuf::from("crawl.csv")
         );
+    }
+
+    #[test]
+    fn install_and_close_own_an_active_extraction_preview() {
+        let mut state = init();
+        scene_update_ready(&mut state);
+        assert!(can_install(&state), "a quiet app may install");
+        let (_tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.extraction_preview_job = Some(ExtractionPreviewJob {
+            rx,
+            cancel: cancel.clone(),
+        });
+        state.extraction_preview = ExtractionPreviewUi::Running;
+        assert!(!can_install(&state), "install waits for the preview worker");
+        stop_owned_work(&mut state);
+        assert!(cancel.load(Ordering::Relaxed), "close cancels the preview");
+        state.extraction_preview_job = None;
+        assert!(can_install(&state));
+    }
+
+    #[test]
+    fn completed_preview_keeps_its_capture_mode_and_rule_definitions() {
+        let mut state = init();
+        scene_extraction_preview(&mut state);
+        let (mode, rules) = match &state.extraction_preview {
+            ExtractionPreviewUi::Done { mode, rules, .. } => (*mode, rules.clone()),
+            other => panic!("expected a completed preview, got {other:?}"),
+        };
+        assert_eq!(mode, RenderMode::Html);
+        assert!(preview_matches_current_drafts(&state, mode, &rules));
+        state.rendering = RenderMode::Browser;
+        state.extraction_drafts[0]
+            .name
+            .replace_text("Renamed after capture");
+        state.extraction_drafts.remove(1);
+        assert!(
+            !preview_matches_current_drafts(&state, mode, &rules),
+            "draft edits invalidate the old preview without relabeling it"
+        );
+        let names = rules
+            .iter()
+            .map(|rule| rule.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Price", "Primary link"]);
     }
 
     #[test]
@@ -8770,7 +11675,11 @@ mod tests {
             canonical: String::new(),
             images: 0,
             images_missing_alt: 0,
-            links: Vec::new(),
+            links: Vec::new().into(),
+            link_evidence: Vec::new().into(),
+            link_evidence_limit: String::new(),
+            extraction: Vec::new().into(),
+            extraction_limit: String::new(),
             indexability: assessment,
         };
         assert_eq!(page.indexability.label, Label::NotAssessed);
@@ -8831,7 +11740,7 @@ mod tests {
             .find(|page| page.url.ends_with("/nofollow"))
             .expect("incomplete browser fixture")
             .clone();
-        page.links = vec!["https://example.com/missing-target".into()];
+        page.links = Arc::new(vec!["https://example.com/missing-target".into()]);
         let mut broken = page.clone();
         broken.url = "https://example.com/missing-target".into();
         broken.status = 404;
@@ -8901,7 +11810,11 @@ mod tests {
             canonical: String::new(),
             images: 0,
             images_missing_alt: 0,
-            links: Vec::new(),
+            links: Vec::new().into(),
+            link_evidence: Vec::new().into(),
+            link_evidence_limit: String::new(),
+            extraction: Vec::new().into(),
+            extraction_limit: String::new(),
             indexability: assessment,
         };
         assert_eq!(page.indexability.label, Label::NotAssessed);
@@ -9761,14 +12674,14 @@ mod tests {
         let template = crawl::sample_pages()[0].clone();
         let mut hub = template.clone();
         hub.url = "https://example.com/hub".into();
-        hub.links = vec![
+        hub.links = Arc::new(vec![
             "https://example.com/healthy".into(),
             "https://example.com/late".into(),
             "https://example.com/healthy".into(),
-        ];
+        ]);
         let mut healthy = template.clone();
         healthy.url = hub.links[0].clone();
-        healthy.links.clear();
+        Arc::make_mut(&mut healthy.links).clear();
         let mut state = init();
         set_pages(
             &mut state,
@@ -9796,10 +12709,10 @@ mod tests {
         let mut late = template.clone();
         late.url = hub.links[1].clone();
         late.status = 404;
-        late.links.clear();
+        Arc::make_mut(&mut late.links).clear();
         let mut source = template;
         source.url = "https://example.com/source".into();
-        source.links = vec![hub.url.clone(), hub.url.clone()];
+        source.links = Arc::new(vec![hub.url.clone(), hub.url.clone()]);
         let (tx, rx) = mpsc::channel();
         tx.send(CrawlEvent::Page(Box::new(late))).unwrap();
         tx.send(CrawlEvent::Page(Box::new(source.clone()))).unwrap();
@@ -9893,21 +12806,23 @@ mod tests {
         let mut hub = template.clone();
         hub.url = hub_url.clone();
         hub.title = "Outbound hub title that is long enough".into();
-        hub.links = (0..50)
-            .map(|index| format!("https://example.com/target-{index}"))
-            .collect();
-        hub.links.push(broken_url.clone());
+        hub.links = Arc::new(
+            (0..50)
+                .map(|index| format!("https://example.com/target-{index}"))
+                .collect::<Vec<_>>(),
+        );
+        Arc::make_mut(&mut hub.links).push(broken_url.clone());
         let mut pages = vec![hub];
         for index in 0..50 {
             let mut target = template.clone();
             target.url = format!("https://example.com/target-{index}");
-            target.links.clear();
+            Arc::make_mut(&mut target.links).clear();
             pages.push(target);
         }
         let mut broken = template.clone();
         broken.url = broken_url.clone();
         broken.status = 404;
-        broken.links.clear();
+        Arc::make_mut(&mut broken.links).clear();
         pages.push(broken);
 
         let mut state = init();
@@ -9957,10 +12872,12 @@ mod tests {
         hub.h1s = (0..1000)
             .map(|index| format!("Hub heading {index}"))
             .collect();
-        hub.links = (0..50)
-            .map(|index| format!("https://example.com/source-{index}"))
-            .collect();
-        hub.links.push(broken_url.clone());
+        hub.links = Arc::new(
+            (0..50)
+                .map(|index| format!("https://example.com/source-{index}"))
+                .collect::<Vec<_>>(),
+        );
+        Arc::make_mut(&mut hub.links).push(broken_url.clone());
         let mut pages = vec![hub];
         for index in 0..50 {
             let mut source = template.clone();
@@ -9971,7 +12888,7 @@ mod tests {
                 format!("Source title {index}")
             };
             source.h1s = vec![format!("Source heading {index}")];
-            source.links = vec![hub_url.clone()];
+            source.links = Arc::new(vec![hub_url.clone()]);
             pages.push(source);
         }
         let mut broken = template.clone();
@@ -10519,9 +13436,11 @@ mod tests {
                 page.words = index % 900;
                 page.images = index % 8;
                 page.images_missing_alt = index % 5;
-                page.links = (1..=3)
-                    .map(|step| format!("https://example.com/page-{}", index + step * 7))
-                    .collect();
+                page.links = Arc::new(
+                    (1..=3)
+                        .map(|step| format!("https://example.com/page-{}", index + step * 7))
+                        .collect::<Vec<_>>(),
+                );
                 page
             })
             .collect()
@@ -10681,7 +13600,7 @@ mod tests {
             rt.update(|state: &mut State, _tx: &mut Tx| {
                 for page in &mut state.pages {
                     if page.url != hub_url && !page.links.contains(&hub_url) {
-                        page.links.push(hub_url.clone());
+                        Arc::make_mut(&mut page.links).push(hub_url.clone());
                     }
                 }
                 state.audit = Audit::from_pages(&state.pages);
@@ -10724,8 +13643,12 @@ mod tests {
             // A heavy outbound selection exercises stable broken-first lookup without an
             // O(pages × targets) sort key. It has no pre-change outbound baseline.
             rt.update(|state: &mut State, _| {
-                let links = state.pages.iter().map(|page| page.url.clone()).collect();
-                state.pages[0].links = links;
+                let links = state
+                    .pages
+                    .iter()
+                    .map(|page| page.url.clone())
+                    .collect::<Vec<_>>();
+                state.pages[0].links = Arc::new(links);
                 state.audit = Audit::from_pages(&state.pages);
                 invalidate_inspector(state);
                 state.relation_pages.outbound = 0;

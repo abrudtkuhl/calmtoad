@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **See the exact links behind a finding.** The Links tab now switches between Pages and Link evidence. Evidence keeps repeated anchors, fragments, invalid schemes, robots/budget skips, source/rendered stages and checked destination facts. An opt-in **Check external links and documents** pass checks external anchors and same-host document downloads with bounded robots-aware requests; document contents are never crawled.
+- **Export a complete content inventory.** Overview and Internal offer **Export inventory CSV…** for all captured URLs or the visible Internal set. One row per URL carries response, capture, content, indexability, link coverage, run context and custom-extraction columns so the CSV needs no joins.
+- **Extract custom CSS fields.** Add up to 20 named Text or Attribute rules with First/All matching, validate and save them locally, preview one URL without crawling further, and see retained values in the Internal inspector and inventory. Browser rules use rendered HTML and report unavailable rather than substituting source HTML.
+
+### Improved
+
+- Link evidence and the inventory remain bounded during streaming and large crawls; existing page-level CSV schemas are unchanged.
+- Inventory export can run during a crawl from a labeled immutable snapshot. Heavy page evidence is shared, preparation is chunked across UI frames, and projection, encoding, and writing run in the background.
+- Completed extraction previews keep their captured mode and rule definitions; later draft edits mark the preview stale instead of relabeling it.
+
+### Fixed
+
+- The optional link evidence cap no longer shortens ordinary page discovery, and overlong hrefs are declined rather than fetched as truncated destinations.
+- Optional link checks treat unreadable robots policy as unknown/blocked for the whole origin, revalidate redirects against internal page limits, and enforce cancellation plus a 30-second chain deadline, including slow robots reads and long crawl delays.
+- Extraction reports value truncation and missing attributes honestly, keeps later All-mode matches, and rejects duplicate rule IDs before capture or export.
+- Closing the window or installing an update now owns and cancels extraction preview and inventory work. Inventory preparation, save dialog, and file writing are tracked states; updates wait for all of them, and cancelled writes leave an existing destination untouched.
+- Oversized robots policies are explicit unknown/blocked, per-origin Retry-After now delays later checks, and shared redirect terminals are fetched once while each source keeps its own chain.
+- Cancelling the final optional check now stops the run, and Browser rendered/source evidence shares one 10,000-occurrence page cap without shortening discovery.
+
 User-facing changes are recorded here as work ships. Versions without a release
 date are being prepared for release.
 
