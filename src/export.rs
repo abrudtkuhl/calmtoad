@@ -12,6 +12,25 @@ pub fn to_csv(headers: &[&str], rows: &[Vec<String>]) -> String {
     output
 }
 
+/// Encode CSV with a cancellation checkpoint every 64 rows. `None` means the caller
+/// cancelled before the complete string was produced; no partial destination is written here.
+pub fn to_csv_cancellable(
+    headers: &[&str],
+    rows: &[Vec<String>],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    let mut output = String::new();
+    write_record(&mut output, headers.iter().copied());
+    for (index, row) in rows.iter().enumerate() {
+        if index % 64 == 0 && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        write_record(&mut output, row.iter().map(String::as_str));
+    }
+    (!cancel.load(Ordering::Relaxed)).then_some(output)
+}
+
 fn write_record<'a>(output: &mut String, fields: impl IntoIterator<Item = &'a str>) {
     for (index, field) in fields.into_iter().enumerate() {
         if index > 0 {

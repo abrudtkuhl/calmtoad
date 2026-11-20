@@ -673,6 +673,9 @@ fn browser_extraction_uses_the_rendered_dom_not_source_html() {
     assert_eq!(page.extraction[0].state, ExtractionState::Matched);
     assert_eq!(page.extraction[0].values, vec!["Hydrated heading"]);
     assert_eq!(page.extraction[0].stage, Some(EvidenceStage::Rendered));
+    assert!(page.content.exact_eligible);
+    assert_eq!(page.content.stage, EvidenceStage::Rendered);
+    assert!(page.content.excerpt.contains("hydrated heading"));
 }
 
 #[test]

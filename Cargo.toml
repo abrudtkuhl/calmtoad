@@ -1,6 +1,6 @@
 [package]
 name = "calmtoad"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "A small SEO spider: crawl one host, read its sitemaps, and audit titles, meta descriptions, H1s, response codes, canonicals, images and links."
 publish = false
@@ -9,6 +9,7 @@ publish = false
 base64 = "0.22"
 chromiumoxide = "0.9.1"
 flate2 = "1.1.11"
+ego-tree = "0.10"
 futures-util = "0.3"
 httpdate = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "io-util", "process", "sync", "macros"] }

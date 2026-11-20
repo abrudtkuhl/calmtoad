@@ -236,6 +236,10 @@ Links keeps its existing Pages table and adds a compact **Pages / Link evidence*
 
 Overview and Internal expose a compact **Export inventory…** action. A temporary scope row offers **All captured URLs** (default) or **Visible Internal URLs**, then a notice says the immutable snapshot is being prepared and the native save dialog follows when it is ready. The export may run during a crawl; its snapshot column says **in-progress** and records the capture time. The inventory is one repeated-context row per captured URL; it is not a second table or a permanent export toolbar.
 
+### Duplicate content
+
+Internal adds a compact **URLs / Duplicate content** switch in the results toolbar; it is not a new top-level tab. Duplicate content has **Same text / Similar / Not compared** controls with counts, a short coverage/status summary, its own search, sort, selection and export. Same-text rows show a representative URL, matching URL count, selected-text length and capture stage; select a row to inspect the hash, scope and a bounded member list with pagination and page actions. Similar rows show two URLs, verified overlap and exact-member counts; the inspector shows stage, scope, token counts, side-by-side excerpts, expandable exact memberships and the approximate-candidate caveat. Not compared explains the URL-specific eligibility or limit reason. The table stays full-bleed and 30px rows at 880px; long URLs truncate but copy/open retain the full value.
+
 ### Custom extraction
 
 **Custom extraction…** opens a compact scrolling rule editor under the command bar: name, selector, Text/Attribute and First/All, with an attribute field when needed, errors beside the rule, and a one-page **Test on URL** preview with Stop. It is a disclosure, not a new tab or modal. A completed preview names the mode actually captured and the rule definitions actually used; editing drafts afterward marks the old preview stale rather than changing its labels. The Internal inspector shows a **Custom extraction** disclosure with retained rule values, stage and state. Values are monospaced measurements only where numeric; extracted page text remains sans.

@@ -2081,6 +2081,7 @@ mod tests {
             link_evidence_limit: String::new(),
             extraction: Vec::new().into(),
             extraction_limit: String::new(),
+            content: std::sync::Arc::new(crate::content::ContentEvidence::default()),
             indexability: assessment,
         };
         report.observe_page(&page);

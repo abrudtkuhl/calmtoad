@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use scraper::{ElementRef, Html, Node};
 use url::Url;
 
+use crate::content::{self, ContentBudget, ContentEvidence};
 use crate::extract::{self, ExtractionOutcome};
 use crate::indexability::{
     self, Assessment, CanonicalDeclaration, CaptureInfo, CaptureMode, EvidenceStage,
@@ -151,6 +152,8 @@ pub struct Page {
     pub extraction: Arc<Vec<ExtractionOutcome>>,
     /// Nonempty when extraction stopped at a per-page or per-run cap.
     pub extraction_limit: String,
+    /// Duplicate-content evidence for the selected capture, shared across clones.
+    pub content: Arc<ContentEvidence>,
     /// The one evidence-backed indexability assessment every view reads.
     pub indexability: Assessment,
 }
@@ -1888,6 +1891,7 @@ fn crawl_engine(
 
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::channel::<EngineEvent>();
+        let content_budget = Arc::new(ContentBudget::default());
 
         for _ in 0..workers {
             let tx = tx.clone();
@@ -1896,6 +1900,7 @@ fn crawl_engine(
             let fetch = &fetch;
             let browser_allowed = browser_allowed.clone();
             let browser = browser.as_ref();
+            let content_budget = content_budget.clone();
             scope.spawn(move || {
                 loop {
                     let (url, depth) = {
@@ -1923,7 +1928,7 @@ fn crawl_engine(
                                     job.renderer
                                         .render(&url, allowed.clone(), job.cancel.clone());
                                 let (fetched, parsed, source, capture_info) =
-                                    browser_page(&capture);
+                                    browser_page(&capture, &content_budget, Some(cancel));
                                 let applicable =
                                     capture.status == 200 && is_html(&capture.content_type, "");
                                 let partial = !capture_info.is_complete();
@@ -1943,10 +1948,20 @@ fn crawl_engine(
                                 )
                             } else {
                                 let fetched = fetch(&url);
+                                let complete = fetched.status == 200
+                                    && fetched.error.is_empty()
+                                    && is_html(&fetched.content_type, &fetched.body)
+                                    && fetched.read == ReadState::Complete;
                                 let parsed = if fetched.status == 200
                                     && is_html(&fetched.content_type, &fetched.body)
                                 {
-                                    Some(parse_html(&fetched.body))
+                                    Some(parse_html_staged(
+                                        &fetched.body,
+                                        EvidenceStage::Document,
+                                        &content_budget,
+                                        complete,
+                                        Some(cancel),
+                                    ))
                                 } else {
                                     None
                                 };
@@ -2473,6 +2488,24 @@ fn crawl_engine(
                 }
             }
 
+            let content_stage = if capture.mode == crate::indexability::CaptureMode::Browser {
+                EvidenceStage::Rendered
+            } else {
+                EvidenceStage::Document
+            };
+            let content = parsed
+                .as_ref()
+                .map(|parsed| Arc::new(parsed.content.clone()))
+                .unwrap_or_else(|| {
+                    Arc::new(ContentEvidence::ineligible(
+                        if content_stage == EvidenceStage::Rendered {
+                            "Rendered DOM unavailable; source fallback is not used for content comparison"
+                        } else {
+                            "No complete HTML document"
+                        },
+                        content_stage,
+                    ))
+                });
             let had_html = parsed.is_some();
             let (title, meta_description, h1s, words, images, images_missing_alt, mut directives) =
                 match parsed {
@@ -2561,6 +2594,7 @@ fn crawl_engine(
                 link_evidence_limit,
                 extraction: Arc::new(extraction_results),
                 extraction_limit,
+                content,
                 indexability,
             };
             sitemap_report.observe_page(&page);
@@ -2728,6 +2762,7 @@ struct Parsed {
     canonicals: Vec<Option<String>>,
     images: usize,
     images_missing_alt: usize,
+    content: ContentEvidence,
 }
 
 /// The counts the audits read out of a parsed document.
@@ -2777,7 +2812,11 @@ fn is_word_block(name: &str) -> bool {
 /// parsed for evidence that scripts may have removed, and is used for link discovery only when no
 /// rendered DOM exists. An incomplete capture therefore keeps its source evidence without
 /// pretending the source was a completed rendered audit.
-fn browser_page(capture: &Capture) -> (Fetched, Option<Parsed>, Option<Parsed>, CaptureInfo) {
+fn browser_page(
+    capture: &Capture,
+    content_budget: &ContentBudget,
+    cancel: Option<&AtomicBool>,
+) -> (Fetched, Option<Parsed>, Option<Parsed>, CaptureInfo) {
     let mut fetched = Fetched {
         status: capture.status,
         content_type: capture.content_type.clone(),
@@ -2801,11 +2840,25 @@ fn browser_page(capture: &Capture) -> (Fetched, Option<Parsed>, Option<Parsed>, 
     let mut parsed = None;
     let mut source_parsed = None;
     if capture.status == 200 && is_html(&capture.content_type, "") {
+        let capture_info = CaptureInfo::browser(capture);
+        let complete = capture_info.is_complete();
         if let Some(body) = capture.rendered_html.as_deref() {
-            parsed = Some(parse_html_staged(body, EvidenceStage::Rendered));
+            parsed = Some(parse_html_staged(
+                body,
+                EvidenceStage::Rendered,
+                content_budget,
+                complete,
+                cancel,
+            ));
         }
         if let Some(body) = capture.source_html.as_deref() {
-            source_parsed = Some(parse_html_staged(body, EvidenceStage::Document));
+            source_parsed = Some(parse_html_staged(
+                body,
+                EvidenceStage::Document,
+                content_budget,
+                false,
+                cancel,
+            ));
         }
         // Content completeness follows the rendered DOM. Source-only captures remain available
         // for evidence inspection but are not completed content audits.
@@ -2861,10 +2914,24 @@ fn anchor_text(element: ElementRef<'_>) -> String {
 }
 
 fn parse_html(body: &str) -> Parsed {
-    parse_html_staged(body, EvidenceStage::Document)
+    // Parsing-only callers (tests and the benchmark gate) do not need content evidence.
+    // Real crawl workers use `parse_html_staged` with the capture-completeness decision.
+    parse_html_staged(
+        body,
+        EvidenceStage::Document,
+        &ContentBudget::default(),
+        false,
+        None,
+    )
 }
 
-fn parse_html_staged(body: &str, stage: EvidenceStage) -> Parsed {
+fn parse_html_staged(
+    body: &str,
+    stage: EvidenceStage,
+    content_budget: &ContentBudget,
+    content_complete: bool,
+    content_cancel: Option<&AtomicBool>,
+) -> Parsed {
     let doc = Html::parse_document(body);
 
     let mut title: Option<String> = None;
@@ -2977,6 +3044,13 @@ fn parse_html_staged(body: &str, stage: EvidenceStage) -> Parsed {
         }
     }
 
+    let content = content::extract_with_cancel(
+        &doc,
+        stage,
+        content_complete,
+        content_budget,
+        content_cancel,
+    );
     Parsed {
         title: title.unwrap_or_default(),
         meta,
@@ -2990,6 +3064,7 @@ fn parse_html_staged(body: &str, stage: EvidenceStage) -> Parsed {
         canonicals,
         images,
         images_missing_alt,
+        content,
     }
 }
 
@@ -3526,6 +3601,7 @@ pub fn sample_pages() -> Vec<Page> {
         link_evidence_limit: String::new(),
         extraction: Arc::new(Vec::new()),
         extraction_limit: String::new(),
+        content: Arc::new(ContentEvidence::default()),
         indexability: Assessment::default(),
     };
     let ok_meta =
@@ -3676,6 +3752,7 @@ pub fn indexability_sample_pages() -> Vec<Page> {
         link_evidence_limit: String::new(),
         extraction: Arc::new(Vec::new()),
         extraction_limit: String::new(),
+        content: Arc::new(ContentEvidence::default()),
         indexability: Assessment::default(),
     };
     let generic = |raw: &str| indexability::parse_meta_directive("robots", raw).unwrap();
@@ -3972,11 +4049,12 @@ mod tests {
             state: RenderState::Captured,
             ..Capture::default()
         };
-        let (_, parsed, source, info) = browser_page(&capture);
+        let (_, parsed, source, info) = browser_page(&capture, &ContentBudget::default(), None);
         assert!(parsed.is_none(), "no rendered DOM is audited");
         let source = source.expect("source fallback is retained");
         assert_eq!(source.anchors.len(), 1);
         assert_eq!(source.anchors[0].href, "/from-source");
+        assert!(!source.content.exact_eligible);
         assert!(!info.is_complete(), "the HTML capture remains incomplete");
     }
 

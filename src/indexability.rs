@@ -55,7 +55,7 @@ pub enum EvidenceSource {
 }
 
 /// Which capture produced a piece of evidence.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EvidenceStage {
     /// The HTML response body, or the browser's pre-script source capture.
     #[default]

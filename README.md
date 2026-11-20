@@ -48,6 +48,8 @@ To try it, open Calm Toad, enter `https://pmprompt.com/`, and press **Crawl**.
 
 The **Links** tab has **Pages** and **Link evidence** views. Link evidence keeps every observed anchor occurrence, including repeated destinations, fragments, invalid schemes and links skipped by robots or budgets. Turn on **Check external links and documents** in the crawl options disclosure to check external anchors and document downloads such as PDFs without downloading their contents or crawling further. Checks are bounded and respect robots.txt and per-origin pacing; a restricted or rate-limited response is labeled as such, not guessed as deleted.
 
+Internal also offers **URLs / Duplicate content**. Same text finds normalized exact groups; Similar shows verified near-pair evidence from a bounded MinHash/LSH search; Not compared explains short, oversized, incomplete or resource-limited pages. Results are comparisons of captured pages only, with no extra requests; “No similar pairs found” never means that no duplicate content exists anywhere.
+
 **Overview** shows finding groups and coverage for the current crawl. Open a group to review matching URLs in its table, or choose **Open URL table** to inspect all captured pages. Incomplete checks and sitemap discovery problems remain visible alongside confirmed findings.
 
 ![Overview of an example crawl with partial sitemap coverage](assets/overview.png)

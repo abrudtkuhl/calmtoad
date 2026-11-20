@@ -3,6 +3,20 @@
 User-facing changes are recorded here as work ships. Versions without a release
 date are being prepared for release.
 
+## [Unreleased]
+
+## [0.8.0] - 2026-11-20
+
+### Added
+
+- **Find duplicate and similar page content.** Open **Internal → Duplicate content** to review pages with the same normalized text and similar-page pairs, beyond duplicate titles and descriptions.
+- **Inspect the evidence behind each match.** Compare captured text excerpts, matching URLs, text overlap and capture provenance. HTML and Browser captures remain separate, and incomplete or resource-limited comparisons are explained.
+- **Export content comparisons.** Save same-text group members, similar-page pairs or URLs that could not be compared as CSV, using the current search and sort order.
+
+### Improved
+
+- Content comparison and CSV preparation run in the background with cancellation and bounded work. Comparisons reuse the pages already captured locally; they make no additional requests and do not require a cloud account.
+
 ## [0.7.0] - 2026-11-19
 
 ### Added

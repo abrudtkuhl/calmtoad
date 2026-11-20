@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use calmtoad::content::{self, ContentAnalysis, ContentEvidence, ContentInput};
 use calmtoad::crawl;
 use calmtoad::crawl::{
     Audit, ContentCheck, Counts, CrawlOutcome, DEFAULT_MAX_PAGES, Limits, MAX_DEPTH, Page,
@@ -38,6 +39,7 @@ use rune_kit::{
     Button, ButtonVariant, Cell, Checkbox, ControlSize, IconButton, IconButtonVariant, Kit,
     SegmentedControl, SortDir, Table, TableColumn, TableState, TableStyle,
 };
+use scraper::Html;
 
 mod theme;
 
@@ -71,6 +73,29 @@ enum SitemapView {
 enum LinksView {
     Pages,
     Evidence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InternalView {
+    Urls,
+    DuplicateContent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuplicateSubview {
+    SameText,
+    Similar,
+    NotCompared,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContentPhase {
+    Idle,
+    Preparing,
+    Running,
+    Ready,
+    Cancelled,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -427,6 +452,8 @@ struct OverviewCounts {
     sitemap_file_findings: usize,
     link_findings: usize,
     link_incomplete: usize,
+    content_same_urls: usize,
+    content_similar_urls: usize,
 }
 
 impl OverviewCounts {
@@ -444,6 +471,8 @@ impl OverviewCounts {
 
     fn has_findings(self) -> bool {
         self.groups().iter().any(|(_, count)| *count > 0)
+            || self.content_same_urls > 0
+            || self.content_similar_urls > 0
     }
 }
 
@@ -515,6 +544,7 @@ fn overview_counts(
     counts: &Counts,
     sitemap: &SitemapReport,
     link_checks: &HashMap<String, LinkCheckResult>,
+    content: Option<&ContentAnalysis>,
 ) -> OverviewCounts {
     OverviewCounts {
         pages: counts.pages,
@@ -551,6 +581,8 @@ fn overview_counts(
                     .is_none_or(|check| check.state.is_incomplete())
             })
             .count(),
+        content_same_urls: content.map_or(0, ContentAnalysis::same_text_affected),
+        content_similar_urls: content.map_or(0, ContentAnalysis::similar_affected),
     }
 }
 
@@ -831,6 +863,26 @@ struct InventoryWriteJob {
     temp_path: PathBuf,
 }
 
+struct ContentPrepareJob {
+    source_indices: Vec<usize>,
+    next: usize,
+    items: Vec<ContentInput>,
+    epoch: u64,
+    generation: u64,
+}
+
+struct ContentJob {
+    rx: mpsc::Receiver<ContentAnalysis>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContentRowRef {
+    Group(usize),
+    Pair(usize),
+    NotCompared(usize),
+}
+
 struct State {
     url: TextEdit,
     rendering: RenderMode,
@@ -913,6 +965,23 @@ struct State {
     inventory_write: Option<InventoryWriteJob>,
     pages_epoch: u64,
     inventory_dialog_open: bool,
+    internal_view: InternalView,
+    duplicate_subview: DuplicateSubview,
+    duplicate_view: ViewState,
+    content_phase: ContentPhase,
+    content_analysis: Option<Arc<ContentAnalysis>>,
+    content_prepare: Option<ContentPrepareJob>,
+    content_job: Option<ContentJob>,
+    content_export_job: Option<ContentExportJob>,
+    content_message: String,
+    content_generation: u64,
+    content_members_page: usize,
+    content_pair_left_open: bool,
+    content_pair_right_open: bool,
+    content_rows: Vec<ContentRowRef>,
+    content_row_keys: Vec<String>,
+    content_visible: Vec<usize>,
+    content_search: Vec<String>,
     /// A short notice from search, selection or clipboard actions.
     action_notice: Option<String>,
     max_pages: usize,
@@ -1024,6 +1093,23 @@ fn init() -> State {
         inventory_write: None,
         pages_epoch: 0,
         inventory_dialog_open: false,
+        internal_view: InternalView::Urls,
+        duplicate_subview: DuplicateSubview::SameText,
+        duplicate_view: ViewState::new("url"),
+        content_phase: ContentPhase::Idle,
+        content_analysis: None,
+        content_prepare: None,
+        content_job: None,
+        content_export_job: None,
+        content_message: String::new(),
+        content_generation: 0,
+        content_members_page: 0,
+        content_pair_left_open: false,
+        content_pair_right_open: false,
+        content_rows: Vec::new(),
+        content_row_keys: Vec::new(),
+        content_visible: Vec::new(),
+        content_search: Vec::new(),
         action_notice: None,
         max_pages: DEFAULT_MAX_PAGES,
         job: None,
@@ -1064,12 +1150,18 @@ impl State {
         if self.tab == Tab::Links && self.links_view == LinksView::Evidence {
             return &self.link_view;
         }
+        if self.tab == Tab::Internal && self.internal_view == InternalView::DuplicateContent {
+            return &self.duplicate_view;
+        }
         &self.views[view_slot(self.tab, self.sitemap_view)]
     }
 
     fn view_mut(&mut self) -> &mut ViewState {
         if self.tab == Tab::Links && self.links_view == LinksView::Evidence {
             return &mut self.link_view;
+        }
+        if self.tab == Tab::Internal && self.internal_view == InternalView::DuplicateContent {
+            return &mut self.duplicate_view;
         }
         let slot = view_slot(self.tab, self.sitemap_view);
         &mut self.views[slot]
@@ -1093,7 +1185,8 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
     let inventory_changed = poll_inventory_prepare(state)
         | poll_inventory_export(state, tx)
         | poll_inventory_write(state);
-    if state.inventory_prepare.is_some() {
+    let content_changed = poll_content_analysis(state) | poll_content_export(state, tx);
+    if state.inventory_prepare.is_some() || state.content_prepare.is_some() {
         tx.wake_after(Duration::from_millis(1));
     }
     if state.crawl_more {
@@ -1102,7 +1195,212 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
     } else if let Some(wait) = deferred_counts_wait(state) {
         tx.wake_after(wait);
     }
-    browser_changed || update_changed || crawl_changed || preview_changed || inventory_changed
+    browser_changed
+        || update_changed
+        || crawl_changed
+        || preview_changed
+        || inventory_changed
+        || content_changed
+}
+
+fn cancel_content_analysis(state: &mut State, keep_worker: bool) {
+    if keep_worker {
+        if let Some(job) = &state.content_job {
+            job.cancel.store(true, Ordering::Relaxed);
+            state.content_phase = ContentPhase::Running;
+            state.content_message = "Stopping content comparison…".into();
+        } else if state.content_prepare.is_some() {
+            state.content_prepare = None;
+            state.content_phase = ContentPhase::Idle;
+            state.content_message = "Content comparison cancelled.".into();
+        }
+        return;
+    }
+    state.content_generation = state.content_generation.wrapping_add(1);
+    state.content_prepare = None;
+    if let Some(job) = state.content_job.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn start_content_analysis(state: &mut State) {
+    if state.pages.is_empty() {
+        state.content_phase = ContentPhase::Idle;
+        state.content_analysis = None;
+        state.content_message = String::new();
+        return;
+    }
+    cancel_content_analysis(state, false);
+    state.content_generation = state.content_generation.wrapping_add(1);
+    let generation = state.content_generation;
+    state.content_analysis = None;
+    state.overview.content_same_urls = 0;
+    state.overview.content_similar_urls = 0;
+    state.content_phase = ContentPhase::Preparing;
+    state.content_message = "Preparing content comparison…".into();
+    state.content_prepare = Some(ContentPrepareJob {
+        source_indices: (0..state.pages.len()).collect(),
+        next: 0,
+        items: Vec::with_capacity(state.pages.len()),
+        epoch: state.pages_epoch,
+        generation,
+    });
+}
+
+fn analyze_content_now(state: &mut State) {
+    cancel_content_analysis(state, false);
+    let generation = state.content_generation;
+    let inputs = state
+        .pages
+        .iter()
+        .map(|page| ContentInput {
+            url: page.url.clone(),
+            content: page.content.clone(),
+        })
+        .collect::<Vec<_>>();
+    let initial = inputs
+        .iter()
+        .map(|input| input.content.retained_bytes())
+        .sum::<usize>();
+    let analysis = content::analyze_with_budget(
+        inputs,
+        generation,
+        &AtomicBool::new(false),
+        &content::ContentBudget::with_used(initial),
+    );
+    state.content_message = content_coverage_message(&analysis);
+    state.overview.content_same_urls = analysis.same_text_affected();
+    state.overview.content_similar_urls = analysis.similar_affected();
+    state.content_analysis = Some(Arc::new(analysis));
+    state.content_phase = ContentPhase::Ready;
+}
+
+fn content_coverage_message(analysis: &ContentAnalysis) -> String {
+    let coverage = &analysis.coverage;
+    let mut text = format!(
+        "Compared {} of {} captured URLs · {} same-text groups · {} similar pairs",
+        coverage.exact_eligible, coverage.captured, coverage.exact_groups, coverage.retained_pairs
+    );
+    if coverage.near_too_short > 0
+        || coverage.near_too_large > 0
+        || coverage.near_resource_limited > 0
+    {
+        text.push_str(&format!(
+            " · near skipped: {} short, {} large, {} resource",
+            coverage.near_too_short, coverage.near_too_large, coverage.near_resource_limited
+        ));
+    }
+    if coverage.near_search_limited > 0 {
+        text.push_str(&format!(
+            " · {} near searches limited",
+            coverage.near_search_limited
+        ));
+    }
+    if coverage.cancelled {
+        text.push_str(" · stopped before near comparison finished");
+    } else if !coverage.limited_reasons.is_empty() {
+        text.push_str(" · comparison limited");
+    }
+    text
+}
+
+fn content_status_detail(state: &State) -> String {
+    let mut text = state.content_message.clone();
+    if let Some(analysis) = state.content_analysis.as_deref()
+        && !analysis.coverage.limited_reasons.is_empty()
+    {
+        text.push_str(" · ");
+        text.push_str(&analysis.coverage.limited_reasons.join("; "));
+    }
+    text
+}
+
+fn poll_content_analysis(state: &mut State) -> bool {
+    if let Some(mut job) = state.content_prepare.take() {
+        if job.epoch != state.pages_epoch {
+            state.content_phase = ContentPhase::Failed;
+            state.content_message =
+                "Crawl results changed while preparing content comparison. Start again.".into();
+            return true;
+        }
+        let mut remaining = 512_usize;
+        while remaining > 0 && job.next < job.source_indices.len() {
+            let Some(page) = state.pages.get(job.source_indices[job.next]) else {
+                state.content_phase = ContentPhase::Failed;
+                state.content_message =
+                    "Crawl results changed while preparing content comparison. Start again.".into();
+                return true;
+            };
+            job.items.push(ContentInput {
+                url: page.url.clone(),
+                content: page.content.clone(),
+            });
+            job.next += 1;
+            remaining -= 1;
+        }
+        if job.next < job.source_indices.len() {
+            state.content_prepare = Some(job);
+            return false;
+        }
+        let generation = job.generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (tx, rx) = mpsc::channel();
+        let waker = state.waker.clone();
+        state.content_job = Some(ContentJob { rx, cancel });
+        state.content_phase = ContentPhase::Running;
+        state.content_message = "Comparing content…".into();
+        std::thread::spawn(move || {
+            let initial = job
+                .items
+                .iter()
+                .map(|input| input.content.retained_bytes())
+                .sum::<usize>();
+            let analysis = content::analyze_with_budget(
+                job.items,
+                generation,
+                &worker_cancel,
+                &content::ContentBudget::with_used(initial),
+            );
+            let _ = tx.send(analysis);
+            if let Some(wake) = &waker {
+                wake();
+            }
+        });
+        return true;
+    }
+    if let Some(job) = state.content_job.take() {
+        match job.rx.try_recv() {
+            Ok(analysis) if analysis.generation == state.content_generation => {
+                state.content_message = content_coverage_message(&analysis);
+                state.content_phase = if analysis.coverage.cancelled {
+                    ContentPhase::Cancelled
+                } else {
+                    ContentPhase::Ready
+                };
+                state.overview.content_same_urls = analysis.same_text_affected();
+                state.overview.content_similar_urls = analysis.similar_affected();
+                state.content_analysis = Some(Arc::new(analysis));
+                if state.tab == Tab::Internal
+                    && state.internal_view == InternalView::DuplicateContent
+                {
+                    refresh_visible_forced(state);
+                }
+                return true;
+            }
+            Ok(_) => return false,
+            Err(mpsc::TryRecvError::Empty) => {
+                state.content_job = Some(job);
+                return false;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.content_phase = ContentPhase::Failed;
+                state.content_message = "Content comparison stopped without a result.".into();
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn poll_crawl_when_inventory_snapshot_is_idle(state: &mut State) -> bool {
@@ -1124,7 +1422,7 @@ fn poll_inventory_write(state: &mut State) -> bool {
         }
         Ok(InventoryWriteOutcome::Cancelled) => {
             state.export_notice = Some(Ok(
-                "Inventory export cancelled; the destination was left unchanged.".into(),
+                "Export cancelled; the destination was left unchanged.".into()
             ));
             true
         }
@@ -1159,6 +1457,7 @@ fn poll_inventory_export(state: &mut State, tx: &mut Tx) -> bool {
                 result.scope_text,
                 "content-inventory",
                 true,
+                "inventory",
             );
             true
         }
@@ -1522,6 +1821,9 @@ fn poll_crawl(state: &mut State) -> bool {
             // Keep a still-valid selection; otherwise the first visible row is chosen by
             // `sync_selection`. Never jump to a Page URL while Sitemap Files is showing.
             sync_selection(state);
+            if !state.pages.is_empty() {
+                start_content_analysis(state);
+            }
         }
         None => {
             state.job = Some(job);
@@ -1627,7 +1929,22 @@ fn can_install(state: &State) -> bool {
         && state.inventory_prepare.is_none()
         && state.inventory_write.is_none()
         && !state.inventory_dialog_open
+        && state.content_prepare.is_none()
+        && state.content_job.is_none()
+        && state.content_export_job.is_none()
         && matches!(state.update, UpdateUi::Ready(_))
+}
+
+fn export_writer_slot_available(state: &State) -> bool {
+    state.inventory_write.is_none() && !state.inventory_dialog_open
+}
+
+fn export_lifecycle_busy(state: &State) -> bool {
+    state.inventory_prepare.is_some()
+        || state.inventory_export_job.is_some()
+        || state.inventory_write.is_some()
+        || state.inventory_dialog_open
+        || state.content_export_job.is_some()
 }
 
 fn start_install(state: &mut State, tx: &mut Tx) {
@@ -1728,8 +2045,9 @@ fn start_crawl(state: &mut State) {
         || state.inventory_export_job.is_some()
         || state.inventory_write.is_some()
         || state.inventory_dialog_open
+        || state.content_export_job.is_some()
     {
-        state.message = "Finish the inventory export before starting a crawl.".into();
+        state.message = "Finish the export before starting a crawl.".into();
         return;
     }
     let (seed, limits) = match validate_start(state) {
@@ -1752,6 +2070,12 @@ fn start_crawl(state: &mut State) {
         state.message = "Fix the custom extraction rule errors before crawling.".into();
         return;
     }
+    cancel_content_analysis(state, false);
+    state.content_analysis = None;
+    state.content_phase = ContentPhase::Idle;
+    state.content_message = String::new();
+    state.overview.content_same_urls = 0;
+    state.overview.content_similar_urls = 0;
     state.extraction_rules = extraction_rules;
     state.field_errors.clear();
     state.run_outcome = None;
@@ -1899,6 +2223,13 @@ fn stop_owned_work(state: &mut State) {
         job.cancel.store(true, Ordering::Relaxed);
         let _ = std::fs::remove_file(&job.temp_path);
     }
+    state.content_prepare = None;
+    if let Some(job) = &state.content_job {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+    if let Some(job) = &state.content_export_job {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 fn read_is_incomplete(status: u16, content_type: &str, read: ReadState) -> bool {
@@ -2035,6 +2366,10 @@ fn sitemap_file_has_finding(file: &SitemapFile) -> bool {
 }
 
 fn visible_id_ref(state: &State, row: usize) -> Option<&str> {
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        let row = *state.content_visible.get(row)?;
+        return state.content_row_keys.get(row).map(String::as_str);
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         let row = *state.link_visible.get(row)?;
         return state.link_row_keys.get(row).map(String::as_str);
@@ -2068,6 +2403,26 @@ fn visible_id(state: &State, row: usize) -> Option<String> {
 /// selection was filtered out and clearing it when nothing is visible.
 fn sync_selection(state: &mut State) {
     if state.tab == Tab::Overview {
+        return;
+    }
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        let count = visible_len(state);
+        let chosen = state
+            .duplicate_view
+            .selected
+            .clone()
+            .filter(|id| (0..count).any(|row| visible_id_ref(state, row) == Some(id.as_str())))
+            .or_else(|| visible_id(state, 0));
+        match chosen {
+            Some(id) => {
+                state.duplicate_view.selected = Some(id.clone());
+                state.table.select(id);
+            }
+            None => {
+                state.duplicate_view.selected = None;
+                state.table.clear_selection();
+            }
+        }
         return;
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
@@ -2132,6 +2487,10 @@ fn refresh_visible_forced(state: &mut State) {
 }
 
 fn refresh_visible_inner(state: &mut State, force: bool) {
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        refresh_content_visible_inner(state, force);
+        return;
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         refresh_link_visible_inner(state, force);
         return;
@@ -2183,6 +2542,243 @@ fn refresh_visible_inner(state: &mut State, force: bool) {
         apply_page_sort(state, force);
     }
     sync_selection(state);
+}
+
+fn content_row_search(analysis: &ContentAnalysis, row: ContentRowRef) -> String {
+    match row {
+        ContentRowRef::Group(index) => {
+            analysis
+                .groups
+                .get(index)
+                .map_or_else(String::new, |group| {
+                    let text = format!(
+                        "{} same normalized text {} {} {}",
+                        group.representative,
+                        group.stage.label(),
+                        group.scope.map_or("", content::ContentScope::label),
+                        group.hash_hex
+                    );
+                    text.to_lowercase()
+                })
+        }
+        ContentRowRef::Pair(index) => analysis.pairs.get(index).map_or_else(String::new, |pair| {
+            format!(
+                "{} {} {} {} {} {} {} {}",
+                pair.left,
+                pair.right,
+                pair.left_group,
+                pair.right_group,
+                pair.left_stage.label(),
+                pair.right_stage.label(),
+                pair.left_scope.map_or("", content::ContentScope::label),
+                pair.right_scope.map_or("", content::ContentScope::label)
+            )
+            .to_lowercase()
+        }),
+        ContentRowRef::NotCompared(index) => {
+            analysis
+                .not_compared
+                .get(index)
+                .map_or_else(String::new, |item| {
+                    format!(
+                        "{} {} {} {}",
+                        item.url,
+                        item.stage.label(),
+                        item.analysis_state.label(),
+                        item.reason
+                    )
+                    .to_lowercase()
+                })
+        }
+    }
+}
+
+fn matching_member_groups(
+    analysis: &ContentAnalysis,
+    needle: &str,
+) -> std::collections::BTreeSet<String> {
+    analysis
+        .member_groups
+        .iter()
+        .filter(|(url, _)| needle.is_empty() || url.contains(needle))
+        .flat_map(|(_, groups)| groups.iter().cloned())
+        .collect()
+}
+
+fn content_row_matches(
+    analysis: &ContentAnalysis,
+    row: ContentRowRef,
+    needle: &str,
+    member_groups: &std::collections::BTreeSet<String>,
+) -> bool {
+    if needle.is_empty() || content_row_search(analysis, row).contains(needle) {
+        return true;
+    }
+    match row {
+        ContentRowRef::Group(index) => analysis
+            .groups
+            .get(index)
+            .is_some_and(|group| member_groups.contains(&group.id)),
+        ContentRowRef::Pair(index) => analysis.pairs.get(index).is_some_and(|pair| {
+            member_groups.contains(&pair.left_group) || member_groups.contains(&pair.right_group)
+        }),
+        ContentRowRef::NotCompared(_) => false,
+    }
+}
+
+fn rebuild_content_rows(state: &mut State) {
+    state.content_rows.clear();
+    state.content_row_keys.clear();
+    state.content_search.clear();
+    let Some(analysis) = state.content_analysis.clone() else {
+        return;
+    };
+    let rows = match state.duplicate_subview {
+        DuplicateSubview::SameText => (0..analysis.groups.len())
+            .map(ContentRowRef::Group)
+            .collect::<Vec<_>>(),
+        DuplicateSubview::Similar => (0..analysis.pairs.len())
+            .map(ContentRowRef::Pair)
+            .collect::<Vec<_>>(),
+        DuplicateSubview::NotCompared => (0..analysis.not_compared.len())
+            .map(ContentRowRef::NotCompared)
+            .collect::<Vec<_>>(),
+    };
+    let (column, direction) = state.duplicate_view.sort.clone();
+    let query_active = !state.duplicate_view.query.text.trim().is_empty();
+    let mut keyed = rows
+        .into_iter()
+        .map(|row| {
+            let key = match row {
+                ContentRowRef::Group(index) => analysis
+                    .groups
+                    .get(index)
+                    .map(|group| group.id.clone())
+                    .unwrap_or_default(),
+                ContentRowRef::Pair(index) => analysis
+                    .pairs
+                    .get(index)
+                    .map(|pair| pair.id.clone())
+                    .unwrap_or_default(),
+                ContentRowRef::NotCompared(index) => analysis
+                    .not_compared
+                    .get(index)
+                    .map(|item| format!("not-{}", item.url))
+                    .unwrap_or_default(),
+            };
+            let search = if query_active {
+                content_row_search(&analysis, row)
+            } else {
+                String::new()
+            };
+            (row, key, search)
+        })
+        .collect::<Vec<_>>();
+    keyed.sort_by(|left, right| {
+        direction.apply(compare_content_rows(&analysis, left.0, right.0, &column))
+    });
+    for (row, key, search) in keyed {
+        state.content_rows.push(row);
+        state.content_row_keys.push(key);
+        state.content_search.push(search);
+    }
+}
+
+fn compare_content_rows(
+    analysis: &ContentAnalysis,
+    left: ContentRowRef,
+    right: ContentRowRef,
+    column: &str,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (ContentRowRef::Group(left), ContentRowRef::Group(right)) => {
+            let (Some(left), Some(right)) = (analysis.groups.get(left), analysis.groups.get(right))
+            else {
+                return std::cmp::Ordering::Equal;
+            };
+            match column {
+                "matches" => left.members.len().cmp(&right.members.len()),
+                "chars" => left.normalized_chars.cmp(&right.normalized_chars),
+                "stage" => left.stage.label().cmp(right.stage.label()),
+                _ => left.representative.cmp(&right.representative),
+            }
+        }
+        (ContentRowRef::Pair(left), ContentRowRef::Pair(right)) => {
+            let (Some(left), Some(right)) = (analysis.pairs.get(left), analysis.pairs.get(right))
+            else {
+                return std::cmp::Ordering::Equal;
+            };
+            match column {
+                "overlap" => left
+                    .score
+                    .partial_cmp(&right.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                "members" => (left.left_members + left.right_members)
+                    .cmp(&(right.left_members + right.right_members)),
+                "stage" => left.left_stage.label().cmp(right.left_stage.label()),
+                _ => left
+                    .left
+                    .cmp(&right.left)
+                    .then_with(|| left.right.cmp(&right.right)),
+            }
+        }
+        (ContentRowRef::NotCompared(left), ContentRowRef::NotCompared(right)) => {
+            let (Some(left), Some(right)) = (
+                analysis.not_compared.get(left),
+                analysis.not_compared.get(right),
+            ) else {
+                return std::cmp::Ordering::Equal;
+            };
+            match column {
+                "reason" => left.reason.cmp(&right.reason),
+                "stage" => left.stage.label().cmp(right.stage.label()),
+                _ => left.url.cmp(&right.url),
+            }
+        }
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn refresh_content_visible_inner(state: &mut State, _force: bool) {
+    rebuild_content_rows(state);
+    let needle = normalized_query(&state.duplicate_view.query.text);
+    let Some(analysis) = state.content_analysis.clone() else {
+        state.content_visible.clear();
+        return;
+    };
+    let member_groups = if needle.is_empty() {
+        std::collections::BTreeSet::new()
+    } else {
+        matching_member_groups(&analysis, &needle)
+    };
+    let mut matching = Vec::new();
+    for (index, row) in state.content_rows.iter().enumerate() {
+        if content_row_matches(&analysis, *row, &needle, &member_groups) {
+            matching.push(index);
+        }
+    }
+    state.content_visible = matching;
+    let total = state.content_rows.len();
+    state.view_counts = ViewCounts {
+        total,
+        findings: if state.duplicate_subview == DuplicateSubview::NotCompared {
+            0
+        } else {
+            total
+        },
+        incomplete: if state.duplicate_subview == DuplicateSubview::NotCompared {
+            total
+        } else {
+            0
+        },
+    };
+    sync_selection(state);
+}
+
+fn set_content_sort(state: &mut State, column: &str, direction: SortDir) {
+    state.duplicate_view.sort = (column.to_string(), direction);
+    state.table.set_sort(column, direction);
+    refresh_visible_forced(state);
 }
 
 fn refresh_link_visible_inner(state: &mut State, force: bool) {
@@ -2481,6 +3077,7 @@ fn refresh_counts(state: &mut State, force: bool) -> bool {
         &state.counts,
         &state.sitemap,
         &state.link_checks,
+        state.content_analysis.as_deref(),
     );
     state.counts_at = Some(Instant::now());
     state.counts_dirty = false;
@@ -2501,6 +3098,18 @@ fn deferred_counts_wait(state: &State) -> Option<Duration> {
 }
 
 fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
+    cancel_content_analysis(state, false);
+    if let Some(job) = state.content_export_job.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+    state.content_analysis = None;
+    state.content_phase = ContentPhase::Idle;
+    state.content_rows.clear();
+    state.content_row_keys.clear();
+    state.content_visible.clear();
+    state.content_search.clear();
+    state.overview.content_same_urls = 0;
+    state.overview.content_similar_urls = 0;
     state.pages_epoch = state.pages_epoch.wrapping_add(1);
     let seed = pages
         .first()
@@ -2557,6 +3166,29 @@ fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
     sort_pages(state);
 }
 
+fn sample_content(text: &str) -> Arc<ContentEvidence> {
+    Arc::new(content::extract(
+        &Html::parse_document(text),
+        EvidenceStage::Document,
+        true,
+        &content::ContentBudget::default(),
+    ))
+}
+
+fn install_sample_content(pages: &mut [Page]) {
+    for page in pages {
+        if page.status == 200 && page.content_type.contains("html") {
+            let text = format!(
+                "<main><h1>{}</h1><p>{}</p><p>{}</p></main>",
+                page.h1s.join(" "),
+                page.meta_description,
+                page.title
+            );
+            page.content = sample_content(&text);
+        }
+    }
+}
+
 fn load_sample(state: &mut State) {
     state.url.replace_text("https://example.com/");
     state.phase = RunPhase::Completed;
@@ -2565,11 +3197,10 @@ fn load_sample(state: &mut State) {
     state.sitemap_view = SitemapView::Urls;
     state.sitemap_discovering = false;
     state.sitemap = calmtoad::sitemap::sample_report();
-    set_pages(
-        state,
-        crawl::sample_pages(),
-        "9 pages on example.com".into(),
-    );
+    let mut pages = crawl::sample_pages();
+    install_sample_content(&mut pages);
+    set_pages(state, pages, "9 pages on example.com".into());
+    analyze_content_now(state);
     refresh_sitemap_visible(state);
 }
 
@@ -2581,9 +3212,11 @@ fn load_indexability_sample(state: &mut State) {
     state.sitemap_view = SitemapView::Urls;
     state.sitemap_discovering = false;
     state.sitemap = calmtoad::sitemap::sample_report();
-    let pages = crawl::indexability_sample_pages();
+    let mut pages = crawl::indexability_sample_pages();
+    install_sample_content(&mut pages);
     let message = format!("{} pages on example.com", pages.len());
     set_pages(state, pages, message);
+    analyze_content_now(state);
     state.table.set_sort("indexability", SortDir::Ascending);
     sort_pages(state);
     refresh_sitemap_visible(state);
@@ -2706,6 +3339,9 @@ fn link_occurrence_at(state: &State, row: usize) -> Option<&LinkOccurrence> {
 }
 
 fn visible_len(state: &State) -> usize {
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        return state.content_visible.len();
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return state.link_visible.len();
     }
@@ -2953,6 +3589,13 @@ fn tab_title(tab: Tab) -> &'static str {
 }
 
 fn active_title(state: &State) -> &'static str {
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        return match state.duplicate_subview {
+            DuplicateSubview::SameText => "Duplicate content · same text",
+            DuplicateSubview::Similar => "Duplicate content · similar",
+            DuplicateSubview::NotCompared => "Duplicate content · not compared",
+        };
+    }
     match (state.tab, state.sitemap_view) {
         (Tab::Links, _) if state.links_view == LinksView::Evidence => "Link evidence",
         (Tab::Sitemaps, SitemapView::Urls) => "Sitemap URLs",
@@ -3063,16 +3706,19 @@ fn focus_search_state(state: &mut State) -> bool {
         state.table.set_sort(column, dir);
         refresh_visible_forced(state);
     }
-    let has_data = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
-        !state.link_rows.is_empty()
-    } else if state.tab == Tab::Sitemaps {
-        match state.sitemap_view {
-            SitemapView::Urls => !state.sitemap.urls.is_empty(),
-            SitemapView::Files => !state.sitemap.files.is_empty(),
-        }
-    } else {
-        !state.pages.is_empty()
-    };
+    let has_data =
+        if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+            !state.content_rows.is_empty()
+        } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+            !state.link_rows.is_empty()
+        } else if state.tab == Tab::Sitemaps {
+            match state.sitemap_view {
+                SitemapView::Urls => !state.sitemap.urls.is_empty(),
+                SitemapView::Files => !state.sitemap.files.is_empty(),
+            }
+        } else {
+            !state.pages.is_empty()
+        };
     if !has_data {
         return false;
     }
@@ -4548,7 +5194,19 @@ fn overview_findings(k: &Kit, state: &State) -> El {
         );
     }
     if !counts.has_findings() {
-        let mut note = "No findings in completed checks.".to_string();
+        let mut note = if matches!(
+            state.content_phase,
+            ContentPhase::Preparing | ContentPhase::Running
+        ) {
+            "Content comparison is still pending; this is not an all-clear.".to_string()
+        } else if matches!(
+            state.content_phase,
+            ContentPhase::Cancelled | ContentPhase::Failed
+        ) {
+            "Content comparison did not finish; this is not an all-clear.".to_string()
+        } else {
+            "No findings in completed checks.".to_string()
+        };
         if counts.incomplete > 0 || matches!(state.phase, RunPhase::Stopped | RunPhase::Limited) {
             note.push_str(" Some checks did not complete; see coverage below.");
         }
@@ -4567,6 +5225,50 @@ fn overview_findings(k: &Kit, state: &State) -> El {
             continue;
         }
         rows = rows.child(overview_group_row(k, group, count));
+    }
+    if counts.content_same_urls > 0 {
+        rows = rows.child(overview_content_row(
+            k,
+            "overview-content-same",
+            format!(
+                "{} same-text {} need review",
+                counts.content_same_urls,
+                if counts.content_same_urls == 1 {
+                    "URL"
+                } else {
+                    "URLs"
+                }
+            ),
+            |state: &mut State| {
+                state.tab = Tab::Internal;
+                state.internal_view = InternalView::DuplicateContent;
+                state.duplicate_subview = DuplicateSubview::SameText;
+                state.duplicate_view.query.replace_text("");
+                refresh_visible_forced(state);
+            },
+        ));
+    }
+    if counts.content_similar_urls > 0 {
+        rows = rows.child(overview_content_row(
+            k,
+            "overview-content-similar",
+            format!(
+                "{} similar-content {} need review",
+                counts.content_similar_urls,
+                if counts.content_similar_urls == 1 {
+                    "URL"
+                } else {
+                    "URLs"
+                }
+            ),
+            |state: &mut State| {
+                state.tab = Tab::Internal;
+                state.internal_view = InternalView::DuplicateContent;
+                state.duplicate_subview = DuplicateSubview::Similar;
+                state.duplicate_view.query.replace_text("");
+                refresh_visible_forced(state);
+            },
+        ));
     }
     block.child(rows)
 }
@@ -4716,6 +5418,35 @@ fn overview_coverage(k: &Kit, state: &State) -> El {
             },
         ));
     }
+    if matches!(
+        state.content_phase,
+        ContentPhase::Preparing | ContentPhase::Running
+    ) {
+        gaps += 1;
+        rows = rows.child(coverage_note(
+            k,
+            "Content comparison is pending. Duplicate and near-duplicate coverage is not complete.",
+        ));
+    } else if matches!(
+        state.content_phase,
+        ContentPhase::Cancelled | ContentPhase::Failed
+    ) {
+        gaps += 1;
+        rows = rows.child(coverage_note(
+            k,
+            "Content comparison stopped before finishing. Exact grouping and any finished evidence are retained, but this is not a no-duplicate claim.",
+        ));
+    } else if state
+        .content_analysis
+        .as_deref()
+        .is_some_and(|analysis| !analysis.coverage.limited_reasons.is_empty())
+    {
+        gaps += 1;
+        rows = rows.child(coverage_note(
+            k,
+            "Content comparison reached a documented search or resource bound. Exact coverage remains separate from near coverage.",
+        ));
+    }
     if state.run.as_ref().is_some_and(|run| run.check_links)
         && counts.link_incomplete > 0
         && !state.phase.active()
@@ -4836,6 +5567,40 @@ fn overview_coverage_row(
         .key(key)
 }
 
+fn overview_content_row(
+    k: &Kit,
+    key: &'static str,
+    label: String,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
+    let small = k.ty.text_xsmall;
+    let muted = k.c.text_muted;
+    Button::new(label.clone())
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Regular)
+        .label_with(move |font, ink| {
+            row()
+                .w_full()
+                .min_w(0.0)
+                .gap(10.0)
+                .center_y()
+                .child(
+                    text(label.clone())
+                        .font(font)
+                        .color(ink)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .child(text("Show").font(small).color(muted))
+        })
+        .help("Review duplicate content evidence in this crawl")
+        .on_press(action)
+        .build(k)
+        .w_full()
+        .key(key)
+}
+
 fn overview_actions(k: &Kit, state: &State) -> El {
     let has_pages = !state.pages.is_empty();
     let mut row = row()
@@ -4872,7 +5637,8 @@ fn overview_actions(k: &Kit, state: &State) -> El {
                     !has_pages
                         || state.inventory_export_job.is_some()
                         || state.inventory_prepare.is_some()
-                        || state.inventory_write.is_some(),
+                        || state.inventory_write.is_some()
+                        || state.content_export_job.is_some(),
                 )
                 .help("Choose all captured URLs or the visible Internal URL set")
                 .on_press(|state: &mut State| state.inventory_scope_open = true)
@@ -4916,7 +5682,8 @@ fn inventory_scope_bar(k: &Kit, state: &State) -> El {
                 state.inventory_export_job.is_some()
                     || state.inventory_prepare.is_some()
                     || state.inventory_write.is_some()
-                    || state.inventory_dialog_open,
+                    || state.inventory_dialog_open
+                    || state.content_export_job.is_some(),
             )
             .on_press_tx(move |state: &mut State, tx: &mut Tx| {
                 state.inventory_scope_open = false;
@@ -5157,12 +5924,8 @@ fn build_inventory_csv(
 }
 
 fn start_inventory_export(state: &mut State, scope: InventoryScope) -> Result<usize, String> {
-    if state.inventory_export_job.is_some()
-        || state.inventory_prepare.is_some()
-        || state.inventory_write.is_some()
-        || state.inventory_dialog_open
-    {
-        return Err("An inventory export is already being prepared or written.".into());
+    if export_lifecycle_busy(state) {
+        return Err("Another export is already being prepared or written.".into());
     }
     if state.pages.is_empty() {
         return Err("No captured URLs to inventory.".into());
@@ -5397,9 +6160,153 @@ fn links_view_controls(k: &Kit, state: &State) -> El {
         ))
 }
 
+fn internal_view_controls(k: &Kit, state: &State) -> El {
+    let button = |label: &'static str, view: InternalView, key: &'static str| {
+        Button::new(label)
+            .variant(if state.internal_view == view {
+                ButtonVariant::Neutral
+            } else {
+                ButtonVariant::Ghost
+            })
+            .control_size(ControlSize::Small)
+            .on_press(move |state: &mut State| {
+                state.internal_view = view;
+                if view == InternalView::DuplicateContent
+                    && state.content_phase == ContentPhase::Idle
+                    && !state.pages.is_empty()
+                    && !state.phase.active()
+                {
+                    start_content_analysis(state);
+                }
+                let (column, dir) = state.view().sort.clone();
+                state.table.set_sort(column, dir);
+                refresh_visible_forced(state);
+            })
+            .build(k)
+            .key(key)
+    };
+    row()
+        .gap(1.0)
+        .center_y()
+        .child(button("URLs", InternalView::Urls, "internal-urls"))
+        .child(button(
+            "Duplicate content",
+            InternalView::DuplicateContent,
+            "internal-duplicates",
+        ))
+}
+
+fn duplicate_subview_controls(k: &Kit, state: &State) -> El {
+    let counts = state.content_analysis.as_deref().map(|analysis| {
+        (
+            analysis.groups.len(),
+            analysis.pairs.len(),
+            analysis.not_compared.len(),
+        )
+    });
+    let button = |label: String, subview: DuplicateSubview, key: &'static str| {
+        Button::new(label.clone())
+            .variant(if state.duplicate_subview == subview {
+                ButtonVariant::Neutral
+            } else {
+                ButtonVariant::Ghost
+            })
+            .control_size(ControlSize::Small)
+            .on_press(move |state: &mut State| {
+                state.duplicate_subview = subview;
+                state.content_members_page = 0;
+                state.content_pair_left_open = false;
+                state.content_pair_right_open = false;
+                refresh_visible_forced(state);
+            })
+            .build(k)
+            .key(key)
+    };
+    let (same, similar, not_compared) = counts.unwrap_or((0, 0, 0));
+    row()
+        .gap(1.0)
+        .center_y()
+        .child(button(
+            format!("Same text {same}"),
+            DuplicateSubview::SameText,
+            "content-same",
+        ))
+        .child(button(
+            format!("Similar {similar}"),
+            DuplicateSubview::Similar,
+            "content-similar",
+        ))
+        .child(button(
+            format!("Not compared {not_compared}"),
+            DuplicateSubview::NotCompared,
+            "content-not-compared",
+        ))
+}
+
+fn content_section_header(k: &Kit, state: &State) -> El {
+    let total = state.view_counts.total;
+    let shown = visible_len(state);
+    let noun = match state.duplicate_subview {
+        DuplicateSubview::SameText => "groups",
+        DuplicateSubview::Similar => "pairs",
+        DuplicateSubview::NotCompared => "URLs",
+    };
+    let mut summary = format!("{shown} of {total} {noun}");
+    if !state.content_message.is_empty() {
+        summary.push_str(&format!(" · {}", state.content_message));
+    }
+    row()
+        .w_full()
+        .h(40.0)
+        .px(GUTTER)
+        .center_y()
+        .gap(6.0)
+        .children(if state.internal_view == InternalView::DuplicateContent {
+            let mut controls = vec![duplicate_subview_controls(k, state)];
+            if matches!(
+                state.content_phase,
+                ContentPhase::Preparing | ContentPhase::Running
+            ) {
+                controls.push(
+                    Button::new("Stop comparing")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(|state: &mut State| cancel_content_analysis(state, true))
+                        .build(k)
+                        .key("content-stop"),
+                );
+            }
+            controls
+        } else {
+            Vec::new()
+        })
+        .child(
+            text(summary.clone())
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted)
+                .grow(1.0)
+                .min_w(40.0)
+                .truncate()
+                .help(summary),
+        )
+        .children(if state.internal_view == InternalView::DuplicateContent {
+            vec![internal_view_controls(k, state)]
+        } else {
+            Vec::new()
+        })
+        .child(run_details_button(k, state))
+        .children(search_field(k, state))
+        .child(export_button(k, state, shown))
+        .child(copy_urls_button(k, state, shown))
+        .child(details_toggle(k, state))
+}
+
 fn section_header(k: &Kit, state: &State) -> El {
     if state.tab == Tab::Sitemaps {
         return sitemap_section_header(k, state);
+    }
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        return content_section_header(k, state);
     }
     let total = state.view_counts.total;
     let shown = visible_len(state);
@@ -5452,6 +6359,11 @@ fn section_header(k: &Kit, state: &State) -> El {
                     }
                 )),
         )
+        .children(if state.tab == Tab::Internal {
+            vec![internal_view_controls(k, state)]
+        } else {
+            Vec::new()
+        })
         .child(run_details_button(k, state))
         .children(search_field(k, state))
         .child(check_filter(k, state))
@@ -5464,7 +6376,8 @@ fn section_header(k: &Kit, state: &State) -> El {
                         || state.inventory_export_job.is_some()
                         || state.inventory_prepare.is_some()
                         || state.inventory_write.is_some()
-                        || state.inventory_dialog_open)
+                        || state.inventory_dialog_open
+                        || state.content_export_job.is_some())
                     .help("Export a complete content inventory for all captured URLs or the visible Internal set")
                     .on_press(|state: &mut State| state.inventory_scope_open = true)
                     .build(k)
@@ -5498,6 +6411,13 @@ fn run_report_reason(state: &State) -> String {
 }
 
 fn run_view_noun(state: &State) -> &'static str {
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        return match state.duplicate_subview {
+            DuplicateSubview::SameText => "same-text groups",
+            DuplicateSubview::Similar => "similar pairs",
+            DuplicateSubview::NotCompared => "uncompared URLs",
+        };
+    }
     match state.tab {
         Tab::Links if state.links_view == LinksView::Evidence => "link occurrences",
         Tab::Sitemaps => match state.sitemap_view {
@@ -5533,16 +6453,19 @@ fn run_details_button(k: &Kit, state: &State) -> El {
 }
 
 fn search_field(k: &Kit, state: &State) -> Option<El> {
-    let has_data = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
-        !state.link_rows.is_empty()
-    } else if state.tab == Tab::Sitemaps {
-        match state.sitemap_view {
-            SitemapView::Urls => !state.sitemap.urls.is_empty(),
-            SitemapView::Files => !state.sitemap.files.is_empty(),
-        }
-    } else {
-        !state.pages.is_empty()
-    };
+    let has_data =
+        if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+            !state.content_rows.is_empty()
+        } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+            !state.link_rows.is_empty()
+        } else if state.tab == Tab::Sitemaps {
+            match state.sitemap_view {
+                SitemapView::Urls => !state.sitemap.urls.is_empty(),
+                SitemapView::Files => !state.sitemap.files.is_empty(),
+            }
+        } else {
+            !state.pages.is_empty()
+        };
     if !has_data {
         return None;
     }
@@ -5669,6 +6592,11 @@ fn sitemap_section_header(k: &Kit, state: &State) -> El {
                     }
                 )),
         )
+        .children(if state.tab == Tab::Internal {
+            vec![internal_view_controls(k, state)]
+        } else {
+            Vec::new()
+        })
         .child(run_details_button(k, state))
         .children(search_field(k, state))
         .child(check_filter(k, state))
@@ -5681,7 +6609,8 @@ fn sitemap_section_header(k: &Kit, state: &State) -> El {
                         || state.inventory_export_job.is_some()
                         || state.inventory_prepare.is_some()
                         || state.inventory_write.is_some()
-                        || state.inventory_dialog_open)
+                        || state.inventory_dialog_open
+                        || state.content_export_job.is_some())
                     .help("Export a complete content inventory for all captured URLs or the visible Internal set")
                     .on_press(|state: &mut State| state.inventory_scope_open = true)
                     .build(k)
@@ -5806,6 +6735,24 @@ fn copy_urls_button(k: &Kit, state: &State, shown: usize) -> El {
 }
 
 fn visible_ids(state: &State) -> Vec<String> {
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        return (0..visible_len(state))
+            .filter_map(|row| content_row_at(state, row))
+            .filter_map(|(row, analysis)| match row {
+                ContentRowRef::Group(index) => analysis
+                    .groups
+                    .get(index)
+                    .map(|group| group.representative.clone()),
+                ContentRowRef::Pair(index) => {
+                    analysis.pairs.get(index).map(|pair| pair.left.clone())
+                }
+                ContentRowRef::NotCompared(index) => analysis
+                    .not_compared
+                    .get(index)
+                    .map(|item| item.url.clone()),
+            })
+            .collect();
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return (0..visible_len(state))
             .filter_map(|row| link_occurrence_at(state, row))
@@ -5835,7 +6782,15 @@ fn export_button(k: &Kit, state: &State, shown: usize) -> El {
             "Save the {shown} visible rows from {} in the current sort order",
             active_title(state)
         ))
-        .disabled(state.phase.active() || shown == 0)
+        .disabled(
+            state.phase.active()
+                || shown == 0
+                || state.content_export_job.is_some()
+                || state.inventory_prepare.is_some()
+                || state.inventory_export_job.is_some()
+                || state.inventory_write.is_some()
+                || state.inventory_dialog_open,
+        )
         .on_press_tx(export_csv)
         .build(k)
         .key("export-csv")
@@ -5860,11 +6815,535 @@ fn details_toggle(k: &Kit, state: &State) -> El {
         .key("details-toggle")
 }
 
+fn content_context(state: &State) -> Vec<String> {
+    let run = state.run.as_ref();
+    vec![
+        run.map(|run| run.seed.clone()).unwrap_or_default(),
+        run.map(|run| run.started_utc.clone()).unwrap_or_default(),
+        run.map(|run| run.rendering.label())
+            .unwrap_or("HTML")
+            .into(),
+        content::POLICY_VERSION.to_string(),
+        content_status_detail(state),
+    ]
+}
+
+#[derive(Clone)]
+struct ContentExportSource {
+    analysis: Arc<ContentAnalysis>,
+    subview: DuplicateSubview,
+    rows: Vec<ContentRowRef>,
+    context: Vec<String>,
+    slug: &'static str,
+}
+
+fn content_export_source(state: &State) -> Option<ContentExportSource> {
+    let analysis = state.content_analysis.clone()?;
+    let rows = state
+        .content_visible
+        .iter()
+        .filter_map(|index| state.content_rows.get(*index).copied())
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    let slug = match state.duplicate_subview {
+        DuplicateSubview::SameText => "duplicate-same-text",
+        DuplicateSubview::Similar => "duplicate-similar",
+        DuplicateSubview::NotCompared => "duplicate-not-compared",
+    };
+    Some(ContentExportSource {
+        analysis,
+        subview: state.duplicate_subview,
+        rows,
+        context: content_context(state),
+        slug,
+    })
+}
+
+fn push_export_row(
+    rows: &mut Vec<Vec<String>>,
+    row: Vec<String>,
+    used: &mut usize,
+    max_bytes: usize,
+) -> bool {
+    let cost = row
+        .iter()
+        .map(|field| field.len().saturating_mul(2).saturating_add(32))
+        .sum::<usize>();
+    let Some(next) = used.checked_add(cost) else {
+        return false;
+    };
+    if next > max_bytes {
+        return false;
+    }
+    *used = next;
+    rows.push(row);
+    true
+}
+
+fn content_export_rows(
+    source: &ContentExportSource,
+    cancel: &AtomicBool,
+) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    content_export_rows_with_limit(source, cancel, usize::MAX)
+}
+
+fn content_export_rows_with_limit(
+    source: &ContentExportSource,
+    cancel: &AtomicBool,
+    max_bytes: usize,
+) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let mut used = 0_usize;
+    let analysis = &source.analysis;
+    let context = &source.context;
+    match source.subview {
+        DuplicateSubview::SameText => {
+            let headers = vec![
+                "GROUP ID",
+                "REPRESENTATIVE URL",
+                "MEMBER URL",
+                "GROUP SIZE",
+                "SELECTED TEXT CHARS",
+                "CAPTURE",
+                "SCOPE",
+                "NORMALIZED HASH",
+                "NORMALIZATION POLICY",
+                "CRAWL SEED",
+                "RUN STARTED UTC",
+                "CAPTURE MODE",
+                "COMPARISON STATUS",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+            let mut rows = Vec::new();
+            for row in &source.rows {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let ContentRowRef::Group(index) = row else {
+                    continue;
+                };
+                let Some(group) = analysis.groups.get(*index) else {
+                    continue;
+                };
+                for member in &group.members {
+                    if cancel.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    if !push_export_row(
+                        &mut rows,
+                        vec![
+                            group.id.clone(),
+                            group.representative.clone(),
+                            member.url.clone(),
+                            group.members.len().to_string(),
+                            member.normalized_chars.to_string(),
+                            member.stage.label().to_string(),
+                            member
+                                .scope
+                                .map_or("", content::ContentScope::label)
+                                .to_string(),
+                            group.hash_hex.clone(),
+                            format!("v{}", group.policy_version),
+                            context[0].clone(),
+                            context[1].clone(),
+                            context[2].clone(),
+                            context[4].clone(),
+                        ],
+                        &mut used,
+                        max_bytes,
+                    ) {
+                        return None;
+                    };
+                }
+            }
+            Some((headers, rows))
+        }
+        DuplicateSubview::Similar => {
+            let headers = vec![
+                "PAIR ID",
+                "LEFT URL",
+                "RIGHT URL",
+                "VERIFIED OVERLAP",
+                "LEFT GROUP",
+                "RIGHT GROUP",
+                "LEFT MEMBERS",
+                "RIGHT MEMBERS",
+                "LEFT CAPTURE",
+                "RIGHT CAPTURE",
+                "LEFT SCOPE",
+                "RIGHT SCOPE",
+                "LEFT TOKENS",
+                "RIGHT TOKENS",
+                "NORMALIZATION POLICY",
+                "CRAWL SEED",
+                "RUN STARTED UTC",
+                "CAPTURE MODE",
+                "COMPARISON STATUS",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+            let mut rows = Vec::new();
+            for row in &source.rows {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let ContentRowRef::Pair(index) = row else {
+                    continue;
+                };
+                let Some(pair) = analysis.pairs.get(*index) else {
+                    continue;
+                };
+                if !push_export_row(
+                    &mut rows,
+                    vec![
+                        pair.id.clone(),
+                        pair.left.clone(),
+                        pair.right.clone(),
+                        format!("{:.6}", pair.score),
+                        pair.left_group.clone(),
+                        pair.right_group.clone(),
+                        pair.left_members.to_string(),
+                        pair.right_members.to_string(),
+                        pair.left_stage.label().to_string(),
+                        pair.right_stage.label().to_string(),
+                        pair.left_scope
+                            .map_or("", content::ContentScope::label)
+                            .to_string(),
+                        pair.right_scope
+                            .map_or("", content::ContentScope::label)
+                            .to_string(),
+                        pair.left_tokens.to_string(),
+                        pair.right_tokens.to_string(),
+                        context[3].clone(),
+                        context[0].clone(),
+                        context[1].clone(),
+                        context[2].clone(),
+                        context[4].clone(),
+                    ],
+                    &mut used,
+                    max_bytes,
+                ) {
+                    return None;
+                };
+            }
+            Some((headers, rows))
+        }
+        DuplicateSubview::NotCompared => {
+            let headers = vec![
+                "URL",
+                "CAPTURE",
+                "SCOPE",
+                "EXACT ELIGIBLE",
+                "NEAR INPUT STATE",
+                "ANALYSIS STATE",
+                "REASON",
+                "NORMALIZATION POLICY",
+                "CRAWL SEED",
+                "RUN STARTED UTC",
+                "CAPTURE MODE",
+                "COMPARISON STATUS",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+            let mut rows = Vec::new();
+            for row in &source.rows {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let ContentRowRef::NotCompared(index) = row else {
+                    continue;
+                };
+                let Some(item) = analysis.not_compared.get(*index) else {
+                    continue;
+                };
+                if !push_export_row(
+                    &mut rows,
+                    vec![
+                        item.url.clone(),
+                        item.stage.label().to_string(),
+                        item.scope
+                            .map_or("", content::ContentScope::label)
+                            .to_string(),
+                        if item.exact_eligible { "yes" } else { "no" }.to_string(),
+                        item.near_state.label().to_string(),
+                        item.analysis_state.label().to_string(),
+                        item.reason.clone(),
+                        context[3].clone(),
+                        context[0].clone(),
+                        context[1].clone(),
+                        context[2].clone(),
+                        context[4].clone(),
+                    ],
+                    &mut used,
+                    max_bytes,
+                ) {
+                    return None;
+                };
+            }
+            Some((headers, rows))
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn content_export(state: &State) -> (Vec<String>, Vec<Vec<String>>, &'static str, &'static str) {
+    let Some(source) = content_export_source(state) else {
+        return (
+            Vec::new(),
+            Vec::new(),
+            "Duplicate content",
+            "duplicate-content",
+        );
+    };
+    let (headers, rows) = content_export_rows(&source, &AtomicBool::new(false)).unwrap_or_default();
+    let title = match source.subview {
+        DuplicateSubview::SameText => "Same normalized text",
+        DuplicateSubview::Similar => "Similar content pairs",
+        DuplicateSubview::NotCompared => "Not compared content",
+    };
+    (headers, rows, title, source.slug)
+}
+
+struct ContentExportJob {
+    rx: mpsc::Receiver<PreparedContentExport>,
+    cancel: Arc<AtomicBool>,
+    generation: u64,
+}
+
+struct PreparedContentExport {
+    csv: String,
+    row_count: usize,
+    scope: String,
+    slug: &'static str,
+}
+
+fn content_export_cost(len: usize) -> usize {
+    len.saturating_mul(2).saturating_add(64)
+}
+
+fn estimate_content_export_bytes(source: &ContentExportSource) -> usize {
+    let analysis = &source.analysis;
+    let context = &source.context;
+    let context_cost = context
+        .iter()
+        .map(|value| content_export_cost(value.len()))
+        .sum::<usize>();
+    let mut rows_cost = 0_usize;
+    match source.subview {
+        DuplicateSubview::SameText => {
+            for row in &source.rows {
+                let ContentRowRef::Group(index) = row else {
+                    continue;
+                };
+                let Some(group) = analysis.groups.get(*index) else {
+                    continue;
+                };
+                for member in &group.members {
+                    rows_cost = rows_cost.saturating_add(
+                        content_export_cost(group.id.len())
+                            .saturating_add(content_export_cost(group.representative.len()))
+                            .saturating_add(content_export_cost(member.url.len()))
+                            .saturating_add(content_export_cost(8))
+                            .saturating_add(content_export_cost(8))
+                            .saturating_add(content_export_cost(member.stage.label().len()))
+                            .saturating_add(content_export_cost(
+                                member.scope.map_or("", content::ContentScope::label).len(),
+                            ))
+                            .saturating_add(content_export_cost(group.hash_hex.len()))
+                            .saturating_add(content_export_cost(8))
+                            .saturating_add(context_cost),
+                    );
+                }
+            }
+        }
+        DuplicateSubview::Similar => {
+            for row in &source.rows {
+                let ContentRowRef::Pair(index) = row else {
+                    continue;
+                };
+                let Some(pair) = analysis.pairs.get(*index) else {
+                    continue;
+                };
+                rows_cost = rows_cost.saturating_add(
+                    content_export_cost(pair.id.len())
+                        .saturating_add(content_export_cost(pair.left.len()))
+                        .saturating_add(content_export_cost(pair.right.len()))
+                        .saturating_add(content_export_cost(12))
+                        .saturating_add(content_export_cost(pair.left_group.len()))
+                        .saturating_add(content_export_cost(pair.right_group.len()))
+                        .saturating_add(content_export_cost(8).saturating_mul(4))
+                        .saturating_add(content_export_cost(
+                            pair.left_scope
+                                .map_or("", content::ContentScope::label)
+                                .len(),
+                        ))
+                        .saturating_add(content_export_cost(
+                            pair.right_scope
+                                .map_or("", content::ContentScope::label)
+                                .len(),
+                        ))
+                        .saturating_add(content_export_cost(8).saturating_mul(2))
+                        .saturating_add(context_cost)
+                        .saturating_add(context_cost),
+                );
+            }
+        }
+        DuplicateSubview::NotCompared => {
+            for row in &source.rows {
+                let ContentRowRef::NotCompared(index) = row else {
+                    continue;
+                };
+                let Some(item) = analysis.not_compared.get(*index) else {
+                    continue;
+                };
+                rows_cost = rows_cost.saturating_add(
+                    content_export_cost(item.url.len())
+                        .saturating_add(content_export_cost(item.stage.label().len()))
+                        .saturating_add(content_export_cost(
+                            item.scope.map_or("", content::ContentScope::label).len(),
+                        ))
+                        .saturating_add(content_export_cost(4))
+                        .saturating_add(content_export_cost(item.near_state.label().len()))
+                        .saturating_add(content_export_cost(item.analysis_state.label().len()))
+                        .saturating_add(content_export_cost(item.reason.len()))
+                        .saturating_add(content_export_cost(8))
+                        .saturating_add(context_cost)
+                        .saturating_add(context_cost),
+                );
+            }
+        }
+    }
+    // Row vectors, headers, and the second complete CSV copy are all retained together.
+    rows_cost.saturating_mul(2).saturating_add(4096)
+}
+
+fn start_content_export(state: &mut State) -> bool {
+    if export_lifecycle_busy(state) {
+        state.export_notice = Some(Err(
+            "Another export is already being prepared or written.".into()
+        ));
+        return false;
+    }
+    let Some(source) = content_export_source(state) else {
+        return false;
+    };
+    let estimate = estimate_content_export_bytes(&source);
+    if source.analysis.retained_bytes.saturating_add(estimate) > content::CONTENT_MEMORY_BUDGET {
+        state.export_notice = Some(Err(
+            "This export would exceed the content-analysis memory budget; narrow the visible scope first."
+                .into(),
+        ));
+        return false;
+    }
+    let generation = state.content_generation;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let (tx, rx) = mpsc::channel();
+    let waker = state.waker.clone();
+    state.content_export_job = Some(ContentExportJob {
+        rx,
+        cancel,
+        generation,
+    });
+    state.export_notice = Some(Ok(format!(
+        "Preparing duplicate-content CSV · {} visible rows…",
+        source.rows.len()
+    )));
+    std::thread::spawn(move || {
+        let remaining =
+            content::CONTENT_MEMORY_BUDGET.saturating_sub(source.analysis.retained_bytes);
+        if let Some((headers, rows)) =
+            content_export_rows_with_limit(&source, &worker_cancel, remaining)
+        {
+            if worker_cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let header_refs = headers.iter().map(String::as_str).collect::<Vec<_>>();
+            if let Some(csv) =
+                calmtoad::export::to_csv_cancellable(&header_refs, &rows, &worker_cancel)
+            {
+                let kind = match source.subview {
+                    DuplicateSubview::SameText => "same-text member",
+                    DuplicateSubview::Similar => "similar pair",
+                    DuplicateSubview::NotCompared => "not-compared URL",
+                };
+                let _ = tx.send(PreparedContentExport {
+                    csv,
+                    row_count: rows.len(),
+                    scope: format!(
+                        "{} {kind} rows · {}",
+                        rows.len(),
+                        content_status_detail_from(&source.context)
+                    ),
+                    slug: source.slug,
+                });
+            }
+        }
+        if let Some(wake) = &waker {
+            wake();
+        }
+    });
+    true
+}
+
+fn poll_content_export(state: &mut State, tx: &mut Tx) -> bool {
+    let Some(job) = state.content_export_job.take() else {
+        return false;
+    };
+    match job.rx.try_recv() {
+        Ok(prepared) => {
+            if job.generation != state.content_generation {
+                return false;
+            }
+            save_prepared_csv(
+                state,
+                tx,
+                prepared.csv,
+                prepared.row_count,
+                prepared.scope,
+                prepared.slug,
+                true,
+                "content",
+            );
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            state.content_export_job = Some(job);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            state.export_notice = Some(Err(
+                "Duplicate-content CSV preparation stopped without a result.".into(),
+            ));
+            true
+        }
+    }
+}
+
+fn content_status_detail_from(context: &[String]) -> String {
+    context.get(4).cloned().unwrap_or_default()
+}
+
 fn export_csv(state: &mut State, tx: &mut Tx) {
     if state.phase.active() {
         return;
     }
+    if export_lifecycle_busy(state) {
+        state.export_notice = Some(Err(
+            "Another export is already being prepared or written.".into()
+        ));
+        return;
+    }
     state.action_notice = None;
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        let _ = start_content_export(state);
+        return;
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         let headers = link_evidence_headers();
         let rows = state
@@ -5959,7 +7438,7 @@ fn save_csv(
 ) {
     let csv = calmtoad::export::to_csv(headers, &rows);
     let row_count = rows.len();
-    save_prepared_csv(state, tx, csv, row_count, scope, slug, false);
+    save_prepared_csv(state, tx, csv, row_count, scope, slug, false, "visible");
 }
 
 fn inventory_temp_file(destination: &Path) -> Result<tempfile::NamedTempFile, String> {
@@ -6020,6 +7499,7 @@ fn write_inventory_file(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn save_prepared_csv(
     state: &mut State,
     tx: &mut Tx,
@@ -6028,7 +7508,14 @@ fn save_prepared_csv(
     scope: String,
     slug: &'static str,
     background_write: bool,
+    row_label: &'static str,
 ) {
+    if export_lifecycle_busy(state) {
+        state.export_notice = Some(Err(
+            "Another export is already being prepared or written.".into()
+        ));
+        return;
+    }
     let options = FileDialogOptions {
         title: format!("Export {scope} as CSV"),
         file_name: Some(format!("calmtoad-{slug}.csv")),
@@ -6046,6 +7533,13 @@ fn save_prepared_csv(
             Ok(Some(path)) => {
                 let path = csv_path(path);
                 if background_write {
+                    if !export_writer_slot_available(state) {
+                        state.export_notice = Some(Err(
+                            "Another export writer is still active; the destination was not replaced."
+                                .into(),
+                        ));
+                        return;
+                    }
                     let temp = match inventory_temp_file(&path) {
                         Ok(temp) => temp,
                         Err(error) => {
@@ -6069,7 +7563,7 @@ fn save_prepared_csv(
                             {
                                 InventoryWriteOutcome::Complete(name) => {
                                     InventoryWriteOutcome::Complete(format!(
-                                        "Exported {row_count} inventory rows to {name}"
+                                        "Exported {row_count} {row_label} rows to {name}"
                                     ))
                                 }
                                 other => other,
@@ -6367,16 +7861,19 @@ fn export_row(tab: Tab, page: &Page, audit: &Audit) -> Vec<String> {
 
 fn results(k: &Kit, state: &State) -> El {
     let frame = row().key("frame").w_full().grow(1.0).min_h(0.0);
-    let has_data = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
-        !state.link_rows.is_empty()
-    } else if state.tab == Tab::Sitemaps {
-        match state.sitemap_view {
-            SitemapView::Urls => !state.sitemap.urls.is_empty(),
-            SitemapView::Files => !state.sitemap.files.is_empty(),
-        }
-    } else {
-        !state.pages.is_empty()
-    };
+    let has_data =
+        if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+            !state.content_rows.is_empty()
+        } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+            !state.link_rows.is_empty()
+        } else if state.tab == Tab::Sitemaps {
+            match state.sitemap_view {
+                SitemapView::Urls => !state.sitemap.urls.is_empty(),
+                SitemapView::Files => !state.sitemap.files.is_empty(),
+            }
+        } else {
+            !state.pages.is_empty()
+        };
     if !has_data {
         return frame.child(empty(k, state));
     }
@@ -6488,7 +7985,73 @@ fn filtered_empty(k: &Kit, state: &State) -> El {
 }
 
 fn empty(k: &Kit, state: &State) -> El {
-    let (title, copy) = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+    let (title, copy) = if state.tab == Tab::Internal
+        && state.internal_view == InternalView::DuplicateContent
+    {
+        match state.content_phase {
+            ContentPhase::Preparing => (
+                "Preparing content comparison".to_string(),
+                "Selecting text and building bounded exact and near fingerprints.".to_string(),
+            ),
+            ContentPhase::Running => (
+                "Comparing content".to_string(),
+                "Exact groups are ready first; near candidates are verified in the background."
+                    .to_string(),
+            ),
+            ContentPhase::Failed => (
+                "Comparison failed".to_string(),
+                state.content_message.clone(),
+            ),
+            ContentPhase::Cancelled => (
+                "Comparison stopped".to_string(),
+                "Completed crawl facts and any finished comparison results are retained."
+                    .to_string(),
+            ),
+            ContentPhase::Idle => {
+                if state.phase.active() {
+                    (
+                        "Comparison waits for the crawl".to_string(),
+                        "Content comparison starts after the captured results settle, including a stopped partial crawl."
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        "Content comparison has not started".to_string(),
+                        "Choose Duplicate content again after a crawl, or start a new crawl."
+                            .to_string(),
+                    )
+                }
+            }
+            ContentPhase::Ready => {
+                if let Some(analysis) = state.content_analysis.as_deref()
+                    && !analysis.coverage.limited_reasons.is_empty()
+                {
+                    (
+                        "Comparison limited".to_string(),
+                        analysis.coverage.limited_reasons.join(" · "),
+                    )
+                } else {
+                    match state.duplicate_subview {
+                        DuplicateSubview::SameText => (
+                            "No same-text groups".to_string(),
+                            "No two eligible captured pages had the same complete normalized text."
+                                .to_string(),
+                        ),
+                        DuplicateSubview::Similar => (
+                            "No similar pairs found".to_string(),
+                            "Candidate retrieval is approximate. This does not prove that no similar content exists."
+                                .to_string(),
+                        ),
+                        DuplicateSubview::NotCompared => (
+                            "No uncompared URLs".to_string(),
+                            "Every selected page has an exact or near comparison state for this crawl."
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
+        }
+    } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         if state.phase.active() {
             (
                 "Collecting link evidence".to_string(),
@@ -6635,6 +8198,9 @@ fn sitemap_empty(state: &State) -> (String, String) {
 }
 
 fn table(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        return content_table(k, state);
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return link_table(k, state);
     }
@@ -6842,6 +8408,159 @@ fn table(k: &Kit, state: &State) -> El {
             cell(&kit, state.tab, page, &state.audit, column)
         })
         .build(state, k)
+}
+
+fn content_row_at(state: &State, row: usize) -> Option<(ContentRowRef, &ContentAnalysis)> {
+    let index = *state.content_visible.get(row)?;
+    let row = *state.content_rows.get(index)?;
+    Some((row, state.content_analysis.as_deref()?))
+}
+
+fn content_table(k: &Kit, state: &State) -> El {
+    let subview = state.duplicate_subview;
+    let mut table = Table::new(
+        |state: &State| &state.table,
+        |state: &mut State| &mut state.table,
+        |state: &State| visible_len(state),
+        |state: &State, row| Cow::Borrowed(visible_id_ref(state, row).unwrap_or("")),
+    )
+    .name(active_title(state))
+    .style(table_style(k))
+    .zebra(false)
+    .on_sort(|state: &mut State, column, direction, _| set_content_sort(state, column, direction))
+    .on_select(|state: &mut State, id, _tx| {
+        state.duplicate_view.selected = Some(id.to_string());
+        state.content_members_page = 0;
+        state.content_pair_left_open = false;
+        state.content_pair_right_open = false;
+        state.details_open = true;
+    });
+    table = match subview {
+        DuplicateSubview::SameText => table
+            .column(
+                TableColumn::new("url", "REPRESENTATIVE URL")
+                    .flex(2.2)
+                    .min(180.0)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("matches", "MATCHES")
+                    .width(88.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("chars", "TEXT CHARS")
+                    .width(104.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(TableColumn::new("stage", "CAPTURE").width(132.0).sortable()),
+        DuplicateSubview::Similar => table
+            .column(
+                TableColumn::new("url", "URL".to_string())
+                    .flex(1.4)
+                    .min(140.0)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("right", "OTHER URL")
+                    .flex(1.4)
+                    .min(140.0)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("overlap", "OVERLAP")
+                    .width(88.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("members", "MEMBERS")
+                    .width(88.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(TableColumn::new("stage", "CAPTURE").width(112.0).sortable()),
+        DuplicateSubview::NotCompared => table
+            .column(
+                TableColumn::new("url", "URL")
+                    .flex(1.8)
+                    .min(180.0)
+                    .sortable(),
+            )
+            .column(TableColumn::new("stage", "CAPTURE").width(132.0).sortable())
+            .column(
+                TableColumn::new("reason", "NOT COMPARED")
+                    .flex(1.8)
+                    .min(160.0)
+                    .sortable(),
+            ),
+    };
+    table
+        .cell(
+            move |state: &State, row, column| match content_row_at(state, row) {
+                Some((ContentRowRef::Group(index), analysis)) => {
+                    let Some(group) = analysis.groups.get(index) else {
+                        return Cell::text("");
+                    };
+                    match column {
+                        "url" => Cell::text(group.representative.clone()),
+                        "matches" => Cell::text((group.members.len() - 1).to_string()).mono(),
+                        "chars" => Cell::text(group.normalized_chars.to_string()).mono(),
+                        "stage" => {
+                            Cell::text(capture_label_for_content(group.stage, group.scope)).muted()
+                        }
+                        _ => Cell::text(""),
+                    }
+                }
+                Some((ContentRowRef::Pair(index), analysis)) => {
+                    let Some(pair) = analysis.pairs.get(index) else {
+                        return Cell::text("");
+                    };
+                    match column {
+                        "url" => Cell::text(pair.left.clone()),
+                        "right" => Cell::text(pair.right.clone()),
+                        "overlap" => Cell::text(format!("{:.1}%", pair.score * 100.0)).mono(),
+                        "members" => {
+                            Cell::text(format!("{} / {}", pair.left_members, pair.right_members))
+                                .mono()
+                        }
+                        "stage" => {
+                            Cell::text(capture_label_for_content(pair.left_stage, pair.left_scope))
+                                .muted()
+                        }
+                        _ => Cell::text(""),
+                    }
+                }
+                Some((ContentRowRef::NotCompared(index), analysis)) => {
+                    let Some(item) = analysis.not_compared.get(index) else {
+                        return Cell::text("");
+                    };
+                    match column {
+                        "url" => Cell::text(item.url.clone()),
+                        "stage" => {
+                            Cell::text(capture_label_for_content(item.stage, item.scope)).muted()
+                        }
+                        "reason" => {
+                            Cell::text(format!("{} · {}", item.analysis_state.label(), item.reason))
+                                .muted()
+                        }
+                        _ => Cell::text(""),
+                    }
+                }
+                None => Cell::text(""),
+            },
+        )
+        .build(state, k)
+}
+
+fn capture_label_for_content(stage: EvidenceStage, scope: Option<content::ContentScope>) -> String {
+    format!(
+        "{} · {}",
+        stage.label(),
+        scope.map_or("—", content::ContentScope::label)
+    )
 }
 
 fn link_table(k: &Kit, state: &State) -> El {
@@ -7233,6 +8952,9 @@ fn selected_page(state: &State) -> Option<&Page> {
 }
 
 fn detail(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        return content_detail(k, state);
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return link_detail(k, state);
     }
@@ -7378,7 +9100,12 @@ fn move_selection(state: &mut State, tx: &mut Tx, delta: i32) {
     let Some(id) = visible_id(state, target) else {
         return;
     };
-    if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+    if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        state.duplicate_view.selected = Some(id.clone());
+        state.content_members_page = 0;
+        state.content_pair_left_open = false;
+        state.content_pair_right_open = false;
+    } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         state.link_view.selected = Some(id.clone());
     } else {
         sync_relation_selection(state, Some(&id));
@@ -7404,6 +9131,12 @@ fn inspect_url_state(state: &mut State, url: &str) -> bool {
     let mut switched = false;
     if state.tab == Tab::Sitemaps {
         state.tab = Tab::Internal;
+        state.internal_view = InternalView::Urls;
+        let (column, dir) = state.view().sort.clone();
+        state.table.set_sort(column, dir);
+        switched = true;
+    } else if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+        state.internal_view = InternalView::Urls;
         let (column, dir) = state.view().sort.clone();
         state.table.set_sort(column, dir);
         switched = true;
@@ -8532,6 +10265,435 @@ fn capture_detail(k: &Kit, capture: &CaptureInfo, page_url: &str) -> El {
     block
 }
 
+fn selected_content_row(state: &State) -> Option<(ContentRowRef, &ContentAnalysis)> {
+    let selected = state.duplicate_view.selected.as_deref()?;
+    let index = state
+        .content_row_keys
+        .iter()
+        .position(|key| key == selected)?;
+    let row = *state.content_rows.get(index)?;
+    Some((row, state.content_analysis.as_deref()?))
+}
+
+fn group_by_id<'a>(analysis: &'a ContentAnalysis, id: &str) -> Option<&'a content::ExactGroup> {
+    analysis.all_groups.iter().find(|group| group.id == id)
+}
+
+fn content_member_rows(k: &Kit, group: &content::ExactGroup, page: usize) -> El {
+    let per_page = 25_usize;
+    let pages = group.members.len().div_ceil(per_page).max(1);
+    let page = page.min(pages.saturating_sub(1));
+    let start = page * per_page;
+    let end = (start + per_page).min(group.members.len());
+    let mut list = col().w_full().gap(4.0).child(muted_note(
+        k,
+        format!(
+            "Showing {}–{} of {} members",
+            start + 1,
+            end,
+            group.members.len()
+        ),
+    ));
+    for member in &group.members[start..end] {
+        let mut row = row()
+            .w_full()
+            .min_w(0.0)
+            .gap(4.0)
+            .center_y()
+            .child(
+                text(member.url.clone())
+                    .font(k.ty.text_small)
+                    .color(k.c.text_base)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate()
+                    .help(member.url.clone()),
+            )
+            .child(copy_icon(k, "Copy member URL", member.url.clone()));
+        row = row.child(
+            Button::new("Show")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Mini)
+                .on_press({
+                    let url = member.url.clone();
+                    move |state: &mut State| {
+                        inspect_url_state(state, &url);
+                    }
+                })
+                .build(k)
+                .key(format!("content-member-show-{}", member.url)),
+        );
+        list = list.child(row);
+    }
+    if pages > 1 {
+        list = list.child(
+            row()
+                .w_full()
+                .gap(4.0)
+                .child(
+                    Button::new("Previous members")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Mini)
+                        .disabled(page == 0)
+                        .on_press(move |state: &mut State| {
+                            state.content_members_page =
+                                state.content_members_page.saturating_sub(1);
+                        })
+                        .build(k)
+                        .key("content-members-prev"),
+                )
+                .child(
+                    Button::new("Next members")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Mini)
+                        .disabled(page + 1 >= pages)
+                        .on_press(move |state: &mut State| {
+                            state.content_members_page += 1;
+                        })
+                        .build(k)
+                        .key("content-members-next"),
+                ),
+        );
+    }
+    list
+}
+
+fn content_detail(k: &Kit, state: &State) -> El {
+    let panel = col()
+        .key("detail")
+        .w(320.0)
+        .h_full()
+        .gap(10.0)
+        .px(14.0)
+        .py(12.0)
+        .border_sides([0.0, 0.0, 0.0, 1.0], k.c.border_weak);
+    let Some((content_row, analysis)) = selected_content_row(state) else {
+        return panel.child(micro(k, "Duplicate content")).child(
+            text("Select a row to inspect its text evidence.")
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        );
+    };
+    let position = state
+        .table
+        .cursor()
+        .and_then(|id| (0..visible_len(state)).find(|row| visible_id_ref(state, *row) == Some(id)));
+    let prev = Button::new("Previous")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(position.is_none_or(|position| position == 0))
+        .on_press_tx(|state: &mut State, tx: &mut Tx| move_selection(state, tx, -1))
+        .build(k)
+        .key("detail-prev");
+    let next = Button::new("Next")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(position.is_none_or(|position| position + 1 >= visible_len(state)))
+        .on_press_tx(|state: &mut State, tx: &mut Tx| move_selection(state, tx, 1))
+        .build(k)
+        .key("detail-next");
+    let close = IconButton::new(k.glyph.close)
+        .variant(IconButtonVariant::GhostMuted)
+        .label("Close duplicate content details")
+        .on_press(|state: &mut State| state.details_open = false)
+        .build(k)
+        .key("detail-close");
+    let mut body = col()
+        .key("content-detail-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(10.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+    match content_row {
+        ContentRowRef::Group(index) => {
+            let Some(group) = analysis.groups.get(index) else {
+                return panel;
+            };
+            body = body
+                .child(
+                    text("Same normalized text")
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_base),
+                )
+                .child(value_with_copy(
+                    k,
+                    "Representative",
+                    &group.representative,
+                    "Copy representative URL",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Group size",
+                    &group.members.len().to_string(),
+                    "Copy group size",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Selected text",
+                    &format!("{} characters", group.normalized_chars),
+                    "Copy text length",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Capture",
+                    &capture_label_for_content(group.stage, group.scope),
+                    "Copy capture",
+                ))
+                .child(value_with_copy(k, "Group ID", &group.id, "Copy group ID"))
+                .child(value_with_copy(
+                    k,
+                    "Normalized hash",
+                    &group.hash_hex,
+                    "Copy normalized hash",
+                ));
+            if group.scope == Some(content::ContentScope::Body) {
+                body = body.child(muted_note(
+                    k,
+                    "Body fallback may include template text. The selected scope is retained as evidence.",
+                ));
+            }
+            if let Some(page) = analysis.pages.get(&group.representative) {
+                body = body.child(value_with_copy(k, "Excerpt", &page.excerpt, "Copy excerpt"));
+                if page.excerpt_truncated {
+                    body = body.child(muted_note(
+                        k,
+                        "This excerpt is bounded; it is not a full diff.",
+                    ));
+                }
+            }
+            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+            body = body.child(content_member_rows(k, group, state.content_members_page));
+        }
+        ContentRowRef::Pair(index) => {
+            let Some(pair) = analysis.pairs.get(index) else {
+                return panel;
+            };
+            let left_group = group_by_id(analysis, &pair.left_group);
+            let right_group = group_by_id(analysis, &pair.right_group);
+            body = body
+                .child(
+                    text("Similar content pair")
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_base),
+                )
+                .child(value_with_copy(
+                    k,
+                    "Verified overlap",
+                    &format!("{:.1}%", pair.score * 100.0),
+                    "Copy overlap",
+                ))
+                .child(value_with_copy(k, "Left URL", &pair.left, "Copy left URL"))
+                .child(value_with_copy(
+                    k,
+                    "Right URL",
+                    &pair.right,
+                    "Copy right URL",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Exact members",
+                    &format!("{} left · {} right", pair.left_members, pair.right_members),
+                    "Copy member counts",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Token counts",
+                    &format!("{} left · {} right", pair.left_tokens, pair.right_tokens),
+                    "Copy token counts",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Left group",
+                    &pair.left_group,
+                    "Copy left group",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Right group",
+                    &pair.right_group,
+                    "Copy right group",
+                ));
+            let left_excerpt = analysis
+                .pages
+                .get(&pair.left)
+                .map_or("", |page| &*page.excerpt);
+            let right_excerpt = analysis
+                .pages
+                .get(&pair.right)
+                .map_or("", |page| &*page.excerpt);
+            body = body.child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .child(
+                        col()
+                            .w_frac(0.5)
+                            .min_w(0.0)
+                            .gap(2.0)
+                            .child(micro(k, "Left excerpt"))
+                            .child(
+                                text(excerpt_text(left_excerpt))
+                                    .font(k.ty.text_small)
+                                    .color(k.c.text_base)
+                                    .wrap()
+                                    .w_full(),
+                            ),
+                    )
+                    .child(
+                        col()
+                            .w_frac(0.5)
+                            .min_w(0.0)
+                            .gap(2.0)
+                            .child(micro(k, "Right excerpt"))
+                            .child(
+                                text(excerpt_text(right_excerpt))
+                                    .font(k.ty.text_small)
+                                    .color(k.c.text_base)
+                                    .wrap()
+                                    .w_full(),
+                            ),
+                    ),
+            );
+            if let Some(group) = left_group {
+                body = body.child(detail_disclosure(
+                    k,
+                    "Left exact members",
+                    state.content_pair_left_open,
+                    "content-left-members",
+                    "content-left-members-toggle",
+                    content_member_rows(k, group, state.content_members_page),
+                    |state| state.content_pair_left_open ^= true,
+                ));
+            }
+            if let Some(group) = right_group {
+                body = body.child(detail_disclosure(
+                    k,
+                    "Right exact members",
+                    state.content_pair_right_open,
+                    "content-right-members",
+                    "content-right-members-toggle",
+                    content_member_rows(k, group, state.content_members_page),
+                    |state| state.content_pair_right_open ^= true,
+                ));
+            }
+            if pair.left_scope == Some(content::ContentScope::Body)
+                || pair.right_scope == Some(content::ContentScope::Body)
+            {
+                body = body.child(muted_note(
+                    k,
+                    "Body fallback may include template text; the selected scope is retained for each side.",
+                ));
+            }
+            body = body.child(muted_note(
+                k,
+                "Near matches are explicit pairs, not transitive groups. The score verifies retained five-token shingle sets; candidate retrieval is approximate.",
+            ));
+        }
+        ContentRowRef::NotCompared(index) => {
+            let Some(item) = analysis.not_compared.get(index) else {
+                return panel;
+            };
+            body = body
+                .child(
+                    text("Not compared")
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_base),
+                )
+                .child(value_with_copy(k, "URL", &item.url, "Copy URL"))
+                .child(value_with_copy(k, "Reason", &item.reason, "Copy reason"))
+                .child(value_with_copy(
+                    k,
+                    "Capture",
+                    &capture_label_for_content(item.stage, item.scope),
+                    "Copy capture",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Exact eligible",
+                    if item.exact_eligible { "yes" } else { "no" },
+                    "Copy exact eligibility",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Near input",
+                    item.near_state.label(),
+                    "Copy near input state",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Analysis state",
+                    item.analysis_state.label(),
+                    "Copy analysis state",
+                ));
+        }
+    }
+    let primary = match content_row {
+        ContentRowRef::Group(index) => analysis
+            .groups
+            .get(index)
+            .map(|group| group.representative.clone()),
+        ContentRowRef::Pair(index) => analysis.pairs.get(index).map(|pair| pair.left.clone()),
+        ContentRowRef::NotCompared(index) => analysis
+            .not_compared
+            .get(index)
+            .map(|item| item.url.clone()),
+    }
+    .unwrap_or_default();
+    let open = IconButton::new(&OPEN_LINK)
+        .variant(IconButtonVariant::GhostMuted)
+        .label("Open page in browser")
+        .on_press_tx({
+            let url = primary.clone();
+            move |_: &mut State, tx: &mut Tx| {
+                let _ = tx.open_url(&url);
+            }
+        })
+        .build(k);
+    panel
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .gap(4.0)
+                .child(micro(k, "Duplicate content"))
+                .child(el().grow(1.0))
+                .child(prev)
+                .child(next)
+                .child(close),
+        )
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .gap(6.0)
+                .child(
+                    text(primary.clone())
+                        .font(k.ty.text_small)
+                        .color(k.c.text_muted)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate()
+                        .help(primary),
+                )
+                .child(open),
+        )
+        .child(el().w_full().h(1.0).fill(k.c.border_weak))
+        .child(body)
+}
+
+fn excerpt_text(value: &str) -> String {
+    if value.is_empty() {
+        "—".into()
+    } else {
+        value.to_string()
+    }
+}
+
 fn link_detail(k: &Kit, state: &State) -> El {
     let panel = col()
         .key("detail")
@@ -9306,6 +11468,51 @@ fn scene_inventory_scope(state: &mut State) {
     state.inventory_scope_open = true;
     switch_tab(state, Tab::Overview);
 }
+fn scene_duplicate_content(state: &mut State) {
+    let mut pages = crawl::sample_pages();
+    let base = (0..80)
+        .map(|index| format!("shared-content-token-{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut similar = base.clone();
+    similar = similar.replacen("shared-content-token-0", "different-opening-token", 1);
+    pages[0].content = sample_content(&format!(
+        "<main><h1>Shared article</h1><p>{base}</p></main>"
+    ));
+    pages[1].content = sample_content(&format!(
+        "<main><h1>Shared article</h1><p>{base}</p></main>"
+    ));
+    pages[2].content = sample_content(&format!(
+        "<main><h1>Nearly shared article</h1><p>{similar}</p></main>"
+    ));
+    pages[3].content = sample_content("<main><h1>Short</h1><p>Only a few words.</p></main>");
+    set_pages(state, pages, "9 pages on example.com".into());
+    analyze_content_now(state);
+    state.internal_view = InternalView::DuplicateContent;
+    state.duplicate_subview = DuplicateSubview::SameText;
+    switch_tab(state, Tab::Internal);
+    refresh_visible_forced(state);
+    if let Some(key) = state.content_row_keys.first().cloned() {
+        state.duplicate_view.selected = Some(key.clone());
+        state.table.select(key);
+        state.details_open = true;
+    }
+}
+
+fn scene_duplicate_content_similar(state: &mut State) {
+    scene_duplicate_content(state);
+    state.duplicate_subview = DuplicateSubview::Similar;
+    state.details_open = false;
+    refresh_visible_forced(state);
+}
+
+fn scene_duplicate_content_not_compared(state: &mut State) {
+    scene_duplicate_content(state);
+    state.duplicate_subview = DuplicateSubview::NotCompared;
+    state.details_open = false;
+    refresh_visible_forced(state);
+}
+
 fn scene_extraction_editor(state: &mut State) {
     load_sample(state);
     state.extraction_drafts = vec![
@@ -9913,6 +12120,12 @@ fn main() {
             ("link-evidence", scene_link_evidence),
             ("link-evidence-detail", scene_link_evidence_detail),
             ("inventory-scope", scene_inventory_scope),
+            ("duplicate-content", scene_duplicate_content),
+            ("duplicate-content-similar", scene_duplicate_content_similar),
+            (
+                "duplicate-content-not-compared",
+                scene_duplicate_content_not_compared,
+            ),
             ("extraction-editor", scene_extraction_editor),
             ("extraction-preview", scene_extraction_preview),
             ("extraction-results", scene_extraction_results),
@@ -10737,6 +12950,272 @@ mod tests {
     }
 
     #[test]
+    fn export_entrypoints_share_one_lifecycle_in_both_start_orders() {
+        let mut state = init();
+        scene_duplicate_content(&mut state);
+        assert!(start_content_export(&mut state));
+        assert!(state.content_export_job.is_some());
+        assert!(start_inventory_export(&mut state, InventoryScope::All).is_err());
+        assert!(state.inventory_prepare.is_none());
+        if let Some(job) = state.content_export_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+
+        let mut state = init();
+        load_sample(&mut state);
+        assert!(start_inventory_export(&mut state, InventoryScope::All).is_ok());
+        assert!(!start_content_export(&mut state));
+        assert!(state.content_export_job.is_none());
+        state.inventory_prepare = None;
+
+        let mut state = init();
+        scene_update_ready(&mut state);
+        let dir = tempfile::TempDir::new().expect("dir");
+        let temp_path = dir.path().join("active.tmp");
+        std::fs::write(&temp_path, b"active").expect("temp");
+        let (_tx, rx) = mpsc::channel();
+        let writer_cancel = Arc::new(AtomicBool::new(false));
+        state.inventory_write = Some(InventoryWriteJob {
+            rx,
+            cancel: writer_cancel.clone(),
+            temp_path,
+        });
+        assert!(export_lifecycle_busy(&state));
+        assert!(!export_writer_slot_available(&state));
+        assert!(!can_install(&state));
+        assert!(start_inventory_export(&mut state, InventoryScope::All).is_err());
+        assert!(!start_content_export(&mut state));
+        stop_owned_work(&mut state);
+        assert!(writer_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn same_text_export_uses_each_member_scope_and_cancels_before_projection() {
+        let member = |url: &str, scope: content::ContentScope| content::ExactMember {
+            url: url.into(),
+            scope: Some(scope),
+            stage: EvidenceStage::Document,
+            normalized_chars: 40,
+        };
+        let group = content::ExactGroup {
+            id: "exact-scope".into(),
+            representative: "https://example.com/main".into(),
+            hash_hex: "hash".into(),
+            stage: EvidenceStage::Document,
+            policy_version: content::POLICY_VERSION,
+            scope: Some(content::ContentScope::Main),
+            normalized_chars: 40,
+            members: vec![
+                member("https://example.com/main", content::ContentScope::Main),
+                member("https://example.com/body", content::ContentScope::Body),
+            ],
+        };
+        let analysis = ContentAnalysis {
+            all_groups: vec![group.clone()],
+            groups: vec![group],
+            similar_affected_urls: 2,
+            ..ContentAnalysis::default()
+        };
+        let source = ContentExportSource {
+            analysis: Arc::new(analysis),
+            subview: DuplicateSubview::SameText,
+            rows: vec![ContentRowRef::Group(0)],
+            context: vec![
+                "seed".into(),
+                "time".into(),
+                "HTML".into(),
+                "1".into(),
+                "complete".into(),
+            ],
+            slug: "duplicate-same-text",
+        };
+        let (_, rows) = content_export_rows(&source, &AtomicBool::new(false)).expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][6], "Main");
+        assert_eq!(rows[1][6], "Body fallback");
+        assert!(content_export_rows(&source, &AtomicBool::new(true)).is_none());
+    }
+
+    #[test]
+    #[ignore = "local large-result final UI processing measurement"]
+    fn duplicate_content_result_completion_is_bounded_on_large_memberships() {
+        let members = (0..40_000)
+            .map(|index| content::ExactMember {
+                url: format!("https://example.com/member/{index}"),
+                scope: Some(content::ContentScope::Main),
+                stage: EvidenceStage::Document,
+                normalized_chars: 100,
+            })
+            .collect::<Vec<_>>();
+        let group = content::ExactGroup {
+            id: "exact-large".into(),
+            representative: "https://example.com/member/0".into(),
+            hash_hex: "hash".into(),
+            stage: EvidenceStage::Document,
+            policy_version: content::POLICY_VERSION,
+            scope: Some(content::ContentScope::Main),
+            normalized_chars: 100,
+            members,
+        };
+        let other = content::ExactGroup {
+            id: "exact-other".into(),
+            representative: "https://example.com/other".into(),
+            hash_hex: "other".into(),
+            stage: EvidenceStage::Document,
+            policy_version: content::POLICY_VERSION,
+            scope: Some(content::ContentScope::Main),
+            normalized_chars: 100,
+            members: vec![content::ExactMember {
+                url: "https://example.com/other".into(),
+                scope: Some(content::ContentScope::Main),
+                stage: EvidenceStage::Document,
+                normalized_chars: 100,
+            }],
+        };
+        let pair = content::NearPair {
+            id: "pair".into(),
+            left: group.representative.clone(),
+            right: other.representative.clone(),
+            score: 0.9,
+            left_group: group.id.clone(),
+            right_group: other.id.clone(),
+            left_members: 40_000,
+            right_members: 1,
+            left_stage: EvidenceStage::Document,
+            right_stage: EvidenceStage::Document,
+            left_scope: Some(content::ContentScope::Main),
+            right_scope: Some(content::ContentScope::Main),
+            left_tokens: 100,
+            right_tokens: 100,
+        };
+        let analysis = ContentAnalysis {
+            all_groups: vec![group.clone(), other],
+            groups: vec![group],
+            pairs: (0..200).map(|_| pair.clone()).collect(),
+            similar_affected_urls: 40_001,
+            ..ContentAnalysis::default()
+        };
+        let mut state = init();
+        state.tab = Tab::Internal;
+        state.internal_view = InternalView::DuplicateContent;
+        state.content_phase = ContentPhase::Ready;
+        state.content_analysis = Some(Arc::new(analysis));
+        state.duplicate_subview = DuplicateSubview::SameText;
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let same = started.elapsed();
+        state.duplicate_subview = DuplicateSubview::Similar;
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let similar = started.elapsed();
+        eprintln!("large result processing: same {same:?}, similar {similar:?}");
+        assert!(same < Duration::from_millis(8));
+        assert!(similar < Duration::from_millis(8));
+    }
+
+    #[test]
+    fn duplicate_export_preserves_long_context_and_csv_escaping() {
+        let group = content::ExactGroup {
+            id: "exact-escape".into(),
+            representative: "https://example.com/quote".into(),
+            hash_hex: "hash".into(),
+            stage: EvidenceStage::Document,
+            policy_version: content::POLICY_VERSION,
+            scope: Some(content::ContentScope::Main),
+            normalized_chars: 100,
+            members: vec![
+                content::ExactMember {
+                    url: "https://example.com/quote,\"line\nbreak".into(),
+                    scope: Some(content::ContentScope::Main),
+                    stage: EvidenceStage::Document,
+                    normalized_chars: 100,
+                },
+                content::ExactMember {
+                    url: "=SUM(A1:A2)".into(),
+                    scope: Some(content::ContentScope::Body),
+                    stage: EvidenceStage::Document,
+                    normalized_chars: 100,
+                },
+            ],
+        };
+        let analysis = ContentAnalysis {
+            all_groups: vec![group.clone()],
+            groups: vec![group],
+            ..ContentAnalysis::default()
+        };
+        let source = ContentExportSource {
+            analysis: Arc::new(analysis),
+            subview: DuplicateSubview::SameText,
+            rows: vec![ContentRowRef::Group(0)],
+            context: vec![
+                "x".repeat(2_000),
+                "2026-11-20T00:00:00Z".into(),
+                "HTML".into(),
+                "1".into(),
+                "complete".into(),
+            ],
+            slug: "duplicate-same-text",
+        };
+        let (headers, rows) = content_export_rows(&source, &AtomicBool::new(false)).expect("rows");
+        let refs = headers.iter().map(String::as_str).collect::<Vec<_>>();
+        let csv = calmtoad::export::to_csv(&refs, &rows);
+        assert!(csv.contains("quote,\"\"line"));
+        assert!(csv.contains("line\nbreak"));
+        assert!(csv.contains("'=SUM(A1:A2)"));
+        assert!(csv.contains(&"x".repeat(2_000)));
+    }
+
+    #[test]
+    #[ignore = "local 50k-member duplicate-content export measurement"]
+    fn duplicate_content_export_of_50k_members_runs_in_background() {
+        let members = (0..50_000)
+            .map(|index| content::ExactMember {
+                url: format!("https://example.com/member/{index}"),
+                scope: Some(content::ContentScope::Main),
+                stage: EvidenceStage::Document,
+                normalized_chars: 100,
+            })
+            .collect::<Vec<_>>();
+        let group = content::ExactGroup {
+            id: "exact-50k".into(),
+            representative: "https://example.com/member/0".into(),
+            hash_hex: "hash".into(),
+            stage: EvidenceStage::Document,
+            policy_version: content::POLICY_VERSION,
+            scope: Some(content::ContentScope::Main),
+            normalized_chars: 100,
+            members,
+        };
+        let analysis = ContentAnalysis {
+            all_groups: vec![group.clone()],
+            groups: vec![group],
+            similar_affected_urls: 50_000,
+            ..ContentAnalysis::default()
+        };
+        let mut state = init();
+        state.tab = Tab::Internal;
+        state.internal_view = InternalView::DuplicateContent;
+        state.duplicate_subview = DuplicateSubview::SameText;
+        state.content_phase = ContentPhase::Ready;
+        state.content_analysis = Some(Arc::new(analysis));
+        state.content_rows = vec![ContentRowRef::Group(0)];
+        state.content_visible = vec![0];
+        let started = Instant::now();
+        assert!(start_content_export(&mut state));
+        let trigger = started.elapsed();
+        let job = state.content_export_job.take().expect("job");
+        let prepared = job.rx.recv_timeout(Duration::from_secs(30)).expect("csv");
+        let elapsed = started.elapsed();
+        assert_eq!(prepared.row_count, 50_000);
+        assert!(prepared.csv.len() > 1_000_000);
+        eprintln!(
+            "50k member export: trigger {trigger:?}, total {elapsed:?}, bytes {}",
+            prepared.csv.len()
+        );
+        assert!(trigger < Duration::from_millis(8));
+    }
+
+    #[test]
     fn inventory_writer_is_safe_and_gates_install_until_finished() {
         let dir = tempfile::TempDir::new().expect("dir");
         let destination = dir.path().join("inventory.csv");
@@ -10781,6 +13260,44 @@ mod tests {
         stop_owned_work(&mut state);
         assert!(job_cancel.load(Ordering::Relaxed));
         assert!(!temp_path.exists(), "close removes the abandoned temp file");
+    }
+
+    #[test]
+    #[ignore = "local content snapshot/poll measurement"]
+    fn content_snapshot_trigger_and_poll_stay_within_the_budget() {
+        let mut state = init();
+        let template = crawl::sample_pages().remove(0);
+        let content = Arc::new(ContentEvidence::default());
+        let pages = (0..50_000)
+            .map(|index| {
+                let mut page = template.clone();
+                page.url = format!("https://example.com/content/page-{index}");
+                page.content = content.clone();
+                page
+            })
+            .collect::<Vec<_>>();
+        state.pages = pages;
+        state.search_index = state.pages.iter().map(page_search_text).collect();
+        state.audit = Arc::new(Audit::from_pages(&state.pages));
+        state.phase = RunPhase::Completed;
+        let started = Instant::now();
+        start_content_analysis(&mut state);
+        let trigger = started.elapsed();
+        assert!(state.content_prepare.is_some());
+        let started = Instant::now();
+        let changed = poll_content_analysis(&mut state);
+        let poll = started.elapsed();
+        assert!(!changed);
+        assert!(
+            state
+                .content_prepare
+                .as_ref()
+                .is_some_and(|job| job.next == 512)
+        );
+        eprintln!("content snapshot 50k: trigger {trigger:?}, first poll {poll:?}");
+        assert!(trigger < Duration::from_millis(8));
+        assert!(poll < Duration::from_millis(8));
+        cancel_content_analysis(&mut state, false);
     }
 
     #[test]
@@ -11028,6 +13545,130 @@ mod tests {
         assert!(rt.find("extraction-content").is_some());
         assert!(rt.state.details_open);
         assert!(rt.state.extraction_open);
+    }
+
+    #[test]
+    fn duplicate_content_view_has_independent_state_and_compact_controls() {
+        let mut state = init();
+        scene_duplicate_content(&mut state);
+        assert_eq!(state.internal_view, InternalView::DuplicateContent);
+        assert_eq!(state.duplicate_subview, DuplicateSubview::SameText);
+        assert!(!state.content_rows.is_empty());
+        let same_rows = state.content_rows.len();
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("internal-urls").is_some());
+        assert!(rt.find("internal-duplicates").is_some());
+        assert!(rt.find("content-same").is_some());
+        assert!(rt.find("content-similar").is_some());
+        assert!(rt.find("content-not-compared").is_some());
+        click_key(&mut rt, "content-similar");
+        assert_eq!(rt.state.duplicate_subview, DuplicateSubview::Similar);
+        assert!(!rt.state.content_rows.is_empty());
+        click_key(&mut rt, "internal-urls");
+        assert_eq!(rt.state.internal_view, InternalView::Urls);
+        click_key(&mut rt, "internal-duplicates");
+        assert_eq!(rt.state.internal_view, InternalView::DuplicateContent);
+        assert_eq!(rt.state.duplicate_subview, DuplicateSubview::Similar);
+        assert!(!rt.state.content_rows.is_empty());
+        assert_ne!(same_rows, 0);
+    }
+
+    #[test]
+    fn duplicate_content_inspector_and_exports_expose_evidence() {
+        let mut state = init();
+        scene_duplicate_content(&mut state);
+        let group_id = state.content_row_keys.first().cloned().expect("group");
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        rt.update(|state: &mut State, _| {
+            state.duplicate_view.selected = Some(group_id.clone());
+            state.table.select(group_id);
+            state.details_open = true;
+        });
+        rt.frame(0.016);
+        assert!(
+            rt.find("content-members-next").is_some()
+                || rt
+                    .find("content-member-show-https://example.com/pricing")
+                    .is_some()
+        );
+        let (headers, rows, title, slug) = content_export(&rt.state);
+        assert_eq!(title, "Same normalized text");
+        assert_eq!(slug, "duplicate-same-text");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(headers[0], "GROUP ID");
+
+        rt.update(|state: &mut State, _| {
+            state.duplicate_subview = DuplicateSubview::Similar;
+            state.details_open = false;
+            refresh_visible_forced(state);
+        });
+        rt.frame(0.016);
+        assert!(!rt.state.content_rows.is_empty());
+        let pair_id = rt.state.content_row_keys.first().cloned().expect("pair");
+        rt.update(|state: &mut State, _| {
+            state.duplicate_view.selected = Some(pair_id.clone());
+            state.table.select(pair_id.clone());
+            state.details_open = true;
+        });
+        rt.frame(0.016);
+        assert!(rt.find("content-left-members-toggle").is_some());
+        click_key(&mut rt, "content-left-members-toggle");
+        assert!(rt.find("content-left-members").is_some());
+        let (headers, rows, title, _) = content_export(&rt.state);
+        assert_eq!(title, "Similar content pairs");
+        assert_eq!(headers[0], "PAIR ID");
+        assert!(!rows.is_empty());
+        rt.update(|state: &mut State, _| {
+            state.duplicate_view.query.replace_text("pricing");
+            refresh_visible_forced(state);
+        });
+        rt.frame(0.016);
+        assert!(
+            !rt.state.content_visible.is_empty(),
+            "a nonrepresentative exact member must retain its similar pair"
+        );
+        rt.update(|state: &mut State, _| {
+            state
+                .duplicate_view
+                .query
+                .replace_text("unrelated-no-match");
+            refresh_visible_forced(state);
+        });
+        rt.frame(0.016);
+        assert!(rt.state.content_visible.is_empty());
+    }
+
+    #[test]
+    fn duplicate_content_links_appear_on_overview_and_fit_narrow_window() {
+        let mut state = init();
+        scene_duplicate_content(&mut state);
+        switch_tab(&mut state, Tab::Overview);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("overview-content-same").is_some());
+        assert!(rt.find("overview-content-similar").is_some());
+        click_key(&mut rt, "overview-content-same");
+        assert_eq!(rt.state.internal_view, InternalView::DuplicateContent);
+        assert_eq!(rt.state.duplicate_subview, DuplicateSubview::SameText);
+
+        let mut narrow = init();
+        scene_duplicate_content(&mut narrow);
+        let mut rt = Runtime::new(
+            narrow,
+            view,
+            (880.0, 560.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.016);
+        assert!(rt.find("internal-duplicates").is_some());
+        assert!(rt.find("content-similar").is_some());
+        assert!(rt.find("result-search").is_some());
+        assert!(rt.find("export-csv").is_some());
     }
 
     #[test]
@@ -11852,6 +14493,7 @@ mod tests {
             link_evidence_limit: String::new(),
             extraction: Vec::new().into(),
             extraction_limit: String::new(),
+            content: Arc::new(ContentEvidence::default()),
             indexability: assessment,
         };
         assert_eq!(page.indexability.label, Label::NotAssessed);
@@ -11987,6 +14629,7 @@ mod tests {
             link_evidence_limit: String::new(),
             extraction: Vec::new().into(),
             extraction_limit: String::new(),
+            content: Arc::new(ContentEvidence::default()),
             indexability: assessment,
         };
         assert_eq!(page.indexability.label, Label::NotAssessed);
