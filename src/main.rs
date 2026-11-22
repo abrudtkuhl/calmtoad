@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use calmtoad::content::{self, ContentAnalysis, ContentEvidence, ContentInput};
@@ -29,6 +29,7 @@ use calmtoad::inventory;
 use calmtoad::links::{LinkCheckResult, LinkOccurrence};
 use calmtoad::render::{self, RenderMode, RenderState, SourceState};
 use calmtoad::sitemap::{FileState, SitemapFile, SitemapKind, SitemapReport, SitemapUrl, UrlState};
+use calmtoad::structured_data;
 use calmtoad::update;
 use rune::tooling::AppSpec;
 use rune::{
@@ -79,6 +80,13 @@ enum LinksView {
 enum InternalView {
     Urls,
     DuplicateContent,
+    StructuredData,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructuredView {
+    Pages,
+    Blocks,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,6 +248,8 @@ struct RelationPages {
     h1: usize,
     inbound: usize,
     outbound: usize,
+    structured_types: usize,
+    structured_duplicates: usize,
 }
 
 const RELATION_PAGE: usize = 25;
@@ -427,7 +437,7 @@ fn sync_relation_selection(state: &mut State, selected: Option<&str>) {
 }
 
 /// Counts for the active view, independent of the search query.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ViewCounts {
     total: usize,
     findings: usize,
@@ -454,6 +464,8 @@ struct OverviewCounts {
     link_incomplete: usize,
     content_same_urls: usize,
     content_similar_urls: usize,
+    structured_urls: usize,
+    structured_incomplete: usize,
 }
 
 impl OverviewCounts {
@@ -473,6 +485,7 @@ impl OverviewCounts {
         self.groups().iter().any(|(_, count)| *count > 0)
             || self.content_same_urls > 0
             || self.content_similar_urls > 0
+            || self.structured_urls > 0
     }
 }
 
@@ -583,6 +596,14 @@ fn overview_counts(
             .count(),
         content_same_urls: content.map_or(0, ContentAnalysis::same_text_affected),
         content_similar_urls: content.map_or(0, ContentAnalysis::similar_affected),
+        structured_urls: pages
+            .iter()
+            .filter(|page| page.structured.has_confirmed_finding())
+            .count(),
+        structured_incomplete: pages
+            .iter()
+            .filter(|page| page.structured.is_incomplete())
+            .count(),
     }
 }
 
@@ -634,6 +655,92 @@ struct CrawlJob {
     cancel: Arc<AtomicBool>,
     /// A Stop has been requested; the worker may still be finishing.
     stopping: bool,
+}
+
+/// One page's structured-data facts, shared into background filters/sorts without cloning
+/// report evidence. URLs are `Arc<str>` so a worker snapshot copies pointers, not strings.
+#[derive(Clone, Debug)]
+struct StructuredPageFact {
+    url: Arc<str>,
+    report: Arc<structured_data::PageReport>,
+}
+
+/// A queued or running Structured pages/blocks refresh. The page snapshot is built in bounded
+/// poll steps; filtering and sorting then run on a worker with an owned pointer-only snapshot.
+struct StructuredRefreshJob {
+    generation: u64,
+    epoch: u64,
+    view: StructuredView,
+    query: String,
+    filter: CheckFilter,
+    sort: (String, SortDir),
+    pages_len: usize,
+    cancel: Arc<AtomicBool>,
+    /// Test-only gate that holds a spawned worker before it touches its snapshot, proving the
+    /// snapshot lease is owned by the allocation rather than the UI job.
+    pause: Option<Arc<WorkerGate>>,
+    rx: Option<mpsc::Receiver<StructuredRefreshOutcome>>,
+}
+
+struct WorkerGate {
+    open: Mutex<bool>,
+    ready: Condvar,
+    entered: AtomicBool,
+}
+
+impl WorkerGate {
+    #[cfg(test)]
+    fn closed() -> Self {
+        Self {
+            open: Mutex::new(false),
+            ready: Condvar::new(),
+            entered: AtomicBool::new(false),
+        }
+    }
+
+    fn wait(&self) {
+        self.entered.store(true, Ordering::Relaxed);
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.ready.wait(open).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    fn has_entered(&self) -> bool {
+        self.entered.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.ready.notify_all();
+    }
+}
+
+struct StructuredRefreshOutcome {
+    view: StructuredView,
+    generation: u64,
+    epoch: u64,
+    pages_len: usize,
+    visible: Vec<usize>,
+    blocks: Vec<StructuredBlockRef>,
+    keys: Vec<String>,
+    counts: ViewCounts,
+    /// Bytes reserved for `visible`/`blocks`/`keys`; transferred to the view caches on apply.
+    reserved: usize,
+    limited: Option<Arc<str>>,
+    block_table_limited: bool,
+    /// Releases the result reservation if this outcome is dropped without being applied.
+    budget: Option<Arc<structured_data::StructuredBudget>>,
+}
+
+impl Drop for StructuredRefreshOutcome {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.take() {
+            budget.release(self.reserved);
+        }
+    }
 }
 
 /// What the update strip is showing.
@@ -883,6 +990,63 @@ enum ContentRowRef {
     NotCompared(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StructuredBlockRef {
+    page: usize,
+    block: usize,
+}
+
+struct StructuredExportJob {
+    rx: mpsc::Receiver<Result<PreparedStructuredExport, String>>,
+    cancel: Arc<AtomicBool>,
+    epoch: u64,
+    /// Snapshot plus projection/encoded-output reservation. Moves into the save dialog/writer
+    /// so the prepared CSV stays charged until it is actually dropped.
+    lease: LedgerLease,
+}
+
+struct PreparedStructuredExport {
+    csv: String,
+    row_count: usize,
+    scope: String,
+    slug: &'static str,
+}
+
+/// Owns a shared-ledger reservation until the allocation it pays for is actually dropped.
+/// Clones share one reservation, so a worker, a UI job and a save/write owner can each keep the
+/// bytes charged; the last owner to drop releases them.
+#[derive(Clone)]
+struct LedgerLease {
+    inner: Arc<LedgerLeaseInner>,
+}
+
+struct LedgerLeaseInner {
+    budget: Arc<structured_data::StructuredBudget>,
+    bytes: usize,
+}
+
+impl Drop for LedgerLeaseInner {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+impl LedgerLease {
+    fn new(budget: Arc<structured_data::StructuredBudget>, bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(LedgerLeaseInner { budget, bytes }),
+        }
+    }
+
+    /// Extend before the lease is shared. All export reservations are added while the UI job is
+    /// still the only owner.
+    fn add(&mut self, bytes: usize) {
+        let inner =
+            Arc::get_mut(&mut self.inner).expect("extend the export lease before it is shared");
+        inner.bytes = inner.bytes.saturating_add(bytes);
+    }
+}
+
 struct State {
     url: TextEdit,
     rendering: RenderMode,
@@ -968,6 +1132,36 @@ struct State {
     internal_view: InternalView,
     duplicate_subview: DuplicateSubview,
     duplicate_view: ViewState,
+    structured_subview: StructuredView,
+    structured_pages_view: ViewState,
+    structured_blocks_view: ViewState,
+    /// Page indices after the Structured pages view's query and filter, in display order.
+    structured_pages_visible: Vec<usize>,
+    /// Pointer-only page snapshot shared into background filters/sorts.
+    structured_facts: Vec<StructuredPageFact>,
+    structured_facts_epoch: u64,
+    /// Reserved bytes held by `structured_facts`.
+    structured_facts_bytes: usize,
+    structured_blocks: Vec<StructuredBlockRef>,
+    structured_block_keys: Vec<String>,
+    structured_block_visible: Vec<usize>,
+    /// True when the Blocks view stopped materializing rows at its bounded row cap.
+    structured_blocks_limited: bool,
+    /// Number of `pages` already materialized into `structured_blocks` for streaming append.
+    structured_block_pages: usize,
+    /// Nonempty when an index/snapshot reservation failed or a documented cap applies.
+    structured_index_limited: Option<Arc<str>>,
+    structured_refresh: Option<StructuredRefreshJob>,
+    structured_refresh_generation: u64,
+    /// Pages already appended to the visible list during a streaming crawl.
+    structured_pages_streamed: usize,
+    /// Reserved bytes held by each view's result cache. Pages and Blocks keep independent
+    /// visible/sort state, so their reservations coexist in the shared ledger.
+    structured_pages_cache_bytes: usize,
+    structured_blocks_cache_bytes: usize,
+    /// The run's retained structured evidence plus derived index/snapshot ledger.
+    structured_budget: Arc<structured_data::StructuredBudget>,
+    structured_export_job: Option<StructuredExportJob>,
     content_phase: ContentPhase,
     content_analysis: Option<Arc<ContentAnalysis>>,
     content_prepare: Option<ContentPrepareJob>,
@@ -1096,6 +1290,26 @@ fn init() -> State {
         internal_view: InternalView::Urls,
         duplicate_subview: DuplicateSubview::SameText,
         duplicate_view: ViewState::new("url"),
+        structured_subview: StructuredView::Pages,
+        structured_pages_view: ViewState::new("url"),
+        structured_blocks_view: ViewState::new("url"),
+        structured_pages_visible: Vec::new(),
+        structured_facts: Vec::new(),
+        structured_facts_epoch: 0,
+        structured_facts_bytes: 0,
+        structured_blocks: Vec::new(),
+        structured_block_keys: Vec::new(),
+        structured_block_visible: Vec::new(),
+        structured_blocks_limited: false,
+        structured_block_pages: 0,
+        structured_index_limited: None,
+        structured_refresh: None,
+        structured_refresh_generation: 0,
+        structured_pages_streamed: 0,
+        structured_pages_cache_bytes: 0,
+        structured_blocks_cache_bytes: 0,
+        structured_budget: Arc::new(structured_data::StructuredBudget::default()),
+        structured_export_job: None,
         content_phase: ContentPhase::Idle,
         content_analysis: None,
         content_prepare: None,
@@ -1150,8 +1364,17 @@ impl State {
         if self.tab == Tab::Links && self.links_view == LinksView::Evidence {
             return &self.link_view;
         }
-        if self.tab == Tab::Internal && self.internal_view == InternalView::DuplicateContent {
-            return &self.duplicate_view;
+        if self.tab == Tab::Internal {
+            match self.internal_view {
+                InternalView::DuplicateContent => return &self.duplicate_view,
+                InternalView::StructuredData => {
+                    return match self.structured_subview {
+                        StructuredView::Pages => &self.structured_pages_view,
+                        StructuredView::Blocks => &self.structured_blocks_view,
+                    };
+                }
+                InternalView::Urls => {}
+            }
         }
         &self.views[view_slot(self.tab, self.sitemap_view)]
     }
@@ -1160,12 +1383,33 @@ impl State {
         if self.tab == Tab::Links && self.links_view == LinksView::Evidence {
             return &mut self.link_view;
         }
-        if self.tab == Tab::Internal && self.internal_view == InternalView::DuplicateContent {
-            return &mut self.duplicate_view;
+        if self.tab == Tab::Internal {
+            match self.internal_view {
+                InternalView::DuplicateContent => return &mut self.duplicate_view,
+                InternalView::StructuredData => {
+                    return match self.structured_subview {
+                        StructuredView::Pages => &mut self.structured_pages_view,
+                        StructuredView::Blocks => &mut self.structured_blocks_view,
+                    };
+                }
+                InternalView::Urls => {}
+            }
         }
         let slot = view_slot(self.tab, self.sitemap_view);
         &mut self.views[slot]
     }
+}
+
+fn structured_view_active(state: &State) -> bool {
+    state.tab == Tab::Internal && state.internal_view == InternalView::StructuredData
+}
+
+fn structured_pages_active(state: &State) -> bool {
+    structured_view_active(state) && state.structured_subview == StructuredView::Pages
+}
+
+fn structured_blocks_active(state: &State) -> bool {
+    structured_view_active(state) && state.structured_subview == StructuredView::Blocks
 }
 
 fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
@@ -1186,7 +1430,12 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
         | poll_inventory_export(state, tx)
         | poll_inventory_write(state);
     let content_changed = poll_content_analysis(state) | poll_content_export(state, tx);
+    let structured_changed = poll_structured_export(state, tx);
+    let structured_view_changed = poll_structured_view(state);
     if state.inventory_prepare.is_some() || state.content_prepare.is_some() {
+        tx.wake_after(Duration::from_millis(1));
+    }
+    if state.structured_refresh.is_some() {
         tx.wake_after(Duration::from_millis(1));
     }
     if state.crawl_more {
@@ -1201,6 +1450,8 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
         || preview_changed
         || inventory_changed
         || content_changed
+        || structured_changed
+        || structured_view_changed
 }
 
 fn cancel_content_analysis(state: &mut State, keep_worker: bool) {
@@ -1458,6 +1709,7 @@ fn poll_inventory_export(state: &mut State, tx: &mut Tx) -> bool {
                 "content-inventory",
                 true,
                 "inventory",
+                None,
             );
             true
         }
@@ -1540,6 +1792,7 @@ fn start_extraction_preview(state: &mut State) {
                 browser_path,
                 check_links: false,
                 extraction_rules: rules.clone(),
+                structured_budget: None,
             },
             worker_cancel,
             |_| {},
@@ -1818,6 +2071,9 @@ fn poll_crawl(state: &mut State) -> bool {
             if state.tab == Tab::Sitemaps {
                 sort_sitemap(state);
             }
+            if structured_view_active(state) {
+                refresh_visible_forced(state);
+            }
             // Keep a still-valid selection; otherwise the first visible row is chosen by
             // `sync_selection`. Never jump to a Page URL while Sitemap Files is showing.
             sync_selection(state);
@@ -1932,6 +2188,8 @@ fn can_install(state: &State) -> bool {
         && state.content_prepare.is_none()
         && state.content_job.is_none()
         && state.content_export_job.is_none()
+        && state.structured_export_job.is_none()
+        && state.structured_refresh.is_none()
         && matches!(state.update, UpdateUi::Ready(_))
 }
 
@@ -1945,6 +2203,7 @@ fn export_lifecycle_busy(state: &State) -> bool {
         || state.inventory_write.is_some()
         || state.inventory_dialog_open
         || state.content_export_job.is_some()
+        || state.structured_export_job.is_some()
 }
 
 fn start_install(state: &mut State, tx: &mut Tx) {
@@ -2046,6 +2305,7 @@ fn start_crawl(state: &mut State) {
         || state.inventory_write.is_some()
         || state.inventory_dialog_open
         || state.content_export_job.is_some()
+        || state.structured_export_job.is_some()
     {
         state.message = "Finish the export before starting a crawl.".into();
         return;
@@ -2103,6 +2363,11 @@ fn start_crawl(state: &mut State) {
     state.pages.clear();
     reset_inspector_dataset(state);
     state.search_index.clear();
+    if let Some(job) = state.structured_export_job.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+    reset_structured_view_cache(state);
+    state.structured_budget = Arc::new(structured_data::StructuredBudget::default());
     state.visible.clear();
     state.audit = Arc::new(Audit::default());
     state.counts = Counts::default();
@@ -2137,6 +2402,7 @@ fn start_crawl(state: &mut State) {
         browser_path: state.browser.path.clone(),
         check_links: state.check_links,
         extraction_rules: state.extraction_rules.clone(),
+        structured_budget: Some(state.structured_budget.clone()),
     };
     state.job = Some(CrawlJob {
         rx,
@@ -2177,6 +2443,15 @@ fn start_crawl(state: &mut State) {
 
 fn reset_view_searches(state: &mut State) {
     for view in &mut state.views {
+        view.query.replace_text("");
+        view.filter = CheckFilter::All;
+        view.selected = None;
+    }
+    for view in [
+        &mut state.duplicate_view,
+        &mut state.structured_pages_view,
+        &mut state.structured_blocks_view,
+    ] {
         view.query.replace_text("");
         view.filter = CheckFilter::All;
         view.selected = None;
@@ -2230,6 +2505,10 @@ fn stop_owned_work(state: &mut State) {
     if let Some(job) = &state.content_export_job {
         job.cancel.store(true, Ordering::Relaxed);
     }
+    if let Some(job) = state.structured_export_job.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+    cancel_structured_refresh(state);
 }
 
 fn read_is_incomplete(status: u16, content_type: &str, read: ReadState) -> bool {
@@ -2370,6 +2649,17 @@ fn visible_id_ref(state: &State, row: usize) -> Option<&str> {
         let row = *state.content_visible.get(row)?;
         return state.content_row_keys.get(row).map(String::as_str);
     }
+    if structured_pages_active(state) {
+        return state
+            .structured_pages_visible
+            .get(row)
+            .and_then(|index| state.pages.get(*index))
+            .map(|page| page.url.as_str());
+    }
+    if structured_blocks_active(state) {
+        let row = *state.structured_block_visible.get(row)?;
+        return state.structured_block_keys.get(row).map(String::as_str);
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         let row = *state.link_visible.get(row)?;
         return state.link_row_keys.get(row).map(String::as_str);
@@ -2420,6 +2710,24 @@ fn sync_selection(state: &mut State) {
             }
             None => {
                 state.duplicate_view.selected = None;
+                state.table.clear_selection();
+            }
+        }
+        return;
+    }
+    if structured_view_active(state) {
+        let count = visible_len(state);
+        let current = state.view().selected.clone();
+        let chosen = current
+            .filter(|id| (0..count).any(|row| visible_id_ref(state, row) == Some(id.as_str())))
+            .or_else(|| visible_id(state, 0));
+        match chosen {
+            Some(id) => {
+                state.view_mut().selected = Some(id.clone());
+                state.table.select(id);
+            }
+            None => {
+                state.view_mut().selected = None;
                 state.table.clear_selection();
             }
         }
@@ -2489,6 +2797,10 @@ fn refresh_visible_forced(state: &mut State) {
 fn refresh_visible_inner(state: &mut State, force: bool) {
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         refresh_content_visible_inner(state, force);
+        return;
+    }
+    if structured_view_active(state) {
+        refresh_structured_visible_inner(state, force);
         return;
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
@@ -2777,6 +3089,941 @@ fn refresh_content_visible_inner(state: &mut State, _force: bool) {
 
 fn set_content_sort(state: &mut State, column: &str, direction: SortDir) {
     state.duplicate_view.sort = (column.to_string(), direction);
+    state.table.set_sort(column, direction);
+    refresh_visible_forced(state);
+}
+
+const MAX_STRUCTURED_SEARCH_BYTES: usize = 8 * 1024;
+const MAX_STRUCTURED_BLOCK_ROWS: usize = 100_000;
+/// Small fixtures keep the original immediate projection. Above these row counts the same
+/// pure projection runs on a worker so no single UI step indexes or sorts the whole corpus.
+const STRUCTURED_SYNC_PAGES: usize = 256;
+const STRUCTURED_SYNC_BLOCKS: usize = 2_048;
+/// Pointer-only page facts added per poll while a large snapshot is being prepared.
+const STRUCTURED_FACT_BATCH: usize = 2_048;
+/// Conservative slot estimates include allocator/growth headroom; the budget is a retained
+/// data ledger, not an exact allocator account.
+const STRUCTURED_VISIBLE_SLOT: usize = 2 * std::mem::size_of::<usize>();
+const STRUCTURED_BLOCK_SLOT: usize = 2 * std::mem::size_of::<StructuredBlockRef>();
+const STRUCTURED_KEY_OVERHEAD: usize = 2 * std::mem::size_of::<usize>() + 32;
+
+fn structured_search_field(field: &str, needle: &str) -> bool {
+    field.to_lowercase().contains(needle)
+}
+
+/// Match every retained supported field independently. There is no concatenated 8 KiB
+/// prefix, so a marker in the last retained type/ID/path or a later script ID still matches.
+fn structured_page_matches(url: &str, report: &structured_data::PageReport, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    macro_rules! hit {
+        ($value:expr) => {
+            if structured_search_field($value, needle) {
+                return true;
+            }
+        };
+    }
+    hit!(url);
+    hit!(report.stage.label());
+    hit!(report.capture.label());
+    hit!(report.inspection.label());
+    hit!(&report.capture_reason);
+    hit!(&report.inspection_reason);
+    for limitation in &report.limitations {
+        hit!(limitation);
+    }
+    for block in &report.blocks {
+        hit!(&block.script_id);
+        hit!(&block.declared_type);
+        hit!(block.syntax.label());
+        hit!(block.root.label());
+        hit!(block.inventory.label());
+        if let Some(error) = &block.error {
+            hit!(&error.message);
+            hit!(error.category.label());
+        }
+        for item in &block.types {
+            hit!(&item.value);
+            hit!(&item.path);
+        }
+        for item in &block.ids {
+            hit!(&item.value);
+            hit!(&item.path);
+        }
+        for item in &block.duplicates {
+            hit!(&item.key);
+            hit!(&item.path);
+        }
+        for limitation in &block.limitations {
+            hit!(limitation);
+        }
+    }
+    false
+}
+
+fn structured_block_matches(url: &str, block: &structured_data::Block, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    macro_rules! hit {
+        ($value:expr) => {
+            if structured_search_field($value, needle) {
+                return true;
+            }
+        };
+    }
+    let ordinal = block.ordinal.to_string();
+    hit!(url);
+    hit!(&ordinal);
+    hit!(&block.script_id);
+    hit!(&block.declared_type);
+    hit!(&block.src);
+    hit!(block.syntax.label());
+    hit!(block.root.label());
+    hit!(block.inventory.label());
+    if let Some(error) = &block.error {
+        hit!(&error.message);
+        hit!(error.category.label());
+    }
+    for item in &block.types {
+        hit!(&item.value);
+        hit!(&item.path);
+    }
+    for item in &block.ids {
+        hit!(&item.value);
+        hit!(&item.path);
+    }
+    for item in &block.duplicates {
+        hit!(&item.key);
+        hit!(&item.path);
+    }
+    for limitation in &block.limitations {
+        hit!(limitation);
+    }
+    false
+}
+
+fn structured_block_finding(page: &Page, block: &structured_data::Block) -> bool {
+    page.structured.capture == structured_data::CaptureCompleteness::Complete
+        && (block.is_parse_finding() || block.has_duplicate_finding())
+}
+
+fn structured_block_incomplete(page: &Page, block: &structured_data::Block) -> bool {
+    page.structured.capture != structured_data::CaptureCompleteness::Complete
+        || page.structured.inspection != structured_data::InspectionCoverage::Complete
+        || matches!(
+            block.syntax,
+            structured_data::SyntaxOutcome::ParserLimit
+                | structured_data::SyntaxOutcome::NotInspected
+                | structured_data::SyntaxOutcome::Cancelled
+        )
+}
+
+fn reset_structured_caches(state: &mut State) {
+    state
+        .structured_budget
+        .release(state.structured_facts_bytes);
+    state
+        .structured_budget
+        .release(state.structured_pages_cache_bytes);
+    state
+        .structured_budget
+        .release(state.structured_blocks_cache_bytes);
+    state.structured_facts.clear();
+    state.structured_facts_epoch = state.pages_epoch;
+    state.structured_facts_bytes = 0;
+    state.structured_pages_cache_bytes = 0;
+    state.structured_blocks_cache_bytes = 0;
+    state.structured_pages_visible.clear();
+    state.structured_pages_streamed = 0;
+    state.structured_blocks.clear();
+    state.structured_block_keys.clear();
+    state.structured_block_visible.clear();
+    state.structured_blocks_limited = false;
+    state.structured_block_pages = 0;
+    state.structured_index_limited = None;
+    state.view_counts = ViewCounts::default();
+}
+
+fn reset_structured_view_cache(state: &mut State) {
+    cancel_structured_refresh(state);
+    reset_structured_caches(state);
+}
+
+fn cancel_structured_refresh(state: &mut State) {
+    state.structured_refresh_generation = state.structured_refresh_generation.wrapping_add(1);
+    if let Some(job) = state.structured_refresh.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Add pointer-only page facts in bounded batches. Returns true when the target is reached or
+/// the aggregate ledger cannot retain another fact.
+fn append_structured_facts(state: &mut State, until: usize) -> bool {
+    if state.structured_facts_epoch != state.pages_epoch
+        || state.structured_facts.len() > state.pages.len()
+    {
+        reset_structured_caches(state);
+    }
+    let target = until.min(state.pages.len());
+    let end = state
+        .structured_facts
+        .len()
+        .saturating_add(STRUCTURED_FACT_BATCH)
+        .min(target);
+    while state.structured_facts.len() < end {
+        let index = state.structured_facts.len();
+        let page = &state.pages[index];
+        let url = Arc::<str>::from(page.url.as_str());
+        let report = page.structured.clone();
+        let cost = std::mem::size_of::<StructuredPageFact>()
+            .saturating_add(url.len())
+            .saturating_add(2 * std::mem::size_of::<usize>());
+        if !state.structured_budget.try_reserve(cost) {
+            state.structured_index_limited = Some(Arc::from(
+                "The 128 MiB structured-data ledger could not retain more page index facts; affected rows are omitted",
+            ));
+            return true;
+        }
+        state.structured_facts_bytes = state.structured_facts_bytes.saturating_add(cost);
+        state
+            .structured_facts
+            .push(StructuredPageFact { url, report });
+    }
+    state.structured_facts.len() >= target || state.structured_index_limited.is_some()
+}
+
+fn structured_page_facts_match(
+    fact: &StructuredPageFact,
+    filter: CheckFilter,
+    needle: &str,
+) -> bool {
+    let is_finding = fact.report.has_confirmed_finding();
+    let is_incomplete = fact.report.is_incomplete();
+    let keep = match filter {
+        CheckFilter::All => true,
+        CheckFilter::Findings => is_finding,
+        CheckFilter::Incomplete => is_incomplete,
+    };
+    keep && structured_page_matches(&fact.url, &fact.report, needle)
+}
+
+fn compare_page_facts(
+    left: &StructuredPageFact,
+    right: &StructuredPageFact,
+    column: &str,
+) -> std::cmp::Ordering {
+    let order = match column {
+        "blocks" => left
+            .report
+            .blocks_observed
+            .cmp(&right.report.blocks_observed),
+        "types" => left
+            .report
+            .literal_types_retained
+            .cmp(&right.report.literal_types_retained),
+        "syntax" => left
+            .report
+            .confirmed_findings()
+            .cmp(&right.report.confirmed_findings()),
+        "coverage" => left
+            .report
+            .inspection
+            .label()
+            .cmp(right.report.inspection.label()),
+        "capture" => left
+            .report
+            .capture_label()
+            .cmp(&right.report.capture_label()),
+        _ => left.url.cmp(&right.url),
+    };
+    order.then_with(|| left.url.cmp(&right.url))
+}
+
+fn structured_refresh_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+}
+
+fn compute_structured_pages(
+    facts: &[StructuredPageFact],
+    needle: &str,
+    filter: CheckFilter,
+    sort: (&str, SortDir),
+    budget: &Arc<structured_data::StructuredBudget>,
+    cancel: Option<&AtomicBool>,
+) -> StructuredRefreshOutcome {
+    let mut findings = 0;
+    let mut incomplete = 0;
+    for fact in facts {
+        findings += usize::from(fact.report.has_confirmed_finding());
+        incomplete += usize::from(fact.report.is_incomplete());
+    }
+    let search_reserved = if needle.is_empty() {
+        0
+    } else if budget.try_reserve(MAX_STRUCTURED_SEARCH_BYTES) {
+        MAX_STRUCTURED_SEARCH_BYTES
+    } else {
+        0
+    };
+    let search_available = needle.is_empty() || search_reserved > 0;
+    let affordable = budget.remaining() / STRUCTURED_VISIBLE_SLOT;
+    let mut cap = facts.len().min(affordable);
+    let mut reserved = cap.saturating_mul(STRUCTURED_VISIBLE_SLOT);
+    let mut limited = None;
+    let mut visible = Vec::new();
+    if cap > 0 && !budget.try_reserve(reserved) {
+        cap = 0;
+        reserved = 0;
+        limited = Some(Arc::from(
+            "The 128 MiB structured-data ledger could not retain the visible page index",
+        ));
+    } else if cap > 0 {
+        visible.reserve_exact(cap);
+    }
+    {
+        if !search_available {
+            limited = Some(Arc::from(
+                "The 128 MiB structured-data ledger could not reserve the transient search text",
+            ));
+        }
+        for (index, fact) in facts.iter().enumerate() {
+            if !search_available {
+                break;
+            }
+            if index % 1024 == 0 && structured_refresh_cancelled(cancel) {
+                limited = Some(Arc::from("Structured-data view refresh was cancelled"));
+                break;
+            }
+            if !structured_page_facts_match(fact, filter, needle) {
+                continue;
+            }
+            if visible.len() >= cap {
+                limited = Some(Arc::from(
+                    "The 128 MiB structured-data ledger reached its visible page index bound; later matches are omitted",
+                ));
+                break;
+            }
+            visible.push(index);
+        }
+        let (column, direction) = sort;
+        visible.sort_by(|left, right| {
+            direction.apply(compare_page_facts(&facts[*left], &facts[*right], column))
+        });
+    }
+    let reserved = if limited.is_some() && visible.is_empty() {
+        budget.release(reserved);
+        0
+    } else {
+        reserved
+    };
+    budget.release(search_reserved);
+    StructuredRefreshOutcome {
+        view: StructuredView::Pages,
+        generation: 0,
+        epoch: 0,
+        pages_len: facts.len(),
+        visible,
+        blocks: Vec::new(),
+        keys: Vec::new(),
+        counts: ViewCounts {
+            total: facts.len(),
+            findings,
+            incomplete,
+        },
+        reserved,
+        limited,
+        block_table_limited: false,
+        budget: if reserved > 0 {
+            Some(budget.clone())
+        } else {
+            None
+        },
+    }
+}
+
+fn compare_block_facts(
+    facts: &[StructuredPageFact],
+    left: StructuredBlockRef,
+    right: StructuredBlockRef,
+    column: &str,
+) -> std::cmp::Ordering {
+    let (Some(left_page), Some(right_page)) = (facts.get(left.page), facts.get(right.page)) else {
+        return std::cmp::Ordering::Equal;
+    };
+    let (Some(left_block), Some(right_block)) = (
+        left_page.report.blocks.get(left.block),
+        right_page.report.blocks.get(right.block),
+    ) else {
+        return std::cmp::Ordering::Equal;
+    };
+    let order = match column {
+        "ordinal" => left_block.ordinal.cmp(&right_block.ordinal),
+        "syntax" => left_block.syntax.label().cmp(right_block.syntax.label()),
+        "root" => left_block.root.label().cmp(right_block.root.label()),
+        "types" => left_block.types.len().cmp(&right_block.types.len()),
+        "duplicates" => left_block.duplicate_count.cmp(&right_block.duplicate_count),
+        "coverage" => left_page
+            .report
+            .inspection
+            .label()
+            .cmp(right_page.report.inspection.label()),
+        _ => left_page.url.cmp(&right_page.url),
+    };
+    order
+        .then_with(|| left_page.url.cmp(&right_page.url))
+        .then_with(|| left_block.ordinal.cmp(&right_block.ordinal))
+}
+
+fn compute_structured_blocks(
+    facts: &[StructuredPageFact],
+    needle: &str,
+    filter: CheckFilter,
+    sort: (&str, SortDir),
+    budget: &Arc<structured_data::StructuredBudget>,
+    cancel: Option<&AtomicBool>,
+) -> StructuredRefreshOutcome {
+    let mut blocks = Vec::new();
+    let mut keys = Vec::new();
+    let mut reserved = 0_usize;
+    let mut findings = 0;
+    let mut incomplete = 0;
+    let mut limited = None;
+    let mut block_table_limited = false;
+    'pages: for (page_index, fact) in facts.iter().enumerate() {
+        if page_index % 256 == 0 && structured_refresh_cancelled(cancel) {
+            limited = Some(Arc::from("Structured-data view refresh was cancelled"));
+            break 'pages;
+        }
+        for (block_index, block) in fact.report.blocks.iter().enumerate() {
+            if blocks.len() >= MAX_STRUCTURED_BLOCK_ROWS {
+                block_table_limited = true;
+                limited = Some(Arc::from(
+                    "The Blocks view is limited to the first 100,000 retained rows",
+                ));
+                break 'pages;
+            }
+            let key = format!("{}#{}", fact.url, block.ordinal);
+            let cost = STRUCTURED_BLOCK_SLOT
+                .saturating_add(key.len())
+                .saturating_add(STRUCTURED_KEY_OVERHEAD);
+            if !budget.try_reserve(cost) {
+                limited = Some(Arc::from(
+                    "The 128 MiB structured-data ledger could not retain more block rows or keys; later blocks are omitted",
+                ));
+                break 'pages;
+            }
+            reserved = reserved.saturating_add(cost);
+            findings += usize::from(structured_block_finding_fact(fact, block));
+            incomplete += usize::from(structured_block_incomplete_fact(fact, block));
+            blocks.push(StructuredBlockRef {
+                page: page_index,
+                block: block_index,
+            });
+            keys.push(key);
+        }
+    }
+    let search_reserved = if needle.is_empty() {
+        0
+    } else if budget.try_reserve(MAX_STRUCTURED_SEARCH_BYTES) {
+        MAX_STRUCTURED_SEARCH_BYTES
+    } else {
+        0
+    };
+    let search_available = needle.is_empty() || search_reserved > 0;
+    if !search_available {
+        limited = Some(Arc::from(
+            "The 128 MiB structured-data ledger could not reserve the transient search text",
+        ));
+    }
+    let mut visible = Vec::new();
+    for (index, row) in blocks.iter().enumerate() {
+        if !search_available {
+            break;
+        }
+        let Some(fact) = facts.get(row.page) else {
+            continue;
+        };
+        let Some(block) = fact.report.blocks.get(row.block) else {
+            continue;
+        };
+        let keep = match filter {
+            CheckFilter::All => true,
+            CheckFilter::Findings => structured_block_finding_fact(fact, block),
+            CheckFilter::Incomplete => structured_block_incomplete_fact(fact, block),
+        } && structured_block_matches(&fact.url, block, needle);
+        if !keep {
+            continue;
+        }
+        if !budget.try_reserve(STRUCTURED_VISIBLE_SLOT) {
+            limited = Some(Arc::from(
+                "The 128 MiB structured-data ledger reached its visible block index bound; later matches are omitted",
+            ));
+            break;
+        }
+        reserved = reserved.saturating_add(STRUCTURED_VISIBLE_SLOT);
+        visible.push(index);
+    }
+    let (column, direction) = sort;
+    visible.sort_by(|left, right| {
+        direction.apply(compare_block_facts(
+            facts,
+            blocks[*left],
+            blocks[*right],
+            column,
+        ))
+    });
+    let total = blocks.len();
+    budget.release(search_reserved);
+    StructuredRefreshOutcome {
+        view: StructuredView::Blocks,
+        generation: 0,
+        epoch: 0,
+        pages_len: facts.len(),
+        visible,
+        blocks,
+        keys,
+        counts: ViewCounts {
+            total,
+            findings,
+            incomplete,
+        },
+        reserved,
+        limited,
+        block_table_limited,
+        budget: if reserved > 0 {
+            Some(budget.clone())
+        } else {
+            None
+        },
+    }
+}
+
+fn structured_block_finding_fact(
+    fact: &StructuredPageFact,
+    block: &structured_data::Block,
+) -> bool {
+    fact.report.capture == structured_data::CaptureCompleteness::Complete
+        && (block.is_parse_finding() || block.has_duplicate_finding())
+}
+
+fn structured_block_incomplete_fact(
+    fact: &StructuredPageFact,
+    block: &structured_data::Block,
+) -> bool {
+    fact.report.capture != structured_data::CaptureCompleteness::Complete
+        || fact.report.inspection != structured_data::InspectionCoverage::Complete
+        || matches!(
+            block.syntax,
+            structured_data::SyntaxOutcome::ParserLimit
+                | structured_data::SyntaxOutcome::NotInspected
+                | structured_data::SyntaxOutcome::Cancelled
+        )
+}
+
+fn apply_structured_outcome(state: &mut State, mut outcome: StructuredRefreshOutcome) {
+    // The view cache now owns this reservation; the outcome must not release it on drop.
+    outcome.budget = None;
+    state.view_counts = outcome.counts;
+    let limited = outcome.limited.take();
+    state.structured_index_limited =
+        match (limited, state.structured_facts.len() < state.pages.len()) {
+            (Some(reason), _) => Some(reason),
+            // Facts could not all be retained; keep the earlier fact/index limitation instead of
+            // letting a successful projection of the available prefix imply complete coverage.
+            (None, true) => state.structured_index_limited.take(),
+            (None, false) => None,
+        };
+    match outcome.view {
+        StructuredView::Pages => {
+            state
+                .structured_budget
+                .release(state.structured_pages_cache_bytes);
+            state.structured_pages_cache_bytes = outcome.reserved;
+            state.structured_pages_visible = std::mem::take(&mut outcome.visible);
+            state.structured_pages_streamed = outcome.pages_len;
+        }
+        StructuredView::Blocks => {
+            state
+                .structured_budget
+                .release(state.structured_blocks_cache_bytes);
+            state.structured_blocks_cache_bytes = outcome.reserved;
+            state.structured_blocks = std::mem::take(&mut outcome.blocks);
+            state.structured_block_keys = std::mem::take(&mut outcome.keys);
+            state.structured_block_visible = std::mem::take(&mut outcome.visible);
+            state.structured_block_pages = outcome.pages_len;
+            state.structured_blocks_limited = outcome.block_table_limited;
+        }
+    }
+    sync_selection(state);
+}
+
+fn structured_sync_eligible(state: &State, view: StructuredView, needle: &str) -> bool {
+    let blocks = || {
+        state
+            .pages
+            .iter()
+            .map(|page| page.structured.blocks.len())
+            .sum::<usize>()
+    };
+    if !needle.is_empty() {
+        // Field-by-field search scans every retained supported field. Keep even one dense page
+        // out of the UI step unless it is genuinely tiny; everything else uses the worker.
+        return match view {
+            StructuredView::Pages => state.pages.len() <= 1 && blocks() <= 8,
+            StructuredView::Blocks => state.pages.len() <= 1 && blocks() <= 8,
+        };
+    }
+    match view {
+        StructuredView::Pages => state.pages.len() <= STRUCTURED_SYNC_PAGES,
+        StructuredView::Blocks => {
+            state.pages.len() <= STRUCTURED_SYNC_PAGES && blocks() <= STRUCTURED_SYNC_BLOCKS
+        }
+    }
+}
+
+fn current_structured_request(
+    state: &State,
+    view: StructuredView,
+) -> (String, CheckFilter, (String, SortDir)) {
+    match view {
+        StructuredView::Pages => (
+            normalized_query(&state.structured_pages_view.query.text),
+            state.structured_pages_view.filter,
+            state.structured_pages_view.sort.clone(),
+        ),
+        StructuredView::Blocks => (
+            normalized_query(&state.structured_blocks_view.query.text),
+            state.structured_blocks_view.filter,
+            state.structured_blocks_view.sort.clone(),
+        ),
+    }
+}
+
+fn start_structured_refresh(state: &mut State, view: StructuredView) {
+    let (query, filter, sort) = current_structured_request(state, view);
+    cancel_structured_refresh(state);
+    let generation = state.structured_refresh_generation;
+    state.structured_refresh = Some(StructuredRefreshJob {
+        generation,
+        epoch: state.pages_epoch,
+        view,
+        query,
+        filter,
+        sort,
+        pages_len: state.pages.len(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        pause: None,
+        rx: None,
+    });
+}
+
+fn structured_job_matches(
+    state: &State,
+    view: StructuredView,
+    query: &str,
+    filter: CheckFilter,
+    sort: &(String, SortDir),
+) -> bool {
+    state.structured_refresh.as_ref().is_some_and(|job| {
+        job.view == view
+            && job.epoch == state.pages_epoch
+            && job.query == query
+            && job.filter == filter
+            && &job.sort == sort
+    })
+}
+
+fn refresh_structured_pages(state: &mut State, force: bool) {
+    if state
+        .structured_refresh
+        .as_ref()
+        .is_some_and(|job| job.view != StructuredView::Pages)
+    {
+        cancel_structured_refresh(state);
+    }
+    let (needle, filter, sort) = current_structured_request(state, StructuredView::Pages);
+    if !force && state.phase.active() {
+        if filter == CheckFilter::All
+            && needle.is_empty()
+            && !state
+                .structured_refresh
+                .as_ref()
+                .is_some_and(|job| job.view == StructuredView::Pages)
+        {
+            let target = state.pages.len();
+            append_structured_facts(state, target);
+            let start = state.structured_pages_streamed;
+            let end = state.structured_facts.len();
+            for index in start..end {
+                let fact = &state.structured_facts[index];
+                state.view_counts.findings += usize::from(fact.report.has_confirmed_finding());
+                state.view_counts.incomplete += usize::from(fact.report.is_incomplete());
+                if !state.structured_budget.try_reserve(STRUCTURED_VISIBLE_SLOT) {
+                    state.structured_index_limited = Some(Arc::from(
+                        "The 128 MiB structured-data ledger reached its visible page index bound; later captured URLs are omitted",
+                    ));
+                    break;
+                }
+                state.structured_pages_cache_bytes += STRUCTURED_VISIBLE_SLOT;
+                state.structured_pages_visible.push(index);
+            }
+            state.structured_pages_streamed = end;
+            state.view_counts.total = state.structured_facts.len();
+            sync_selection(state);
+            return;
+        }
+        if state.structured_refresh.is_none() && state.structured_pages_streamed < state.pages.len()
+        {
+            start_structured_refresh(state, StructuredView::Pages);
+        }
+        return;
+    }
+    if structured_job_matches(state, StructuredView::Pages, &needle, filter, &sort) {
+        return;
+    }
+    if structured_sync_eligible(state, StructuredView::Pages, &needle) {
+        append_structured_facts(state, state.pages.len());
+        let mut outcome = compute_structured_pages(
+            &state.structured_facts,
+            &needle,
+            filter,
+            (&sort.0, sort.1),
+            &state.structured_budget,
+            None,
+        );
+        outcome.epoch = state.pages_epoch;
+        apply_structured_outcome(state, outcome);
+        return;
+    }
+    start_structured_refresh(state, StructuredView::Pages);
+}
+
+fn append_structured_blocks(state: &mut State, from: usize, to: usize) {
+    let target = to.min(state.structured_facts.len());
+    let first_new = state.structured_blocks.len();
+    let mut findings = 0_usize;
+    let mut incomplete = 0_usize;
+    'pages: for page_index in from..target {
+        let fact = &state.structured_facts[page_index];
+        for (block_index, block) in fact.report.blocks.iter().enumerate() {
+            if state.structured_blocks.len() >= MAX_STRUCTURED_BLOCK_ROWS {
+                state.structured_blocks_limited = true;
+                state.structured_index_limited = Some(Arc::from(
+                    "The Blocks view is limited to the first 100,000 retained rows",
+                ));
+                break 'pages;
+            }
+            let key = format!("{}#{}", fact.url, block.ordinal);
+            let cost = STRUCTURED_BLOCK_SLOT
+                .saturating_add(key.len())
+                .saturating_add(STRUCTURED_KEY_OVERHEAD);
+            if !state.structured_budget.try_reserve(cost) {
+                state.structured_index_limited = Some(Arc::from(
+                    "The 128 MiB structured-data ledger could not retain more block rows or keys; later blocks are omitted",
+                ));
+                break 'pages;
+            }
+            state.structured_blocks_cache_bytes += cost;
+            findings += usize::from(structured_block_finding_fact(fact, block));
+            incomplete += usize::from(structured_block_incomplete_fact(fact, block));
+            state.structured_blocks.push(StructuredBlockRef {
+                page: page_index,
+                block: block_index,
+            });
+            state.structured_block_keys.push(key);
+        }
+    }
+    if state.structured_blocks_view.filter == CheckFilter::All
+        && state.structured_blocks_view.query.text.trim().is_empty()
+    {
+        for index in first_new..state.structured_blocks.len() {
+            if !state.structured_budget.try_reserve(STRUCTURED_VISIBLE_SLOT) {
+                state.structured_index_limited = Some(Arc::from(
+                    "The 128 MiB structured-data ledger reached its visible block index bound; later matches are omitted",
+                ));
+                break;
+            }
+            state.structured_blocks_cache_bytes += STRUCTURED_VISIBLE_SLOT;
+            state.structured_block_visible.push(index);
+        }
+    }
+    state.view_counts.findings += findings;
+    state.view_counts.incomplete += incomplete;
+    state.structured_block_pages = target;
+}
+
+fn refresh_structured_blocks(state: &mut State, force: bool) {
+    if state
+        .structured_refresh
+        .as_ref()
+        .is_some_and(|job| job.view != StructuredView::Blocks)
+    {
+        cancel_structured_refresh(state);
+    }
+    let (needle, filter, sort) = current_structured_request(state, StructuredView::Blocks);
+    if !force && state.phase.active() {
+        if filter == CheckFilter::All
+            && needle.is_empty()
+            && !state
+                .structured_refresh
+                .as_ref()
+                .is_some_and(|job| job.view == StructuredView::Blocks)
+        {
+            let target = state.pages.len();
+            append_structured_facts(state, target);
+            let from = state
+                .structured_block_pages
+                .min(state.structured_facts.len());
+            append_structured_blocks(state, from, state.structured_facts.len());
+            state.view_counts.total = state.structured_blocks.len();
+            sync_selection(state);
+            return;
+        }
+        if state.structured_refresh.is_none() && state.structured_block_pages < state.pages.len() {
+            start_structured_refresh(state, StructuredView::Blocks);
+        }
+        return;
+    }
+    if structured_job_matches(state, StructuredView::Blocks, &needle, filter, &sort) {
+        return;
+    }
+    if structured_sync_eligible(state, StructuredView::Blocks, &needle) {
+        append_structured_facts(state, state.pages.len());
+        let mut outcome = compute_structured_blocks(
+            &state.structured_facts,
+            &needle,
+            filter,
+            (&sort.0, sort.1),
+            &state.structured_budget,
+            None,
+        );
+        outcome.epoch = state.pages_epoch;
+        apply_structured_outcome(state, outcome);
+        return;
+    }
+    start_structured_refresh(state, StructuredView::Blocks);
+}
+
+fn refresh_structured_visible_inner(state: &mut State, force: bool) {
+    match state.structured_subview {
+        StructuredView::Pages => refresh_structured_pages(state, force),
+        StructuredView::Blocks => refresh_structured_blocks(state, force),
+    }
+}
+
+fn poll_structured_view(state: &mut State) -> bool {
+    let Some(mut job) = state.structured_refresh.take() else {
+        return false;
+    };
+    if job.epoch != state.pages_epoch || job.generation != state.structured_refresh_generation {
+        return true;
+    }
+    let Some(rx) = job.rx.as_mut() else {
+        // Facts are built in bounded poll steps so the UI never indexes a large corpus in one
+        // frame. A failed reservation is a reported limitation, not an unbounded allocation.
+        append_structured_facts(state, job.pages_len);
+        let target = job.pages_len.min(state.structured_facts.len());
+        let ready = state.structured_facts.len() >= job.pages_len
+            || state.structured_index_limited.is_some();
+        if !ready {
+            state.structured_refresh = Some(job);
+            return false;
+        }
+        let snapshot_bytes = target
+            .saturating_mul(std::mem::size_of::<StructuredPageFact>())
+            .saturating_add(64);
+        let minimum = match job.view {
+            StructuredView::Pages => 16 * 1024,
+            StructuredView::Blocks => 64 * 1024,
+        };
+        if state.structured_budget.remaining() < snapshot_bytes.saturating_add(minimum)
+            || !state.structured_budget.try_reserve(snapshot_bytes)
+        {
+            state.structured_index_limited = Some(Arc::from(
+                "The 128 MiB structured-data ledger could not retain a background page snapshot; the view keeps its previous rows and reports limited coverage",
+            ));
+            return true;
+        }
+        // The reservation is now already held; only then clone the pointer snapshot. The lease
+        // travels into the worker so cancellation cannot free bytes until the clone drops.
+        let snapshot_lease = LedgerLease::new(state.structured_budget.clone(), snapshot_bytes);
+        let snapshot = state.structured_facts[..target].to_vec();
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let budget = state.structured_budget.clone();
+        let waker = state.waker.clone();
+        let cancel = job.cancel.clone();
+        let view = job.view;
+        let query = job.query.clone();
+        let filter = job.filter;
+        let sort = job.sort.clone();
+        let generation = job.generation;
+        let epoch = job.epoch;
+        let pause = job.pause.clone();
+        std::thread::spawn(move || {
+            let _snapshot_lease = snapshot_lease;
+            let facts = Arc::new(snapshot);
+            if let Some(gate) = pause {
+                gate.wait();
+            }
+            let mut outcome = match view {
+                StructuredView::Pages => compute_structured_pages(
+                    &facts,
+                    &query,
+                    filter,
+                    (&sort.0, sort.1),
+                    &budget,
+                    Some(&cancel),
+                ),
+                StructuredView::Blocks => compute_structured_blocks(
+                    &facts,
+                    &query,
+                    filter,
+                    (&sort.0, sort.1),
+                    &budget,
+                    Some(&cancel),
+                ),
+            };
+            outcome.generation = generation;
+            outcome.epoch = epoch;
+            outcome.pages_len = facts.len();
+            if !cancel.load(Ordering::Relaxed) {
+                let _ = worker_tx.send(outcome);
+            }
+            if let Some(wake) = &waker {
+                wake();
+            }
+        });
+        job.rx = Some(worker_rx);
+        state.structured_refresh = Some(job);
+        return false;
+    };
+    match rx.try_recv() {
+        Ok(outcome) => {
+            if outcome.generation == state.structured_refresh_generation
+                && outcome.epoch == state.pages_epoch
+                && structured_view_active(state)
+                && outcome.view == state.structured_subview
+            {
+                apply_structured_outcome(state, outcome);
+            }
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            state.structured_refresh = Some(job);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            state.structured_index_limited = Some(Arc::from(
+                "The structured-data view worker stopped without a result; showing the previous rows",
+            ));
+            true
+        }
+    }
+}
+
+fn set_structured_sort(state: &mut State, column: &str, direction: SortDir) {
+    state.view_mut().sort = (column.to_string(), direction);
     state.table.set_sort(column, direction);
     refresh_visible_forced(state);
 }
@@ -3108,9 +4355,14 @@ fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
     state.content_row_keys.clear();
     state.content_visible.clear();
     state.content_search.clear();
+    if let Some(job) = state.structured_export_job.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
     state.overview.content_same_urls = 0;
     state.overview.content_similar_urls = 0;
     state.pages_epoch = state.pages_epoch.wrapping_add(1);
+    reset_structured_view_cache(state);
+    state.structured_budget = Arc::new(structured_data::StructuredBudget::default());
     let seed = pages
         .first()
         .map(|page| page.url.clone())
@@ -3341,6 +4593,12 @@ fn link_occurrence_at(state: &State, row: usize) -> Option<&LinkOccurrence> {
 fn visible_len(state: &State) -> usize {
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         return state.content_visible.len();
+    }
+    if structured_pages_active(state) {
+        return state.structured_pages_visible.len();
+    }
+    if structured_blocks_active(state) {
+        return state.structured_block_visible.len();
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return state.link_visible.len();
@@ -3596,12 +4854,25 @@ fn active_title(state: &State) -> &'static str {
             DuplicateSubview::NotCompared => "Duplicate content · not compared",
         };
     }
+    if structured_view_active(state) {
+        return match state.structured_subview {
+            StructuredView::Pages => "Structured data · pages",
+            StructuredView::Blocks => "Structured data · blocks",
+        };
+    }
     match (state.tab, state.sitemap_view) {
         (Tab::Links, _) if state.links_view == LinksView::Evidence => "Link evidence",
         (Tab::Sitemaps, SitemapView::Urls) => "Sitemap URLs",
         (Tab::Sitemaps, SitemapView::Files) => "Sitemap files",
         _ => tab_title(state.tab),
     }
+}
+
+fn search_scope_label(state: &State) -> &'static str {
+    if structured_view_active(state) {
+        return "URL, literal type or @id, JSON Pointer path, diagnostic text, script ID and declared type";
+    }
+    "URL, title, meta description, H1, canonical, content type and finding text"
 }
 
 const GUTTER: f32 = 20.0;
@@ -3709,6 +4980,10 @@ fn focus_search_state(state: &mut State) -> bool {
     let has_data =
         if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
             !state.content_rows.is_empty()
+        } else if structured_pages_active(state) {
+            !state.pages.is_empty()
+        } else if structured_blocks_active(state) {
+            !state.structured_blocks.is_empty()
         } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
             !state.link_rows.is_empty()
         } else if state.tab == Tab::Sitemaps {
@@ -3964,26 +5239,31 @@ fn update_banner(k: &Kit, state: &State) -> Option<El> {
 
 fn banner(k: &Kit, title: String, detail: String, actions: Vec<El>, progress: Option<f32>) -> El {
     let mut body = col().w_full().gap(7.0).child(
-        row()
-            .w_full()
-            .gap(12.0)
-            .center_y()
-            .child(
-                col()
-                    .gap(3.0)
-                    .min_w(0.0)
-                    .child(text(title).font(k.ty.text_small).color(k.c.text_base))
-                    .child(
-                        text(detail)
-                            .font(k.ty.small)
-                            .color(k.c.text_muted)
-                            .wrap()
-                            .w_full(),
-                    ),
-            )
-            .child(el().grow(1.0))
-            .children(actions),
+        row().w_full().child(
+            col()
+                .gap(3.0)
+                .grow(1.0)
+                .min_w(0.0)
+                .child(text(title).font(k.ty.text_small).color(k.c.text_base))
+                .child(
+                    text(detail)
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .wrap()
+                        .w_full(),
+                ),
+        ),
     );
+    if !actions.is_empty() {
+        body = body.child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .flex_wrap()
+                .justify_end()
+                .children(actions),
+        );
+    }
     if let Some(fraction) = progress {
         body = body.child(
             row()
@@ -4981,7 +6261,11 @@ fn tab_button(k: &Kit, state: &State, tab: Tab, counts: &Counts) -> El {
                 .text_case(TextCase::Uppercase)
         })
         .on_press(move |state: &mut State| {
+            let was_structured = structured_view_active(state);
             state.tab = tab;
+            if was_structured && !structured_view_active(state) {
+                cancel_structured_refresh(state);
+            }
             state.relation_pages = RelationPages::default();
             state.selection_epoch = state.selection_epoch.wrapping_add(1);
             let (column, dir) = state.view().sort.clone();
@@ -5207,7 +6491,10 @@ fn overview_findings(k: &Kit, state: &State) -> El {
         } else {
             "No findings in completed checks.".to_string()
         };
-        if counts.incomplete > 0 || matches!(state.phase, RunPhase::Stopped | RunPhase::Limited) {
+        if counts.incomplete > 0
+            || counts.structured_incomplete > 0
+            || matches!(state.phase, RunPhase::Stopped | RunPhase::Limited)
+        {
             note.push_str(" Some checks did not complete; see coverage below.");
         }
         return block.child(
@@ -5266,6 +6553,29 @@ fn overview_findings(k: &Kit, state: &State) -> El {
                 state.internal_view = InternalView::DuplicateContent;
                 state.duplicate_subview = DuplicateSubview::Similar;
                 state.duplicate_view.query.replace_text("");
+                refresh_visible_forced(state);
+            },
+        ));
+    }
+    if counts.structured_urls > 0 {
+        rows = rows.child(overview_content_row(
+            k,
+            "overview-structured",
+            format!(
+                "{} {} a JSON-LD syntax or duplicate-key finding",
+                counts.structured_urls,
+                if counts.structured_urls == 1 {
+                    "URL has"
+                } else {
+                    "URLs have"
+                }
+            ),
+            |state: &mut State| {
+                state.tab = Tab::Internal;
+                state.internal_view = InternalView::StructuredData;
+                state.structured_subview = StructuredView::Pages;
+                state.structured_pages_view.query.replace_text("");
+                state.structured_pages_view.filter = CheckFilter::Findings;
                 refresh_visible_forced(state);
             },
         ));
@@ -5415,6 +6725,31 @@ fn overview_coverage(k: &Kit, state: &State) -> El {
             |state: &mut State| {
                 state.links_view = LinksView::Evidence;
                 open_overview_target(state, Tab::Links, CheckFilter::Findings);
+            },
+        ));
+    }
+    if counts.structured_incomplete > 0 && !state.phase.active() {
+        gaps += 1;
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-structured-incomplete",
+            format!(
+                "{} {} incomplete JSON-LD coverage",
+                counts.structured_incomplete,
+                if counts.structured_incomplete == 1 {
+                    "URL has"
+                } else {
+                    "URLs have"
+                }
+            ),
+            "Pages whose JSON-LD capture, inspection or retained evidence did not finish. They are not an absence claim.",
+            |state: &mut State| {
+                state.tab = Tab::Internal;
+                state.internal_view = InternalView::StructuredData;
+                state.structured_subview = StructuredView::Pages;
+                state.structured_pages_view.query.replace_text("");
+                state.structured_pages_view.filter = CheckFilter::Incomplete;
+                refresh_visible_forced(state);
             },
         ));
     }
@@ -5638,7 +6973,8 @@ fn overview_actions(k: &Kit, state: &State) -> El {
                         || state.inventory_export_job.is_some()
                         || state.inventory_prepare.is_some()
                         || state.inventory_write.is_some()
-                        || state.content_export_job.is_some(),
+                        || state.content_export_job.is_some()
+                        || state.structured_export_job.is_some(),
                 )
                 .help("Choose all captured URLs or the visible Internal URL set")
                 .on_press(|state: &mut State| state.inventory_scope_open = true)
@@ -5662,7 +6998,11 @@ fn open_overview_group(state: &mut State, group: OverviewGroup) {
 }
 
 fn open_overview_target(state: &mut State, tab: Tab, filter: CheckFilter) {
+    let was_structured = structured_view_active(state);
     state.tab = tab;
+    if was_structured && !structured_view_active(state) {
+        cancel_structured_refresh(state);
+    }
     state.relation_pages = RelationPages::default();
     state.selection_epoch = state.selection_epoch.wrapping_add(1);
     // A group count must not open onto an empty hidden query left in another visit.
@@ -5683,7 +7023,8 @@ fn inventory_scope_bar(k: &Kit, state: &State) -> El {
                     || state.inventory_prepare.is_some()
                     || state.inventory_write.is_some()
                     || state.inventory_dialog_open
-                    || state.content_export_job.is_some(),
+                    || state.content_export_job.is_some()
+                    || state.structured_export_job.is_some(),
             )
             .on_press_tx(move |state: &mut State, tx: &mut Tx| {
                 state.inventory_scope_open = false;
@@ -6194,6 +7535,194 @@ fn internal_view_controls(k: &Kit, state: &State) -> El {
             InternalView::DuplicateContent,
             "internal-duplicates",
         ))
+        .child(button(
+            "Structured data",
+            InternalView::StructuredData,
+            "internal-structured",
+        ))
+}
+
+fn structured_internal_view_controls(k: &Kit, state: &State) -> El {
+    let selected = match state.internal_view {
+        InternalView::Urls => 0,
+        InternalView::DuplicateContent => 1,
+        InternalView::StructuredData => 2,
+    };
+    row().center_y().child(
+        SegmentedControl::new(&["URLs", "Duplicate", "Structured"], Some(selected))
+            .label("Internal view")
+            .fit()
+            .on_pick(|state: &mut State, index, _tx| {
+                state.internal_view = match index {
+                    0 => InternalView::Urls,
+                    1 => InternalView::DuplicateContent,
+                    _ => InternalView::StructuredData,
+                };
+                if state.internal_view != InternalView::StructuredData {
+                    cancel_structured_refresh(state);
+                }
+                if state.internal_view == InternalView::DuplicateContent
+                    && state.content_phase == ContentPhase::Idle
+                    && !state.pages.is_empty()
+                    && !state.phase.active()
+                {
+                    start_content_analysis(state);
+                }
+                let (column, dir) = state.view().sort.clone();
+                state.table.set_sort(column, dir);
+                refresh_visible_forced(state);
+            })
+            .build(k)
+            .key("internal-menu")
+            .help("Switch between Internal URLs, Duplicate content and Structured data"),
+    )
+}
+
+fn structured_subview_controls(k: &Kit, state: &State) -> El {
+    let page_count = state.pages.len();
+    let block_count = state
+        .pages
+        .iter()
+        .map(|page| page.structured.blocks.len())
+        .sum::<usize>();
+    let limited = state.structured_blocks_limited;
+    let button = |label: String, view: StructuredView, key: &'static str| {
+        Button::new(label)
+            .variant(if state.structured_subview == view {
+                ButtonVariant::Neutral
+            } else {
+                ButtonVariant::Ghost
+            })
+            .control_size(ControlSize::Small)
+            .on_press(move |state: &mut State| {
+                state.structured_subview = view;
+                state
+                    .table
+                    .set_sort(state.view().sort.0.clone(), state.view().sort.1);
+                refresh_visible_forced(state);
+            })
+            .build(k)
+            .key(key)
+    };
+    row()
+        .gap(1.0)
+        .center_y()
+        .child(button(
+            format!("Pages {page_count}"),
+            StructuredView::Pages,
+            "structured-pages",
+        ))
+        .child(button(
+            if limited {
+                format!("Blocks {block_count}+")
+            } else {
+                format!("Blocks {block_count}")
+            },
+            StructuredView::Blocks,
+            "structured-blocks",
+        ))
+}
+
+fn structured_status_detail(state: &State) -> String {
+    if state.pages.is_empty() {
+        return String::new();
+    }
+    let finding = state
+        .pages
+        .iter()
+        .filter(|page| page.structured.has_confirmed_finding())
+        .count();
+    let incomplete = state
+        .pages
+        .iter()
+        .filter(|page| page.structured.is_incomplete())
+        .count();
+    let mut parts = Vec::new();
+    if finding > 0 {
+        parts.push(format!(
+            "{finding} {} with a confirmed finding",
+            if finding == 1 { "page" } else { "pages" }
+        ));
+    }
+    if incomplete > 0 {
+        parts.push(format!(
+            "{incomplete} {} incomplete",
+            if incomplete == 1 { "page" } else { "pages" }
+        ));
+    }
+    if parts.is_empty() {
+        "No confirmed JSON-LD syntax or duplicate-key finding in this crawl".into()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn structured_section_header(k: &Kit, state: &State) -> El {
+    let total = state.view_counts.total;
+    let shown = visible_len(state);
+    let noun = match state.structured_subview {
+        StructuredView::Pages => "URLs",
+        StructuredView::Blocks => "retained blocks",
+    };
+    let mut summary = format!("{shown} of {total} {noun}");
+    if state.structured_blocks_limited && state.structured_subview == StructuredView::Blocks {
+        summary.push_str(&format!(
+            " · table limited to the first {MAX_STRUCTURED_BLOCK_ROWS}"
+        ));
+    }
+    if state.view_counts.findings > 0 || state.view_counts.incomplete > 0 {
+        summary.push_str(&format!(
+            " · {} {} · {} incomplete",
+            state.view_counts.findings,
+            if state.view_counts.findings == 1 {
+                "finding"
+            } else {
+                "findings"
+            },
+            state.view_counts.incomplete
+        ));
+    }
+    if state
+        .structured_refresh
+        .as_ref()
+        .is_some_and(|job| job.view == state.structured_subview)
+    {
+        summary.push_str(" · refreshing…");
+    }
+    if state.structured_index_limited.is_some() {
+        summary.push_str(" · index limited");
+    }
+    let detail = structured_status_detail(state);
+    let mut help = format!(
+        "{detail} · {} · Literal types are observed strings; contexts, aliases and remote contexts are not evaluated.",
+        state.view().filter.help()
+    );
+    if let Some(reason) = &state.structured_index_limited {
+        help.push_str(" · ");
+        help.push_str(reason);
+    }
+    row()
+        .w_full()
+        .h(40.0)
+        .px(GUTTER)
+        .center_y()
+        .gap(6.0)
+        .child(structured_subview_controls(k, state))
+        .child(
+            text(summary.clone())
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted)
+                .grow(1.0)
+                .min_w(40.0)
+                .truncate()
+                .help(help),
+        )
+        .child(structured_internal_view_controls(k, state))
+        .children(search_field(k, state))
+        .child(check_filter(k, state))
+        .child(export_button(k, state, shown))
+        .child(copy_urls_button(k, state, shown))
+        .child(details_toggle(k, state))
 }
 
 fn duplicate_subview_controls(k: &Kit, state: &State) -> El {
@@ -6308,6 +7837,9 @@ fn section_header(k: &Kit, state: &State) -> El {
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         return content_section_header(k, state);
     }
+    if structured_view_active(state) {
+        return structured_section_header(k, state);
+    }
     let total = state.view_counts.total;
     let shown = visible_len(state);
     let query_active = !state.view().query.text.trim().is_empty();
@@ -6377,7 +7909,8 @@ fn section_header(k: &Kit, state: &State) -> El {
                         || state.inventory_prepare.is_some()
                         || state.inventory_write.is_some()
                         || state.inventory_dialog_open
-                        || state.content_export_job.is_some())
+                        || state.content_export_job.is_some()
+                        || state.structured_export_job.is_some())
                     .help("Export a complete content inventory for all captured URLs or the visible Internal set")
                     .on_press(|state: &mut State| state.inventory_scope_open = true)
                     .build(k)
@@ -6418,6 +7951,12 @@ fn run_view_noun(state: &State) -> &'static str {
             DuplicateSubview::NotCompared => "uncompared URLs",
         };
     }
+    if structured_view_active(state) {
+        return match state.structured_subview {
+            StructuredView::Pages => "structured URLs",
+            StructuredView::Blocks => "retained blocks",
+        };
+    }
     match state.tab {
         Tab::Links if state.links_view == LinksView::Evidence => "link occurrences",
         Tab::Sitemaps => match state.sitemap_view {
@@ -6456,6 +7995,10 @@ fn search_field(k: &Kit, state: &State) -> Option<El> {
     let has_data =
         if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
             !state.content_rows.is_empty()
+        } else if structured_pages_active(state) {
+            !state.pages.is_empty()
+        } else if structured_blocks_active(state) {
+            !state.structured_blocks.is_empty()
         } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
             !state.link_rows.is_empty()
         } else if state.tab == Tab::Sitemaps {
@@ -6473,7 +8016,11 @@ fn search_field(k: &Kit, state: &State) -> Option<El> {
         rune_kit::TextInput::new(&state.view().query)
             .plain()
             .height(28.0)
-            .width(Some(160.0))
+            .width(Some(if structured_view_active(state) {
+                132.0
+            } else {
+                160.0
+            }))
             .leading_icon(k.glyph.search)
             .leading_icon_size(14.0)
             .text_style(TextStyle::new(11.5, 400.0).lh(16.0))
@@ -6482,9 +8029,7 @@ fn search_field(k: &Kit, state: &State) -> Option<El> {
             .on_edit(|state: &mut State| &mut state.view_mut().query)
             .on_change(|state: &mut State, _| refresh_visible_forced(state))
             .on_key(|state: &mut State, event: &KeyEvent, _| {
-                if matches!(event.key, Key::Escape)
-                    && !state.view().query.text.is_empty()
-                {
+                if matches!(event.key, Key::Escape) && !state.view().query.text.is_empty() {
                     state.view_mut().query.replace_text("");
                     refresh_visible_forced(state);
                     true
@@ -6494,7 +8039,10 @@ fn search_field(k: &Kit, state: &State) -> Option<El> {
             })
             .build(k)
             .key("result-search")
-            .help("Literal, case-insensitive search over URL, title, meta description, H1, canonical, content type and finding text in this view."),
+            .help(format!(
+                "Literal, case-insensitive search over {} in this view.",
+                search_scope_label(state)
+            )),
     )
 }
 
@@ -6610,7 +8158,8 @@ fn sitemap_section_header(k: &Kit, state: &State) -> El {
                         || state.inventory_prepare.is_some()
                         || state.inventory_write.is_some()
                         || state.inventory_dialog_open
-                        || state.content_export_job.is_some())
+                        || state.content_export_job.is_some()
+                        || state.structured_export_job.is_some())
                     .help("Export a complete content inventory for all captured URLs or the visible Internal set")
                     .on_press(|state: &mut State| state.inventory_scope_open = true)
                     .build(k)
@@ -6753,6 +8302,11 @@ fn visible_ids(state: &State) -> Vec<String> {
             })
             .collect();
     }
+    if structured_view_active(state) {
+        return (0..visible_len(state))
+            .filter_map(|row| visible_id(state, row))
+            .collect();
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return (0..visible_len(state))
             .filter_map(|row| link_occurrence_at(state, row))
@@ -6786,6 +8340,7 @@ fn export_button(k: &Kit, state: &State, shown: usize) -> El {
             state.phase.active()
                 || shown == 0
                 || state.content_export_job.is_some()
+                || state.structured_export_job.is_some()
                 || state.inventory_prepare.is_some()
                 || state.inventory_export_job.is_some()
                 || state.inventory_write.is_some()
@@ -7309,6 +8864,7 @@ fn poll_content_export(state: &mut State, tx: &mut Tx) -> bool {
                 prepared.slug,
                 true,
                 "content",
+                None,
             );
             true
         }
@@ -7329,6 +8885,664 @@ fn content_status_detail_from(context: &[String]) -> String {
     context.get(4).cloned().unwrap_or_default()
 }
 
+#[derive(Clone)]
+enum StructuredExportRow {
+    Page {
+        url: String,
+        report: Arc<structured_data::PageReport>,
+    },
+    Block {
+        url: String,
+        report: Arc<structured_data::PageReport>,
+        block: usize,
+    },
+}
+
+#[derive(Clone)]
+struct StructuredExportSource {
+    subview: StructuredView,
+    rows: Vec<StructuredExportRow>,
+    context: Vec<String>,
+    slug: &'static str,
+    retained_bytes: usize,
+}
+
+fn structured_context(state: &State) -> Vec<String> {
+    let run = state.run.as_ref();
+    let mut status = format!("{} · {}", state.phase.label(), state.message);
+    if let Some(reason) = &state.structured_index_limited {
+        status.push_str(" · ");
+        status.push_str(reason);
+    }
+    vec![
+        run.map(|run| run.seed.clone()).unwrap_or_default(),
+        run.map(|run| run.started_utc.clone()).unwrap_or_default(),
+        run.map(|run| run.rendering.label())
+            .unwrap_or("HTML")
+            .into(),
+        status,
+    ]
+}
+
+fn structured_export_source(state: &State) -> Option<StructuredExportSource> {
+    let context = structured_context(state);
+    let (subview, rows, slug): (StructuredView, Vec<StructuredExportRow>, &'static str) =
+        match state.structured_subview {
+            StructuredView::Pages => {
+                let rows = state
+                    .structured_pages_visible
+                    .iter()
+                    .filter_map(|index| state.pages.get(*index))
+                    .map(|page| StructuredExportRow::Page {
+                        url: page.url.clone(),
+                        report: page.structured.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                (StructuredView::Pages, rows, "structured-data-pages")
+            }
+            StructuredView::Blocks => {
+                let rows = state
+                    .structured_block_visible
+                    .iter()
+                    .filter_map(|index| state.structured_blocks.get(*index).copied())
+                    .filter_map(|row| {
+                        let page = state.pages.get(row.page)?;
+                        Some(StructuredExportRow::Block {
+                            url: page.url.clone(),
+                            report: page.structured.clone(),
+                            block: row.block,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (StructuredView::Blocks, rows, "structured-data-blocks")
+            }
+        };
+    if rows.is_empty() {
+        return None;
+    }
+    let mut unique = HashMap::<usize, usize>::new();
+    for row in &rows {
+        let report = match row {
+            StructuredExportRow::Page { report, .. }
+            | StructuredExportRow::Block { report, .. } => report,
+        };
+        unique.insert(Arc::as_ptr(report) as usize, report.retained_bytes);
+    }
+    let retained_bytes = unique.values().copied().sum();
+    Some(StructuredExportSource {
+        subview,
+        rows,
+        context,
+        slug,
+        retained_bytes,
+    })
+}
+
+fn structured_export_pages_json(report: &structured_data::PageReport) -> (String, String, String) {
+    let types = report.iter_types().cloned().collect::<Vec<_>>();
+    let ids = report.iter_ids().cloned().collect::<Vec<_>>();
+    let duplicates = report
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block.duplicates.iter().map(move |duplicate| {
+                serde_json::json!({
+                    "block": block.ordinal,
+                    "key": duplicate.key.as_ref(),
+                    "path": duplicate.path.as_ref(),
+                    "truncated": duplicate.key_truncated || duplicate.path_truncated,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        structured_data::types_json(&types),
+        structured_data::ids_json(&ids),
+        serde_json::Value::Array(duplicates).to_string(),
+    )
+}
+
+fn structured_export_rows(
+    source: &StructuredExportSource,
+    cancel: &AtomicBool,
+    max_bytes: usize,
+) -> Result<(Vec<&'static str>, Vec<Vec<String>>), String> {
+    let context = &source.context;
+    let mut used = 0_usize;
+    match source.subview {
+        StructuredView::Pages => {
+            let headers = vec![
+                "URL",
+                "CAPTURE STAGE",
+                "CAPTURE COMPLETENESS",
+                "CAPTURE REASON",
+                "BLOCKS OBSERVED",
+                "BLOCKS INSPECTED",
+                "BLOCKS RETAINED",
+                "BLOCKS SKIPPED",
+                "SYNTAX FINDINGS",
+                "OBSERVED SYNTAX PROBLEMS",
+                "DUPLICATE KEY BLOCKS",
+                "LITERAL TYPES COUNT",
+                "LITERAL TYPES",
+                "LITERAL IDS",
+                "DUPLICATE KEYS",
+                "INVENTORY STATE",
+                "INSPECTION COVERAGE",
+                "INSPECTION REASON",
+                "LIMITATIONS",
+                "CRAWL SEED",
+                "RUN STARTED UTC",
+                "CAPTURE MODE",
+                "STRUCTURED-DATA STATUS",
+            ];
+            let mut rows = Vec::new();
+            for row in &source.rows {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(String::new());
+                }
+                let StructuredExportRow::Page { url, report } = row else {
+                    continue;
+                };
+                let (types, ids, duplicates) = structured_export_pages_json(report);
+                let limitations = report
+                    .limitations
+                    .iter()
+                    .map(|item| item.as_ref())
+                    .collect::<Vec<_>>();
+                if !push_export_row(
+                    &mut rows,
+                    vec![
+                        url.clone(),
+                        report.stage.label().to_string(),
+                        report.capture.label().to_string(),
+                        report.capture_reason.to_string(),
+                        report.blocks_observed_label(),
+                        report.blocks_inspected.to_string(),
+                        report.blocks_retained.to_string(),
+                        report.blocks_skipped.to_string(),
+                        report.confirmed_findings().to_string(),
+                        report.observed_syntax_problems().to_string(),
+                        report.duplicate_blocks().to_string(),
+                        report.literal_types_retained.to_string(),
+                        types,
+                        ids,
+                        duplicates,
+                        report
+                            .blocks
+                            .iter()
+                            .map(|block| block.inventory.label())
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                        report.inspection.label().to_string(),
+                        report.inspection_reason.to_string(),
+                        serde_json::Value::Array(
+                            limitations
+                                .into_iter()
+                                .map(|item| serde_json::Value::String(item.to_string()))
+                                .collect(),
+                        )
+                        .to_string(),
+                        context[0].clone(),
+                        context[1].clone(),
+                        context[2].clone(),
+                        context[3].clone(),
+                    ],
+                    &mut used,
+                    max_bytes,
+                ) {
+                    return Err("This structured-data export exceeds its reserved projection/encoding allowance; narrow the visible scope first.".into());
+                }
+            }
+            Ok((headers, rows))
+        }
+        StructuredView::Blocks => {
+            let headers = vec![
+                "URL",
+                "BLOCK ORDINAL",
+                "SCRIPT ID",
+                "DECLARED TYPE",
+                "SRC",
+                "CAPTURE STAGE",
+                "CAPTURE COMPLETENESS",
+                "SYNTAX OUTCOME",
+                "ERROR CATEGORY",
+                "ERROR MESSAGE",
+                "LINE",
+                "COLUMN",
+                "ROOT SHAPE",
+                "INVENTORY STATE",
+                "LITERAL TYPES",
+                "LITERAL IDS",
+                "DUPLICATE KEYS",
+                "DUPLICATE COUNT",
+                "DUPLICATES TRUNCATED",
+                "RAW RETAINED",
+                "RAW BYTES",
+                "LIMITATIONS",
+                "SCRIPT ID TRUNCATED",
+                "DECLARED TYPE TRUNCATED",
+                "SRC TRUNCATED",
+                "CRAWL SEED",
+                "RUN STARTED UTC",
+                "CAPTURE MODE",
+                "STRUCTURED-DATA STATUS",
+            ];
+            let mut rows = Vec::new();
+            for row in &source.rows {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(String::new());
+                }
+                let StructuredExportRow::Block { url, report, block } = row else {
+                    continue;
+                };
+                let Some(block) = report.blocks.get(*block) else {
+                    continue;
+                };
+                let limitations = block
+                    .limitations
+                    .iter()
+                    .map(|item| item.as_ref())
+                    .collect::<Vec<_>>();
+                if !push_export_row(
+                    &mut rows,
+                    vec![
+                        url.clone(),
+                        block.ordinal.to_string(),
+                        block.script_id.to_string(),
+                        block.declared_type.to_string(),
+                        block.src.to_string(),
+                        report.stage.label().to_string(),
+                        report.capture.label().to_string(),
+                        block.syntax.label().to_string(),
+                        block
+                            .error
+                            .as_ref()
+                            .map_or("", |error| error.category.label())
+                            .to_string(),
+                        block
+                            .error
+                            .as_ref()
+                            .map_or("", |error| error.message.as_ref())
+                            .to_string(),
+                        block
+                            .error
+                            .as_ref()
+                            .map_or(String::new(), |error| error.line.to_string()),
+                        block
+                            .error
+                            .as_ref()
+                            .map_or(String::new(), |error| error.column.to_string()),
+                        block.root.label().to_string(),
+                        block.inventory.label().to_string(),
+                        structured_data::types_json(&block.types),
+                        structured_data::ids_json(&block.ids),
+                        structured_data::duplicates_json(&block.duplicates),
+                        block.duplicate_count.to_string(),
+                        if block.duplicates_truncated {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                        .to_string(),
+                        if block.raw_retained { "yes" } else { "no" }.to_string(),
+                        block.raw_bytes.to_string(),
+                        serde_json::Value::Array(
+                            limitations
+                                .into_iter()
+                                .map(|item| serde_json::Value::String(item.to_string()))
+                                .collect(),
+                        )
+                        .to_string(),
+                        if block.script_id_truncated {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                        .to_string(),
+                        if block.declared_type_truncated {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                        .to_string(),
+                        if block.src_truncated { "yes" } else { "no" }.to_string(),
+                        context[0].clone(),
+                        context[1].clone(),
+                        context[2].clone(),
+                        context[3].clone(),
+                    ],
+                    &mut used,
+                    max_bytes,
+                ) {
+                    return Err("This structured-data export exceeds its reserved projection/encoding allowance; narrow the visible scope first.".into());
+                }
+            }
+            Ok((headers, rows))
+        }
+    }
+}
+
+/// Conservative JSON string size, including the six-byte `\u00XX` form serde_json uses for
+/// control characters (for example a decoded NUL retained in `@type`).
+fn json_escaped_len(value: &str) -> usize {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\\' => 2,
+            ch if (ch as u32) < 0x20 => 6,
+            ch => ch.len_utf8(),
+        })
+        .sum()
+}
+
+/// Cost of one emitted inventory-state label. The Pages projection joins every per-block
+/// label with `" · "`; charging the separator for each label (including the last one) keeps the
+/// estimate conservative. The Blocks projection emits a single label and gets the same small
+/// delimiter allowance for free.
+fn inventory_state_label_cost(label: &str) -> usize {
+    label.len().saturating_add(" · ".len())
+}
+
+fn estimate_structured_export_bytes(source: &StructuredExportSource) -> usize {
+    // Every output row copies all four context strings, so account for a context copy per row
+    // rather than once for the whole export. Count the retained literal/path/limitation bytes
+    // that are actually projected, not the raw JSON evidence that is never exported. The
+    // per-block inventory-state label is a dynamic field, so charge each emitted label and its
+    // join delimiter explicitly; the remaining emitted fields are short static labels or bounded
+    // counters covered by the per-row allowance below.
+    let context_cost = source
+        .context
+        .iter()
+        .map(|value| value.len().saturating_mul(2).saturating_add(64))
+        .sum::<usize>();
+    let literals = |types: usize, ids: usize, duplicates: usize| {
+        types
+            .saturating_add(ids)
+            .saturating_add(duplicates)
+            .saturating_mul(64)
+    };
+    let row_cost = source
+        .rows
+        .iter()
+        .map(|row| {
+            let fields = match row {
+                StructuredExportRow::Page { url, report } => {
+                    let types = report
+                        .iter_types()
+                        .map(|item| json_escaped_len(&item.value) + json_escaped_len(&item.path))
+                        .sum::<usize>();
+                    let ids = report
+                        .iter_ids()
+                        .map(|item| json_escaped_len(&item.value) + json_escaped_len(&item.path))
+                        .sum::<usize>();
+                    let duplicates = report
+                        .iter_duplicates()
+                        .map(|(_, item)| json_escaped_len(&item.key) + json_escaped_len(&item.path))
+                        .sum::<usize>();
+                    let inventory = report
+                        .blocks
+                        .iter()
+                        .map(|block| inventory_state_label_cost(block.inventory.label()))
+                        .sum::<usize>();
+                    url.len()
+                        .saturating_mul(2)
+                        .saturating_add(report.capture_reason.len().saturating_mul(2))
+                        .saturating_add(report.inspection_reason.len().saturating_mul(2))
+                        .saturating_add(
+                            report
+                                .limitations
+                                .iter()
+                                .map(|item| json_escaped_len(item).saturating_add(8))
+                                .sum::<usize>(),
+                        )
+                        .saturating_add(types)
+                        .saturating_add(ids)
+                        .saturating_add(duplicates)
+                        .saturating_add(inventory)
+                        .saturating_add(literals(
+                            report.literal_types_retained,
+                            report.literal_ids_retained,
+                            report
+                                .blocks
+                                .iter()
+                                .map(|block| block.duplicates.len())
+                                .sum(),
+                        ))
+                        .saturating_add(64)
+                }
+                StructuredExportRow::Block { url, report, block } => {
+                    let block = report.blocks.get(*block);
+                    let types = block.map_or(0, |block| {
+                        block
+                            .types
+                            .iter()
+                            .map(|item| {
+                                json_escaped_len(&item.value) + json_escaped_len(&item.path)
+                            })
+                            .sum::<usize>()
+                    });
+                    let ids = block.map_or(0, |block| {
+                        block
+                            .ids
+                            .iter()
+                            .map(|item| {
+                                json_escaped_len(&item.value) + json_escaped_len(&item.path)
+                            })
+                            .sum::<usize>()
+                    });
+                    let duplicates = block.map_or(0, |block| {
+                        block
+                            .duplicates
+                            .iter()
+                            .map(|item| json_escaped_len(&item.key) + json_escaped_len(&item.path))
+                            .sum::<usize>()
+                    });
+                    let inventory = block.map_or(0, |block| {
+                        inventory_state_label_cost(block.inventory.label())
+                    });
+                    url.len()
+                        .saturating_mul(2)
+                        .saturating_add(
+                            block.map_or(0, |block| block.script_id.len().saturating_mul(2)),
+                        )
+                        .saturating_add(
+                            block.map_or(0, |block| block.declared_type.len().saturating_mul(2)),
+                        )
+                        .saturating_add(block.map_or(0, |block| block.src.len().saturating_mul(2)))
+                        .saturating_add(
+                            block
+                                .and_then(|block| block.error.as_ref())
+                                .map_or(0, |error| error.message.len().saturating_mul(2)),
+                        )
+                        .saturating_add(block.map_or(0, |block| {
+                            block
+                                .limitations
+                                .iter()
+                                .map(|item| json_escaped_len(item).saturating_add(8))
+                                .sum::<usize>()
+                        }))
+                        .saturating_add(types)
+                        .saturating_add(ids)
+                        .saturating_add(duplicates)
+                        .saturating_add(inventory)
+                        .saturating_add(literals(
+                            block.map_or(0, |block| block.types.len()),
+                            block.map_or(0, |block| block.ids.len()),
+                            block.map_or(0, |block| block.duplicates.len()),
+                        ))
+                        .saturating_add(64)
+                }
+            };
+            fields.saturating_add(context_cost)
+        })
+        .sum::<usize>();
+    // Projection cells, escaped CSV and the encoded String can coexist; keep a conservative
+    // factor rather than a single-pass estimate.
+    row_cost.saturating_mul(3).saturating_add(8_192)
+}
+
+fn structured_export_snapshot_estimate(state: &State) -> usize {
+    let row_overhead = std::mem::size_of::<StructuredExportRow>() + 32;
+    match state.structured_subview {
+        StructuredView::Pages => state
+            .structured_pages_visible
+            .iter()
+            .filter_map(|index| state.pages.get(*index))
+            .map(|page| row_overhead.saturating_add(page.url.len()))
+            .sum(),
+        StructuredView::Blocks => state
+            .structured_block_visible
+            .iter()
+            .filter_map(|row| state.structured_blocks.get(*row))
+            .filter_map(|row| state.pages.get(row.page))
+            .map(|page| row_overhead.saturating_add(page.url.len()))
+            .sum(),
+    }
+}
+
+fn start_structured_export(state: &mut State) -> bool {
+    start_structured_export_with_gate(state, None)
+}
+
+fn start_structured_export_with_gate(state: &mut State, pause: Option<Arc<WorkerGate>>) -> bool {
+    if export_lifecycle_busy(state) {
+        state.export_notice = Some(Err(
+            "Another export is already being prepared or written.".into()
+        ));
+        return false;
+    }
+    if state
+        .structured_refresh
+        .as_ref()
+        .is_some_and(|job| job.view == state.structured_subview)
+    {
+        state.export_notice = Some(Err(
+            "The structured-data view is still refreshing; try Export again when it finishes."
+                .into(),
+        ));
+        return false;
+    }
+    let snapshot_bytes = structured_export_snapshot_estimate(state);
+    if !state.structured_budget.try_reserve(snapshot_bytes) {
+        state.export_notice = Some(Err(
+            "The 128 MiB structured-data ledger could not retain this export snapshot; narrow the visible scope first.".into(),
+        ));
+        return false;
+    }
+    let mut lease = LedgerLease::new(state.structured_budget.clone(), snapshot_bytes);
+    let Some(source) = structured_export_source(state) else {
+        return false;
+    };
+    let estimate = estimate_structured_export_bytes(&source);
+    if source.retained_bytes.saturating_add(estimate) > structured_data::STRUCTURED_DATA_BUDGET
+        || estimate > state.structured_budget.remaining()
+        || !state.structured_budget.try_reserve(estimate)
+    {
+        state.export_notice = Some(Err(
+            "This export would exceed the structured-data memory budget; narrow the visible scope first.".into(),
+        ));
+        return false;
+    }
+    lease.add(estimate);
+    let epoch = state.pages_epoch;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let (tx, rx) = mpsc::channel();
+    let waker = state.waker.clone();
+    let worker_lease = lease.clone();
+    state.structured_export_job = Some(StructuredExportJob {
+        rx,
+        cancel,
+        epoch,
+        lease,
+    });
+    state.export_notice = Some(Ok(format!(
+        "Preparing structured-data CSV · {} visible rows…",
+        source.rows.len()
+    )));
+    std::thread::spawn(move || {
+        let _worker_lease = worker_lease;
+        if let Some(gate) = pause {
+            gate.wait();
+        }
+        let outcome = structured_export_rows(&source, &worker_cancel, estimate).and_then(
+            |(headers, rows)| {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return Err(String::new());
+                }
+                let header_refs = headers.to_vec();
+                let csv = calmtoad::export::to_csv_cancellable(&header_refs, &rows, &worker_cancel)
+                    .ok_or_else(String::new)?;
+                let (noun, row_label) = match source.subview {
+                    StructuredView::Pages => ("structured URL", "page"),
+                    StructuredView::Blocks => ("retained block", "block"),
+                };
+                Ok(PreparedStructuredExport {
+                    csv,
+                    row_count: rows.len(),
+                    scope: format!(
+                        "{} {noun} rows · {}",
+                        rows.len(),
+                        source
+                            .context
+                            .get(3)
+                            .cloned()
+                            .unwrap_or_else(|| row_label.into())
+                    ),
+                    slug: source.slug,
+                })
+            },
+        );
+        let _ = tx.send(outcome);
+        if let Some(wake) = &waker {
+            wake();
+        }
+    });
+    true
+}
+
+fn poll_structured_export(state: &mut State, tx: &mut Tx) -> bool {
+    let Some(job) = state.structured_export_job.take() else {
+        return false;
+    };
+    match job.rx.try_recv() {
+        Ok(Ok(prepared)) => {
+            if job.epoch != state.pages_epoch {
+                return false;
+            }
+            save_prepared_csv(
+                state,
+                tx,
+                prepared.csv,
+                prepared.row_count,
+                prepared.scope,
+                prepared.slug,
+                true,
+                "structured-data",
+                Some(job.lease),
+            );
+            true
+        }
+        Ok(Err(message)) => {
+            if !message.is_empty() {
+                state.export_notice = Some(Err(message));
+            }
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            state.structured_export_job = Some(job);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            state.export_notice = Some(Err(
+                "Structured-data CSV preparation stopped without a result.".into(),
+            ));
+            true
+        }
+    }
+}
+
 fn export_csv(state: &mut State, tx: &mut Tx) {
     if state.phase.active() {
         return;
@@ -7342,6 +9556,10 @@ fn export_csv(state: &mut State, tx: &mut Tx) {
     state.action_notice = None;
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         let _ = start_content_export(state);
+        return;
+    }
+    if structured_view_active(state) {
+        let _ = start_structured_export(state);
         return;
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
@@ -7438,7 +9656,9 @@ fn save_csv(
 ) {
     let csv = calmtoad::export::to_csv(headers, &rows);
     let row_count = rows.len();
-    save_prepared_csv(state, tx, csv, row_count, scope, slug, false, "visible");
+    save_prepared_csv(
+        state, tx, csv, row_count, scope, slug, false, "visible", None,
+    );
 }
 
 fn inventory_temp_file(destination: &Path) -> Result<tempfile::NamedTempFile, String> {
@@ -7509,6 +9729,7 @@ fn save_prepared_csv(
     slug: &'static str,
     background_write: bool,
     row_label: &'static str,
+    lease: Option<LedgerLease>,
 ) {
     if export_lifecycle_busy(state) {
         state.export_notice = Some(Err(
@@ -7528,6 +9749,7 @@ fn save_prepared_csv(
         state.inventory_dialog_open = true;
     }
     tx.save_file(options, move |state: &mut State, result, _tx| {
+        let mut lease = lease;
         state.inventory_dialog_open = false;
         match result {
             Ok(Some(path)) => {
@@ -7558,6 +9780,7 @@ fn save_prepared_csv(
                         temp_path,
                     });
                     std::thread::spawn(move || {
+                        let _lease = lease.take();
                         let result =
                             match write_inventory_temp(temp, &path, csv.as_bytes(), &worker_cancel)
                             {
@@ -7574,6 +9797,7 @@ fn save_prepared_csv(
                         }
                     });
                 } else {
+                    let _lease = lease.take();
                     match std::fs::write(&path, csv.as_bytes()) {
                         Ok(()) => {
                             let name = path
@@ -7864,6 +10088,10 @@ fn results(k: &Kit, state: &State) -> El {
     let has_data =
         if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
             !state.content_rows.is_empty()
+        } else if structured_pages_active(state) {
+            !state.pages.is_empty()
+        } else if structured_blocks_active(state) {
+            !state.structured_blocks.is_empty()
         } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
             !state.link_rows.is_empty()
         } else if state.tab == Tab::Sitemaps {
@@ -7900,8 +10128,9 @@ fn filtered_empty(k: &Kit, state: &State) -> El {
         (
             "No matches".to_string(),
             format!(
-                "No {} match “{query}”{filter_note}. Search covers URL, title, meta description, H1, canonical, content type and finding text.",
-                active_title(state).to_lowercase()
+                "No {} match “{query}”{filter_note}. Search covers {}.",
+                active_title(state).to_lowercase(),
+                search_scope_label(state)
             ),
         )
     } else if filter == CheckFilter::Findings {
@@ -8049,6 +10278,50 @@ fn empty(k: &Kit, state: &State) -> El {
                         ),
                     }
                 }
+            }
+        }
+    } else if structured_pages_active(state) {
+        if state.phase.active() {
+            (
+                "Collecting JSON-LD evidence".to_string(),
+                "Pages appear as captures finish; each page keeps its own inspection state."
+                    .to_string(),
+            )
+        } else if state.pages.is_empty() {
+            (
+                "Crawl a site".to_string(),
+                "Enter a URL above to begin.".to_string(),
+            )
+        } else {
+            (
+                "No structured-data rows".to_string(),
+                "Every captured URL is listed here, including pages where JSON-LD could not be inspected."
+                    .to_string(),
+            )
+        }
+    } else if structured_blocks_active(state) {
+        if state.phase.active() {
+            (
+                "Collecting JSON-LD blocks".to_string(),
+                "Retained block records appear as captures finish.".to_string(),
+            )
+        } else {
+            let complete_absence = !state.pages.is_empty()
+                && state
+                    .pages
+                    .iter()
+                    .all(|page| page.structured.can_assert_absence());
+            if complete_absence {
+                (
+                    "No JSON-LD blocks found".to_string(),
+                    "Every page in this crawl completed a JSON-LD inventory with no matching script elements. Microdata and RDFa are outside this inventory.".to_string(),
+                )
+            } else {
+                (
+                    "No retained JSON-LD blocks".to_string(),
+                    "No block record was retained. That can mean no matching markup, or that capture, inspection or retention did not finish; open Pages to see each page's coverage."
+                        .to_string(),
+                )
             }
         }
     } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
@@ -8200,6 +10473,9 @@ fn sitemap_empty(state: &State) -> (String, String) {
 fn table(k: &Kit, state: &State) -> El {
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         return content_table(k, state);
+    }
+    if structured_view_active(state) {
+        return structured_table(k, state);
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return link_table(k, state);
@@ -8555,6 +10831,750 @@ fn content_table(k: &Kit, state: &State) -> El {
         .build(state, k)
 }
 
+fn structured_table(k: &Kit, state: &State) -> El {
+    let kit = k.clone();
+    let mut table = Table::new(
+        |state: &State| &state.table,
+        |state: &mut State| &mut state.table,
+        |state: &State| visible_len(state),
+        |state: &State, row| Cow::Borrowed(visible_id_ref(state, row).unwrap_or("")),
+    )
+    .name(active_title(state))
+    .style(structured_table_style(k))
+    .zebra(false)
+    .on_sort(|state: &mut State, column, direction, _| {
+        set_structured_sort(state, column, direction)
+    })
+    .on_select(|state: &mut State, id, _tx| {
+        state.view_mut().selected = Some(id.to_string());
+        state.relation_pages.structured_types = 0;
+        state.relation_pages.structured_duplicates = 0;
+        state.details_open = true;
+    });
+    table = match state.structured_subview {
+        StructuredView::Pages => table
+            .column(
+                TableColumn::new("url", "URL")
+                    .flex(2.2)
+                    .min(120.0)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("blocks", "BLOCKS")
+                    .width(70.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("types", "TYPES")
+                    .width(64.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(TableColumn::new("syntax", "SYNTAX").width(86.0).sortable())
+            .column(
+                TableColumn::new("capture", "CAPTURE")
+                    .width(90.0)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("coverage", "COVERAGE")
+                    .width(90.0)
+                    .sortable(),
+            ),
+        StructuredView::Blocks => table
+            .column(
+                TableColumn::new("url", "URL")
+                    .flex(1.9)
+                    .min(120.0)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("ordinal", "#")
+                    .width(36.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(TableColumn::new("syntax", "SYNTAX").width(100.0).sortable())
+            .column(
+                TableColumn::new("types", "TYPES")
+                    .width(64.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("duplicates", "DUPES")
+                    .width(64.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("coverage", "COVERAGE")
+                    .width(90.0)
+                    .sortable(),
+            ),
+    };
+    let subview = state.structured_subview;
+    table
+        .cell(move |state: &State, row, column| match subview {
+            StructuredView::Pages => {
+                let Some(page) = state
+                    .structured_pages_visible
+                    .get(row)
+                    .and_then(|index| state.pages.get(*index))
+                else {
+                    return Cell::text("");
+                };
+                structured_page_cell(&kit, page, column)
+            }
+            StructuredView::Blocks => {
+                let Some(index) = state.structured_block_visible.get(row) else {
+                    return Cell::text("");
+                };
+                let Some(row_ref) = state.structured_blocks.get(*index) else {
+                    return Cell::text("");
+                };
+                let Some(page) = state.pages.get(row_ref.page) else {
+                    return Cell::text("");
+                };
+                let Some(block) = page.structured.blocks.get(row_ref.block) else {
+                    return Cell::text("");
+                };
+                structured_block_cell(&kit, page, block, column)
+            }
+        })
+        .build(state, k)
+}
+
+fn structured_page_cell(k: &Kit, page: &Page, column: &str) -> Cell {
+    let report = &page.structured;
+    match column {
+        "url" => Cell::text(page.url.clone()),
+        "blocks" => Cell::text(report.blocks_observed_label()).mono(),
+        "types" => Cell::text(report.literal_type_label()).mono(),
+        "syntax" => {
+            let label = report.syntax_label();
+            if report.has_confirmed_finding() {
+                Cell::text(label).color(k.c.danger.fg)
+            } else if report.observed_syntax_problems() > 0 || report.duplicate_blocks() > 0 {
+                Cell::text(label).color(k.c.warning.fg)
+            } else {
+                Cell::text(label).muted()
+            }
+        }
+        "coverage" => {
+            let label = report.inspection.label();
+            if matches!(
+                report.inspection,
+                structured_data::InspectionCoverage::Limited
+                    | structured_data::InspectionCoverage::Cancelled
+            ) {
+                Cell::text(label).color(k.c.warning.fg)
+            } else {
+                Cell::text(label).muted()
+            }
+        }
+        "capture" => Cell::text(report.capture_short_label()).muted(),
+        _ => Cell::text(""),
+    }
+}
+
+fn structured_block_cell(
+    k: &Kit,
+    page: &Page,
+    block: &structured_data::Block,
+    column: &str,
+) -> Cell {
+    match column {
+        "url" => Cell::text(page.url.clone()),
+        "ordinal" => Cell::text(block.ordinal.to_string()).mono(),
+        "syntax" => {
+            let label = block.syntax.short_label();
+            if structured_block_finding(page, block) {
+                Cell::text(label).color(k.c.danger.fg)
+            } else if structured_block_incomplete(page, block) {
+                Cell::text(label).color(k.c.warning.fg)
+            } else {
+                Cell::text(label).muted()
+            }
+        }
+        "root" => Cell::text(block.root.label()).muted(),
+        "types" => Cell::text(block.types.len().to_string()).mono(),
+        "duplicates" => Cell::text(block.duplicate_count.to_string()).mono(),
+        "coverage" => {
+            let label = page.structured.inspection.label();
+            if matches!(
+                page.structured.inspection,
+                structured_data::InspectionCoverage::Limited
+                    | structured_data::InspectionCoverage::Cancelled
+            ) {
+                Cell::text(label).color(k.c.warning.fg)
+            } else {
+                Cell::text(label).muted()
+            }
+        }
+        _ => Cell::text(""),
+    }
+}
+
+enum StructuredSelection<'a> {
+    Page(&'a Page),
+    Block(&'a Page, &'a structured_data::Block),
+}
+
+fn selected_structured(state: &State) -> Option<StructuredSelection<'_>> {
+    let id = state.view().selected.as_deref()?;
+    let row = (0..visible_len(state)).find(|row| visible_id_ref(state, *row) == Some(id))?;
+    match state.structured_subview {
+        StructuredView::Pages => {
+            let index = *state.structured_pages_visible.get(row)?;
+            state.pages.get(index).map(StructuredSelection::Page)
+        }
+        StructuredView::Blocks => {
+            let index = *state.structured_block_visible.get(row)?;
+            let row = *state.structured_blocks.get(index)?;
+            let page = state.pages.get(row.page)?;
+            let block = page.structured.blocks.get(row.block)?;
+            Some(StructuredSelection::Block(page, block))
+        }
+    }
+}
+
+fn structured_type_window(k: &Kit, types: &[structured_data::TypeOccurrence], page: usize) -> El {
+    let total = types.len();
+    let (start, end) = relation_window(page, total);
+    let mut block = col().w_full().min_w(0.0).gap(3.0).child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .center_y()
+            .child(micro(k, "Literal types observed"))
+            .child(el().grow(1.0))
+            .child(
+                text(format!("Showing {}–{} of {}", start + 1, end, total))
+                    .font(k.ty.text_xsmall)
+                    .color(k.c.text_muted),
+            ),
+    );
+    for item in types.iter().skip(start).take(end - start) {
+        block = block.child(value_with_copy(
+            k,
+            &item.path,
+            &format!(
+                "{}{}",
+                item.value,
+                if item.value_truncated || item.path_truncated {
+                    " · shortened"
+                } else {
+                    ""
+                }
+            ),
+            "Copy literal type",
+        ));
+    }
+    if total > RELATION_PAGE {
+        block = block.child(
+            row()
+                .w_full()
+                .gap(6.0)
+                .child(
+                    Button::new("Previous")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .disabled(page == 0)
+                        .on_press(|state: &mut State| {
+                            state.relation_pages.structured_types =
+                                state.relation_pages.structured_types.saturating_sub(1);
+                        })
+                        .build(k),
+                )
+                .child(
+                    Button::new("Next")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .disabled(end >= total)
+                        .on_press(|state: &mut State| {
+                            state.relation_pages.structured_types =
+                                state.relation_pages.structured_types.saturating_add(1);
+                        })
+                        .build(k),
+                ),
+        );
+    }
+    block
+}
+
+fn structured_duplicate_window(
+    k: &Kit,
+    duplicates: &[structured_data::DuplicateKey],
+    total: usize,
+    page: usize,
+) -> El {
+    let (start, end) = relation_window(page, duplicates.len());
+    let mut block = col().w_full().min_w(0.0).gap(3.0).child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .center_y()
+            .child(micro(k, "Duplicate keys"))
+            .child(el().grow(1.0))
+            .child(
+                text(format!(
+                    "{} observed · showing {}–{} of {} retained",
+                    total,
+                    start + 1,
+                    end,
+                    duplicates.len()
+                ))
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted),
+            ),
+    );
+    for item in duplicates.iter().skip(start).take(end - start) {
+        block = block.child(value_with_copy(
+            k,
+            &item.path,
+            &format!("{} is repeated", item.key),
+            "Copy duplicate key",
+        ));
+    }
+    if duplicates.len() > RELATION_PAGE {
+        block = block.child(
+            row()
+                .w_full()
+                .gap(6.0)
+                .child(
+                    Button::new("Previous")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .disabled(page == 0)
+                        .on_press(|state: &mut State| {
+                            state.relation_pages.structured_duplicates =
+                                state.relation_pages.structured_duplicates.saturating_sub(1);
+                        })
+                        .build(k),
+                )
+                .child(
+                    Button::new("Next")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .disabled(end >= duplicates.len())
+                        .on_press(|state: &mut State| {
+                            state.relation_pages.structured_duplicates =
+                                state.relation_pages.structured_duplicates.saturating_add(1);
+                        })
+                        .build(k),
+                ),
+        );
+    }
+    block
+}
+
+fn structured_block_list(k: &Kit, page: &Page) -> El {
+    let blocks = &page.structured.blocks;
+    if blocks.is_empty() {
+        return col();
+    }
+    let mut list = col().w_full().min_w(0.0).gap(1.0).child(micro(k, "Blocks"));
+    for (index, block) in blocks.iter().enumerate() {
+        let url = page.url.clone();
+        let key = format!("{url}#{}", block.ordinal);
+        list = list.child(
+            Button::new(format!(
+                "#{} · {} · {} · {} {}",
+                block.ordinal,
+                block.syntax.label(),
+                block.root.label(),
+                block.types.len(),
+                if block.types.len() == 1 {
+                    "type"
+                } else {
+                    "types"
+                }
+            ))
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .on_press(move |state: &mut State| {
+                state.structured_subview = StructuredView::Blocks;
+                state.structured_blocks_view.query.replace_text(&url);
+                state.structured_blocks_view.filter = CheckFilter::All;
+                state.view_mut().selected = Some(key.clone());
+                refresh_visible_forced(state);
+                state.table.select(key.clone());
+                state.details_open = true;
+            })
+            .build(k)
+            .w_full()
+            .key(format!("structured-open-block-{index}")),
+        );
+    }
+    list
+}
+
+fn structured_raw_viewer(k: &Kit, block: &structured_data::Block) -> El {
+    let line = block.error.as_ref().map_or(1, |error| error.line);
+    if block.raw_retained {
+        let (excerpt, start, end, total) = structured_data::raw_excerpt(&block.raw, line);
+        if total == 0 {
+            return col().w_full().min_w(0.0).gap(3.0).child(muted_note(
+                k,
+                "This is an empty inline block; 0 raw bytes were retained.",
+            ));
+        }
+        let mut block_view = col()
+            .w_full()
+            .min_w(0.0)
+            .gap(3.0)
+            .child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .child(micro(k, "Retained JSON"))
+                    .child(el().grow(1.0))
+                    .child(
+                        text(format!(
+                            "lines {}–{} of {} · {} bytes",
+                            start, end, total, block.raw_bytes
+                        ))
+                        .font(k.ty.text_xsmall)
+                        .color(k.c.text_muted),
+                    )
+                    .child(copy_icon(k, "Copy retained JSON", block.raw.to_string())),
+            )
+            .child(
+                text(excerpt)
+                    .font(TextStyle::new(11.0, 400.0).mono())
+                    .color(k.c.text_base)
+                    .wrap()
+                    .w_full(),
+            );
+        if total > (end - start + 1) {
+            block_view = block_view.child(muted_note(
+                k,
+                "This is a bounded excerpt centered on the diagnostic. Copy retained JSON copies the whole retained block, not just this excerpt.",
+            ));
+        }
+        block_view
+    } else {
+        col().w_full().min_w(0.0).gap(3.0).child(muted_note(
+            k,
+            "Raw JSON was not retained for this block, so no raw copy is offered.",
+        ))
+    }
+}
+
+fn structured_detail(k: &Kit, state: &State) -> El {
+    let panel = col()
+        .key("detail")
+        .w(320.0)
+        .h_full()
+        .gap(10.0)
+        .px(14.0)
+        .py(12.0)
+        .border_sides([0.0, 0.0, 0.0, 1.0], k.c.border_weak);
+    let Some(selection) = selected_structured(state) else {
+        return panel.child(micro(k, "Structured data")).child(
+            text("Select a page or retained block to inspect its JSON-LD evidence.")
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        );
+    };
+    let primary = match &selection {
+        StructuredSelection::Page(page) => page.url.clone(),
+        StructuredSelection::Block(page, _) => page.url.clone(),
+    };
+    let position = state
+        .table
+        .cursor()
+        .and_then(|id| (0..visible_len(state)).find(|row| visible_id_ref(state, *row) == Some(id)));
+    let prev = Button::new("Previous")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(position.is_none_or(|position| position == 0))
+        .on_press_tx(|state: &mut State, tx: &mut Tx| move_selection(state, tx, -1))
+        .build(k)
+        .key("detail-prev");
+    let next = Button::new("Next")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(position.is_none_or(|position| position + 1 >= visible_len(state)))
+        .on_press_tx(|state: &mut State, tx: &mut Tx| move_selection(state, tx, 1))
+        .build(k)
+        .key("detail-next");
+    let close = IconButton::new(k.glyph.close)
+        .variant(IconButtonVariant::GhostMuted)
+        .label("Close structured-data details")
+        .on_press(|state: &mut State| state.details_open = false)
+        .build(k)
+        .key("detail-close");
+    let mut body = col()
+        .key("structured-detail-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(10.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+    match selection {
+        StructuredSelection::Page(page) => {
+            let report = &page.structured;
+            body = body
+                .child(
+                    text("JSON-LD page evidence")
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_base),
+                )
+                .child(value_with_copy(k, "URL", &page.url, "Copy URL"))
+                .child(value_with_copy(
+                    k,
+                    "Capture",
+                    &report.capture_label(),
+                    "Copy capture",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Inspection",
+                    report.inspection.label(),
+                    "Copy inspection",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Blocks",
+                    &format!(
+                        "{} observed · {} inspected · {} retained · {} skipped",
+                        report.blocks_observed_label(),
+                        report.blocks_inspected,
+                        report.blocks_retained,
+                        report.blocks_skipped
+                    ),
+                    "Copy block counts",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Literal types observed",
+                    &report.literal_type_label(),
+                    "Copy literal type count",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Duplicate keys",
+                    &format!(
+                        "{} {} · {} observed in {} {}",
+                        report.duplicate_diagnostics,
+                        if report.duplicate_diagnostics == 1 {
+                            "retained diagnostic"
+                        } else {
+                            "retained diagnostics"
+                        },
+                        report.duplicate_diagnostics + report.duplicate_diagnostics_dropped,
+                        report.duplicate_blocks(),
+                        if report.duplicate_blocks() == 1 {
+                            "block"
+                        } else {
+                            "blocks"
+                        }
+                    ),
+                    "Copy duplicate-key counts",
+                ));
+            if !report.capture_reason.is_empty() {
+                body = body.child(muted_note(k, report.capture_reason.as_ref()));
+            }
+            if !report.inspection_reason.is_empty() {
+                body = body.child(muted_note(k, report.inspection_reason.as_ref()));
+            }
+            if report.can_assert_absence() {
+                body = body.child(muted_note(
+                    k,
+                    "No JSON-LD blocks found in this complete capture. Microdata and RDFa are outside this inventory.",
+                ));
+            }
+            for limitation in &report.limitations {
+                body = body.child(muted_note(k, limitation.as_ref()));
+            }
+            body = body.child(muted_note(
+                k,
+                "Literal types are observed strings. Context aliases, remote contexts and value payloads are not expanded; this is not schema.org validation or a Google eligibility result.",
+            ));
+            let types = report.iter_types().cloned().collect::<Vec<_>>();
+            if !types.is_empty() {
+                body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+                body = body.child(structured_type_window(
+                    k,
+                    &types,
+                    state.relation_pages.structured_types,
+                ));
+            }
+            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+            body = body.child(structured_block_list(k, page));
+        }
+        StructuredSelection::Block(page, block) => {
+            let report = &page.structured;
+            body = body
+                .child(
+                    text(format!("JSON-LD block #{}", block.ordinal))
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_base),
+                )
+                .child(value_with_copy(k, "URL", &page.url, "Copy URL"))
+                .child(value_with_copy(
+                    k,
+                    "Capture",
+                    &report.capture_label(),
+                    "Copy capture",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Syntax",
+                    block.syntax.label(),
+                    "Copy syntax outcome",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Root shape",
+                    block.root.label(),
+                    "Copy root shape",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Inventory",
+                    block.inventory.label(),
+                    "Copy inventory state",
+                ));
+            if !block.script_id.is_empty() {
+                body = body.child(value_with_copy(
+                    k,
+                    "Script ID",
+                    &block.script_id,
+                    "Copy script ID",
+                ));
+            }
+            if !block.declared_type.is_empty() {
+                body = body.child(value_with_copy(
+                    k,
+                    "Declared type",
+                    &block.declared_type,
+                    "Copy declared type",
+                ));
+            }
+            if !block.src.is_empty() {
+                body = body.child(value_with_copy(
+                    k,
+                    "Src (not fetched)",
+                    &block.src,
+                    "Copy external src",
+                ));
+            }
+            if let Some(error) = &block.error {
+                body = body
+                    .child(
+                        text(error.message.to_string())
+                            .font(k.ty.text_small)
+                            .color(if error.category == structured_data::ErrorCategory::Limit {
+                                k.c.warning.fg
+                            } else {
+                                k.c.danger.fg
+                            })
+                            .wrap()
+                            .w_full(),
+                    )
+                    .child(value_with_copy(
+                        k,
+                        "Location in block",
+                        &format!(
+                            "line {} · byte column {} · {}",
+                            error.line,
+                            error.column,
+                            error.category.label()
+                        ),
+                        "Copy diagnostic location",
+                    ));
+            }
+            for limitation in &block.limitations {
+                body = body.child(muted_note(k, limitation.as_ref()));
+            }
+            body = body.child(muted_note(
+                k,
+                "Literal types are observed strings. Context aliases, remote contexts and value payloads are not expanded; this is not schema.org validation or a Google eligibility result.",
+            ));
+            if !block.types.is_empty() {
+                body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+                body = body.child(structured_type_window(
+                    k,
+                    &block.types,
+                    state.relation_pages.structured_types,
+                ));
+            }
+            if !block.ids.is_empty() {
+                body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+                body = body.child(
+                    col()
+                        .w_full()
+                        .gap(3.0)
+                        .child(micro(k, "Literal @id values"))
+                        .children(block.ids.iter().take(RELATION_PAGE).map(|item| {
+                            value_with_copy(k, &item.path, &item.value, "Copy literal @id")
+                        })),
+                );
+            }
+            if block.duplicate_count > 0 {
+                body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+                body = body.child(structured_duplicate_window(
+                    k,
+                    &block.duplicates,
+                    block.duplicate_count,
+                    state.relation_pages.structured_duplicates,
+                ));
+            }
+            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+            body = body.child(structured_raw_viewer(k, block));
+        }
+    }
+    let open = IconButton::new(&OPEN_LINK)
+        .variant(IconButtonVariant::GhostMuted)
+        .label("Open page in browser")
+        .on_press_tx({
+            let url = primary.clone();
+            move |_: &mut State, tx: &mut Tx| {
+                let _ = tx.open_url(&url);
+            }
+        })
+        .build(k);
+    panel
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .gap(4.0)
+                .child(micro(k, "Structured data"))
+                .child(el().grow(1.0))
+                .child(prev)
+                .child(next)
+                .child(close),
+        )
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .gap(6.0)
+                .child(
+                    text(primary.clone())
+                        .font(k.ty.text_small)
+                        .color(k.c.text_muted)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate()
+                        .help(primary),
+                )
+                .child(open),
+        )
+        .child(el().w_full().h(1.0).fill(k.c.border_weak))
+        .child(body)
+}
+
 fn capture_label_for_content(stage: EvidenceStage, scope: Option<content::ContentScope>) -> String {
     format!(
         "{} · {}",
@@ -8845,6 +11865,14 @@ fn table_style(k: &Kit) -> TableStyle {
     style
 }
 
+/// The structured-data tables carry six short columns; the standard gutter leaves each one
+/// too narrow at the 880px minimum when the inspector is open.
+fn structured_table_style(k: &Kit) -> TableStyle {
+    let mut style = table_style(k);
+    style.cell_pad = 10.0;
+    style
+}
+
 fn cell(k: &Kit, tab: Tab, page: &Page, audit: &Audit, column: &str) -> Cell {
     match (tab, column) {
         (_, "url") => Cell::text(page.url.clone()),
@@ -8954,6 +11982,9 @@ fn selected_page(state: &State) -> Option<&Page> {
 fn detail(k: &Kit, state: &State) -> El {
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         return content_detail(k, state);
+    }
+    if structured_view_active(state) {
+        return structured_detail(k, state);
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return link_detail(k, state);
@@ -9105,6 +12136,10 @@ fn move_selection(state: &mut State, tx: &mut Tx, delta: i32) {
         state.content_members_page = 0;
         state.content_pair_left_open = false;
         state.content_pair_right_open = false;
+    } else if structured_view_active(state) {
+        state.view_mut().selected = Some(id.clone());
+        state.relation_pages.structured_types = 0;
+        state.relation_pages.structured_duplicates = 0;
     } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         state.link_view.selected = Some(id.clone());
     } else {
@@ -9135,7 +12170,7 @@ fn inspect_url_state(state: &mut State, url: &str) -> bool {
         let (column, dir) = state.view().sort.clone();
         state.table.set_sort(column, dir);
         switched = true;
-    } else if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
+    } else if state.tab == Tab::Internal && state.internal_view != InternalView::Urls {
         state.internal_view = InternalView::Urls;
         let (column, dir) = state.view().sort.clone();
         state.table.set_sort(column, dir);
@@ -11359,7 +14394,11 @@ fn dash(value: &str) -> String {
 }
 
 fn switch_tab(state: &mut State, tab: Tab) {
+    let was_structured = structured_view_active(state);
     state.tab = tab;
+    if was_structured && !structured_view_active(state) {
+        cancel_structured_refresh(state);
+    }
     state.relation_pages = RelationPages::default();
     state.selection_epoch = state.selection_epoch.wrapping_add(1);
     let (column, dir) = state.view().sort.clone();
@@ -11468,6 +14507,84 @@ fn scene_inventory_scope(state: &mut State) {
     state.inventory_scope_open = true;
     switch_tab(state, Tab::Overview);
 }
+fn sample_structured(html: &str, complete: bool) -> Arc<structured_data::PageReport> {
+    let doc = Html::parse_document(html);
+    let budget = structured_data::StructuredBudget::default();
+    structured_data::Inspection::new(&budget, None).inspect(&doc, EvidenceStage::Document, complete)
+}
+
+fn scene_structured_data_pages(state: &mut State) {
+    let mut pages = crawl::sample_pages();
+    pages[0].structured = sample_structured(
+        r##"<main>
+          <script type="application/ld+json" id="organization">
+            {"@context":"https://schema.org","@type":["Organization","LocalBusiness"],
+             "@id":"https://example.com/#org","name":"Example",
+             "employee":{"@type":"Person","@id":"#person"}}
+          </script>
+        </main>"##,
+        true,
+    );
+    pages[1].structured = sample_structured(
+        r#"<main><script type="application/ld+json">{"@type":"Product","offers":}</script></main>"#,
+        true,
+    );
+    pages[2].structured = sample_structured(
+        r#"<main><script type="application/ld+json">{"@type":"Article","headline":"One","headline":"Two"}</script></main>"#,
+        true,
+    );
+    pages[3].structured = structured_data::PageReport::unavailable(
+        "Rendered DOM unavailable; source fallback is not used for structured data",
+        EvidenceStage::Rendered,
+    )
+    .into();
+    pages[4].structured = sample_structured(
+        r#"<main><script type="application/ld+json">{"@type":["WebPage"],"@graph":[{"@type":"Person"},{"@type":"Organization"}]}</script></main>"#,
+        true,
+    );
+    pages[5].structured = sample_structured(
+        r#"<main><script src="https://example.com/data.json" type="application/ld+json"></script></main>"#,
+        true,
+    );
+    pages[6].structured = sample_structured("<main><p>No JSON-LD here</p></main>", true);
+    pages[7].structured = sample_structured("<main><p>No JSON-LD here either</p></main>", true);
+    pages[8].structured = structured_data::PageReport::unavailable(
+        "Response is not an HTML document",
+        EvidenceStage::Document,
+    )
+    .into();
+    set_pages(state, pages, "9 pages on example.com".into());
+    state.internal_view = InternalView::StructuredData;
+    state.structured_subview = StructuredView::Pages;
+    state.structured_pages_view.filter = CheckFilter::All;
+    switch_tab(state, Tab::Internal);
+    refresh_visible_forced(state);
+    if let Some(key) = state
+        .structured_pages_visible
+        .iter()
+        .filter_map(|index| state.pages.get(*index))
+        .find(|page| page.structured.has_confirmed_finding())
+        .map(|page| page.url.clone())
+    {
+        state.structured_pages_view.selected = Some(key.clone());
+        state.table.select(key);
+        state.details_open = true;
+    }
+}
+
+fn scene_structured_data_blocks(state: &mut State) {
+    scene_structured_data_pages(state);
+    state.structured_subview = StructuredView::Blocks;
+    state.structured_blocks_view.query.replace_text("");
+    state.structured_blocks_view.filter = CheckFilter::All;
+    refresh_visible_forced(state);
+    if let Some(key) = state.structured_block_keys.first().cloned() {
+        state.structured_blocks_view.selected = Some(key.clone());
+        state.table.select(key);
+        state.details_open = true;
+    }
+}
+
 fn scene_duplicate_content(state: &mut State) {
     let mut pages = crawl::sample_pages();
     let base = (0..80)
@@ -11747,6 +14864,10 @@ fn scene_failed(state: &mut State) {
     state.pages.clear();
     reset_inspector_dataset(state);
     state.search_index.clear();
+    if let Some(job) = state.structured_export_job.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+    reset_structured_view_cache(state);
     state.visible.clear();
     state.counts = Counts::default();
     state.view_counts = ViewCounts::default();
@@ -12120,6 +15241,8 @@ fn main() {
             ("link-evidence", scene_link_evidence),
             ("link-evidence-detail", scene_link_evidence_detail),
             ("inventory-scope", scene_inventory_scope),
+            ("structured-data-pages", scene_structured_data_pages),
+            ("structured-data-blocks", scene_structured_data_blocks),
             ("duplicate-content", scene_duplicate_content),
             ("duplicate-content-similar", scene_duplicate_content_similar),
             (
@@ -14494,6 +17617,7 @@ mod tests {
             extraction: Vec::new().into(),
             extraction_limit: String::new(),
             content: Arc::new(ContentEvidence::default()),
+            structured: Arc::new(calmtoad::structured_data::PageReport::default()),
             indexability: assessment,
         };
         assert_eq!(page.indexability.label, Label::NotAssessed);
@@ -14630,6 +17754,7 @@ mod tests {
             extraction: Vec::new().into(),
             extraction_limit: String::new(),
             content: Arc::new(ContentEvidence::default()),
+            structured: Arc::new(calmtoad::structured_data::PageReport::default()),
             indexability: assessment,
         };
         assert_eq!(page.indexability.label, Label::NotAssessed);
@@ -16500,5 +19625,972 @@ mod tests {
         rt.pointer_up(x, y);
         rt.frame(0.016);
         assert!(!rt.state.use_sitemaps);
+    }
+    #[test]
+    fn structured_data_views_keep_independent_state_and_fit_the_minimum_window() {
+        let mut state = init();
+        scene_structured_data_pages(&mut state);
+        assert_eq!(state.internal_view, InternalView::StructuredData);
+        assert_eq!(state.structured_subview, StructuredView::Pages);
+        assert!(!state.structured_pages_visible.is_empty());
+
+        let mut rt = test_runtime(state);
+        rt.state.views[0].selected = None;
+        rt.frame(0.016);
+        // Force the minimum window after the first layout.
+        let mut narrow = Runtime::new(
+            rt.state,
+            view,
+            (880.0, 560.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        narrow.frame(0.016);
+        assert!(narrow.find("internal-menu").is_some());
+        assert!(narrow.find("structured-pages").is_some());
+        assert!(narrow.find("structured-blocks").is_some());
+        for key in ["export-csv", "copy-urls", "details-toggle"] {
+            let (x, _) = narrow.find(key).unwrap_or_else(|| panic!("{key} missing"));
+            assert!(x < 880.0, "{key} sits outside the 880px window at x={x}");
+        }
+
+        narrow.update(|state: &mut State, _| {
+            state
+                .structured_pages_view
+                .query
+                .replace_text("Organization");
+            state.structured_pages_view.filter = CheckFilter::All;
+            state.structured_pages_view.sort = ("types".into(), SortDir::Descending);
+            refresh_visible_forced(state);
+        });
+        let _ = pump_structured_view(&mut narrow.state);
+        narrow.frame(0.016);
+        let pages_query = narrow.state.structured_pages_view.query.text.clone();
+        let pages_filter = narrow.state.structured_pages_view.filter;
+        let pages_sort = narrow.state.structured_pages_view.sort.clone();
+        let filtered_pages = narrow.state.structured_pages_visible.len();
+        assert!(!narrow.state.structured_pages_visible.is_empty());
+
+        click_key(&mut narrow, "structured-blocks");
+        assert_eq!(narrow.state.structured_subview, StructuredView::Blocks);
+        assert!(!narrow.state.structured_blocks.is_empty());
+        narrow.update(|state: &mut State, _| {
+            state.structured_blocks_view.query.replace_text("headline");
+            state.structured_blocks_view.filter = CheckFilter::All;
+            state.structured_blocks_view.sort = ("syntax".into(), SortDir::Descending);
+            refresh_visible_forced(state);
+        });
+        let _ = pump_structured_view(&mut narrow.state);
+        narrow.frame(0.016);
+        assert!(
+            !narrow.state.structured_block_visible.is_empty(),
+            "block search matches a literal key/path without indexing raw JSON"
+        );
+
+        click_key(&mut narrow, "structured-pages");
+        assert_eq!(narrow.state.structured_subview, StructuredView::Pages);
+        assert_eq!(narrow.state.structured_pages_view.query.text, pages_query);
+        assert_eq!(narrow.state.structured_pages_view.filter, pages_filter);
+        assert_eq!(narrow.state.structured_pages_view.sort, pages_sort);
+        assert_eq!(narrow.state.structured_pages_visible.len(), filtered_pages);
+
+        // Search does not concatenate or scan the raw JSON body.
+        narrow.update(|state: &mut State, _| {
+            state.structured_pages_view.query.replace_text("offers");
+            state.structured_pages_view.filter = CheckFilter::All;
+            refresh_visible_forced(state);
+        });
+        let _ = pump_structured_view(&mut narrow.state);
+        narrow.frame(0.016);
+        assert!(
+            narrow.state.structured_pages_visible.is_empty(),
+            "a raw-only token must not become a page search match"
+        );
+    }
+
+    #[test]
+    fn structured_data_overview_links_known_findings_and_incomplete_coverage() {
+        let mut state = init();
+        scene_structured_data_pages(&mut state);
+        switch_tab(&mut state, Tab::Overview);
+        state.counts_dirty = true;
+        let _ = refresh_counts(&mut state, true);
+        assert!(state.overview.structured_urls > 0);
+        assert!(state.overview.structured_incomplete > 0);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("overview-structured").is_some());
+        assert!(rt.find("overview-structured-incomplete").is_some());
+
+        click_key(&mut rt, "overview-structured");
+        assert_eq!(rt.state.tab, Tab::Internal);
+        assert_eq!(rt.state.internal_view, InternalView::StructuredData);
+        assert_eq!(rt.state.structured_subview, StructuredView::Pages);
+        assert_eq!(rt.state.structured_pages_view.filter, CheckFilter::Findings);
+        assert!(!rt.state.structured_pages_visible.is_empty());
+
+        switch_tab(&mut rt.state, Tab::Overview);
+        rt.frame(0.016);
+        click_key(&mut rt, "overview-structured-incomplete");
+        assert_eq!(
+            rt.state.structured_pages_view.filter,
+            CheckFilter::Incomplete
+        );
+        assert!(!rt.state.structured_pages_visible.is_empty());
+    }
+
+    #[test]
+    fn structured_exports_project_the_exact_visible_snapshot_and_stay_bounded() {
+        let mut state = init();
+        scene_structured_data_pages(&mut state);
+        state.structured_pages_view.filter = CheckFilter::All;
+        state.structured_pages_view.query.replace_text("");
+        refresh_visible_forced(&mut state);
+        let source = structured_export_source(&state).expect("pages source");
+        assert_eq!(source.rows.len(), state.structured_pages_visible.len());
+        assert_eq!(source.context[0], "https://example.com/");
+        let (headers, rows) = structured_export_rows(&source, &AtomicBool::new(false), usize::MAX)
+            .expect("pages rows");
+        assert_eq!(rows.len(), source.rows.len());
+        assert_eq!(headers[0], "URL");
+        assert!(!headers.contains(&"RAW JSON"));
+        for row in &rows {
+            assert_eq!(row.len(), headers.len());
+            for column in [
+                "LITERAL TYPES",
+                "LITERAL IDS",
+                "DUPLICATE KEYS",
+                "LIMITATIONS",
+            ] {
+                let index = headers.iter().position(|header| *header == column).unwrap();
+                serde_json::from_str::<serde_json::Value>(&row[index]).unwrap_or_else(|error| {
+                    panic!("{column} was not JSON: {error}: {}", row[index])
+                });
+            }
+        }
+        assert!(structured_export_rows(&source, &AtomicBool::new(true), usize::MAX).is_err());
+        let limited = structured_export_rows(&source, &AtomicBool::new(false), 10);
+        assert!(limited.unwrap_err().contains("reserved projection"));
+        assert!(estimate_structured_export_bytes(&source) > 0);
+
+        state.structured_subview = StructuredView::Blocks;
+        state.structured_blocks_view.query.replace_text("");
+        state.structured_blocks_view.filter = CheckFilter::All;
+        refresh_visible_forced(&mut state);
+        let source = structured_export_source(&state).expect("blocks source");
+        assert_eq!(source.rows.len(), state.structured_block_visible.len());
+        let (headers, rows) = structured_export_rows(&source, &AtomicBool::new(false), usize::MAX)
+            .expect("block rows");
+        assert_eq!(headers[0], "URL");
+        assert!(headers.contains(&"RAW RETAINED"));
+        assert!(!headers.contains(&"RAW JSON"));
+        for row in &rows {
+            assert_eq!(row.len(), headers.len());
+            for column in [
+                "LITERAL TYPES",
+                "LITERAL IDS",
+                "DUPLICATE KEYS",
+                "LIMITATIONS",
+            ] {
+                let index = headers.iter().position(|header| *header == column).unwrap();
+                serde_json::from_str::<serde_json::Value>(&row[index]).unwrap_or_else(|error| {
+                    panic!("{column} was not JSON: {error}: {}", row[index])
+                });
+            }
+        }
+    }
+
+    fn structured_test_pages(count: usize, blocks_per_page: usize) -> Vec<Page> {
+        let template = crawl::sample_pages().remove(0);
+        let html = (1..=blocks_per_page)
+            .map(|index| {
+                format!(
+                    r##"<script type="application/ld+json">{{"@type":["Thing","Person"],"@id":"#x{index}","name":"Example"}}</script>"##
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let report = sample_structured(&html, true);
+        assert_eq!(report.blocks.len(), blocks_per_page);
+        let mut pages = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut page = template.clone();
+            page.url = format!("https://example.com/page/{index}");
+            page.structured = report.clone();
+            pages.push(page);
+        }
+        pages
+    }
+
+    fn structured_test_state(count: usize, blocks_per_page: usize) -> State {
+        let mut state = init();
+        state.pages = structured_test_pages(count, blocks_per_page);
+        state.pages_epoch = state.pages_epoch.wrapping_add(1);
+        state.tab = Tab::Internal;
+        state.internal_view = InternalView::StructuredData;
+        state.structured_subview = StructuredView::Pages;
+        state.structured_pages_view.filter = CheckFilter::All;
+        state
+    }
+
+    /// Drive the real poll path without a window. Every individual step is measured so a
+    /// synchronous scan cannot hide inside the total.
+    fn pump_structured_view(state: &mut State) -> (Duration, Duration, Duration) {
+        let wall = Instant::now();
+        let mut total = Duration::ZERO;
+        let mut max_step = Duration::ZERO;
+        let mut steps = 0_usize;
+        while state.structured_refresh.is_some() {
+            let started = Instant::now();
+            let _ = poll_structured_view(state);
+            let step = started.elapsed();
+            total += step;
+            max_step = max_step.max(step);
+            steps += 1;
+            assert!(steps < 200_000, "structured view worker did not finish");
+            if state.structured_refresh.is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        (max_step, total, wall.elapsed())
+    }
+
+    #[test]
+    fn structured_large_refresh_moves_index_and_sort_work_off_the_ui_step() {
+        let mut state = structured_test_state(300, 1);
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let trigger = started.elapsed();
+        assert!(
+            trigger < Duration::from_millis(8),
+            "trigger took {trigger:?}"
+        );
+        assert!(
+            state.structured_refresh.is_some(),
+            "300 pages must use the bounded worker path"
+        );
+        assert!(
+            !start_structured_export(&mut state),
+            "an export must not freeze a half-refreshed visible snapshot"
+        );
+        assert!(
+            state
+                .export_notice
+                .as_ref()
+                .is_some_and(|notice| notice.is_err())
+        );
+        state.export_notice = None;
+        let (max_step, total, wall) = pump_structured_view(&mut state);
+        assert!(
+            max_step < Duration::from_millis(8),
+            "poll step {max_step:?}"
+        );
+        assert_eq!(state.structured_pages_visible.len(), 300);
+        assert!(state.structured_index_limited.is_none());
+        assert!(
+            state.structured_budget.used() <= structured_data::STRUCTURED_DATA_BUDGET,
+            "index caches must stay inside the shared ledger"
+        );
+
+        state.structured_pages_view.query.replace_text("Person");
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let query_trigger = started.elapsed();
+        assert!(
+            query_trigger < Duration::from_millis(8),
+            "query trigger {query_trigger:?}"
+        );
+        let (query_step, query_total, query_wall) = pump_structured_view(&mut state);
+        assert!(query_step < Duration::from_millis(8));
+        assert_eq!(state.structured_pages_visible.len(), 300);
+
+        state.structured_subview = StructuredView::Blocks;
+        state.structured_blocks_view.filter = CheckFilter::All;
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let blocks_trigger = started.elapsed();
+        assert!(blocks_trigger < Duration::from_millis(8));
+        let (blocks_step, blocks_total, blocks_wall) = pump_structured_view(&mut state);
+        assert!(blocks_step < Duration::from_millis(8));
+        assert_eq!(state.structured_block_visible.len(), 300);
+
+        eprintln!(
+            "structured 300-page worker: trigger {trigger:?}, pages ui {total:?} wall {wall:?}, query trigger {query_trigger:?}, query ui {query_total:?} wall {query_wall:?}, blocks trigger {blocks_trigger:?}, blocks ui {blocks_total:?} wall {blocks_wall:?}, ledger {}",
+            state.structured_budget.used()
+        );
+    }
+
+    #[test]
+    fn structured_index_reservation_failure_stops_retained_rows_and_reports_coverage() {
+        let mut state = structured_test_state(300, 1);
+        state.structured_budget = Arc::new(structured_data::StructuredBudget::with_used(
+            structured_data::STRUCTURED_DATA_BUDGET - 4_096,
+        ));
+        refresh_visible_forced(&mut state);
+        let (_, _, _) = pump_structured_view(&mut state);
+        assert!(
+            state.structured_index_limited.is_some(),
+            "a failed aggregate reservation must be visible"
+        );
+        assert!(state.structured_facts.len() < state.pages.len());
+        assert!(state.structured_pages_visible.len() <= state.structured_facts.len());
+        assert!(
+            state.structured_budget.used() <= structured_data::STRUCTURED_DATA_BUDGET,
+            "the ledger must never exceed its cap"
+        );
+
+        // The same limited state stays honest when switching to Blocks: no unbounded cache is
+        // allocated after the failed reservation.
+        state.structured_subview = StructuredView::Blocks;
+        refresh_visible_forced(&mut state);
+        let (_, _, _) = pump_structured_view(&mut state);
+        assert!(state.structured_blocks.len() <= state.structured_facts.len());
+        assert!(state.structured_budget.used() <= structured_data::STRUCTURED_DATA_BUDGET);
+    }
+
+    #[test]
+    fn structured_search_matches_retained_fields_after_the_old_prefix_bound() {
+        let mut page = crawl::sample_pages().remove(0);
+        let filler = "a".repeat(1_000);
+        let mut scripts = String::new();
+        for index in 0..9 {
+            let marker = if index == 8 { "NeedleMarker" } else { "" };
+            scripts.push_str(&format!(
+                r##"<script type="application/ld+json">{{"@type":"Type{index}{filler}{marker}","payload":"rawonlytoken"}}</script>"##
+            ));
+        }
+        page.structured = sample_structured(&scripts, true);
+        assert_eq!(page.structured.literal_types_retained, 9);
+        assert!(
+            page.structured
+                .iter_types()
+                .map(|item| item.value.len())
+                .sum::<usize>()
+                > MAX_STRUCTURED_SEARCH_BYTES
+        );
+        let mut state = init();
+        state.pages = vec![page];
+        state.pages_epoch = state.pages_epoch.wrapping_add(1);
+        state.tab = Tab::Internal;
+        state.internal_view = InternalView::StructuredData;
+        state.structured_subview = StructuredView::Pages;
+        state
+            .structured_pages_view
+            .query
+            .replace_text("needlemarker");
+        state.structured_pages_view.filter = CheckFilter::All;
+        refresh_visible_forced(&mut state);
+        let _ = pump_structured_view(&mut state);
+        assert_eq!(state.structured_pages_visible.len(), 1);
+
+        state.structured_subview = StructuredView::Blocks;
+        state
+            .structured_blocks_view
+            .query
+            .replace_text("needlemarker");
+        state.structured_blocks_view.filter = CheckFilter::All;
+        refresh_visible_forced(&mut state);
+        let _ = pump_structured_view(&mut state);
+        assert_eq!(state.structured_block_visible.len(), 1);
+
+        state
+            .structured_pages_view
+            .query
+            .replace_text("rawonlytoken");
+        state.structured_subview = StructuredView::Pages;
+        refresh_visible_forced(&mut state);
+        let _ = pump_structured_view(&mut state);
+        assert!(
+            state.structured_pages_visible.is_empty(),
+            "search must not read raw JSON"
+        );
+    }
+
+    #[test]
+    fn cancelled_export_keeps_the_lease_until_the_paused_worker_drops() {
+        let mut state = init();
+        scene_structured_data_pages(&mut state);
+        state.structured_subview = StructuredView::Pages;
+        state.structured_pages_view.query.replace_text("");
+        state.structured_pages_view.filter = CheckFilter::All;
+        refresh_visible_forced(&mut state);
+        let before = state.structured_budget.used();
+        let gate = Arc::new(WorkerGate::closed());
+        assert!(start_structured_export_with_gate(
+            &mut state,
+            Some(gate.clone())
+        ));
+        for _ in 0..500 {
+            if gate.has_entered() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            gate.has_entered(),
+            "the export worker must reach the paused allocation"
+        );
+        let reserved = state.structured_budget.used();
+        assert!(reserved > before);
+        stop_owned_work(&mut state);
+        assert!(state.structured_export_job.is_none());
+        assert_eq!(
+            state.structured_budget.used(),
+            reserved,
+            "dropping the UI job must not release the worker-owned source/rows/CSV"
+        );
+        gate.open();
+        let mut released = false;
+        for _ in 0..500 {
+            if state.structured_budget.used() < reserved {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            released,
+            "the export lease must release once the worker drops its allocations"
+        );
+    }
+
+    #[test]
+    fn export_estimate_accounts_for_json_escaped_control_characters() {
+        let escapes = "\\u0000".repeat(1_000);
+        let report = sample_structured(
+            &format!(r##"<script type="application/ld+json">{{"@type":"{escapes}"}}</script>"##),
+            true,
+        );
+        assert_eq!(report.literal_types_retained, 1);
+        assert_eq!(report.blocks[0].types[0].value.len(), 1_000);
+        let context = vec![
+            "https://example.com/".to_string(),
+            "2026-11-21T00:00:00Z".to_string(),
+            "HTML".to_string(),
+            "Completed · 1 page".to_string(),
+        ];
+        let source = StructuredExportSource {
+            subview: StructuredView::Pages,
+            rows: vec![StructuredExportRow::Page {
+                url: "https://example.com/".into(),
+                report: report.clone(),
+            }],
+            context: context.clone(),
+            slug: "structured-data-pages",
+            retained_bytes: report.retained_bytes,
+        };
+        let estimate = estimate_structured_export_bytes(&source);
+        assert!(
+            estimate < structured_data::STRUCTURED_DATA_BUDGET,
+            "one escaped row must fit the ledger: {estimate}"
+        );
+        let (headers, rows) = structured_export_rows(&source, &AtomicBool::new(false), estimate)
+            .expect("escaped retained NULs must fit the reserved estimate");
+        let types = headers
+            .iter()
+            .position(|header| *header == "LITERAL TYPES")
+            .expect("literal types column");
+        assert!(
+            rows[0][types].contains("\\u0000"),
+            "the projected JSON column must carry escaped NULs"
+        );
+        let csv = calmtoad::export::to_csv(&headers, &rows);
+        assert!(
+            csv.len() <= estimate,
+            "the estimate must cover encoded CSV bytes: {} <= {}",
+            csv.len(),
+            estimate
+        );
+
+        let blocks = StructuredExportSource {
+            subview: StructuredView::Blocks,
+            rows: vec![StructuredExportRow::Block {
+                url: "https://example.com/".into(),
+                report: report.clone(),
+                block: 0,
+            }],
+            context,
+            slug: "structured-data-blocks",
+            retained_bytes: report.retained_bytes,
+        };
+        let estimate = estimate_structured_export_bytes(&blocks);
+        structured_export_rows(&blocks, &AtomicBool::new(false), estimate)
+            .expect("the Blocks projection must use the same escaped allowance");
+    }
+
+    #[test]
+    fn structured_export_estimate_charges_context_for_every_row() {
+        let report = sample_structured(
+            r##"<script type="application/ld+json">{"@type":"Thing"}</script>"##,
+            true,
+        );
+        let context = vec!["c".repeat(4_096); 4];
+        let source = StructuredExportSource {
+            subview: StructuredView::Pages,
+            rows: vec![StructuredExportRow::Page {
+                url: "https://example.com/a".into(),
+                report: report.clone(),
+            }],
+            context: context.clone(),
+            slug: "structured-data-pages",
+            retained_bytes: report.retained_bytes,
+        };
+        let one = estimate_structured_export_bytes(&source);
+        let mut many = source.clone();
+        many.rows = (0..100)
+            .map(|index| StructuredExportRow::Page {
+                url: format!("https://example.com/{index}"),
+                report: report.clone(),
+            })
+            .collect();
+        let hundred = estimate_structured_export_bytes(&many);
+        assert!(
+            hundred > one.saturating_add(99 * 4_096),
+            "each row must carry its own context allowance: {one} -> {hundred}"
+        );
+    }
+
+    #[test]
+    fn structured_export_estimate_covers_inventory_labels_for_many_zero_literal_blocks() {
+        // 32 blocks per page with no literal @type/@id evidence: the only dynamic per-block
+        // output is the INVENTORY STATE label. Before the estimate charged that column, 10,000
+        // rows overshot their reserved projection allowance.
+        let html = (0..32)
+            .map(|_| r#"<script type="application/ld+json">{}</script>"#)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let report = sample_structured(&html, true);
+        assert_eq!(report.blocks.len(), 32);
+        assert_eq!(report.literal_types_retained, 0);
+        assert_eq!(report.literal_ids_retained, 0);
+        assert!(report.blocks.iter().all(|block| {
+            block.types.is_empty() && block.ids.is_empty() && block.duplicates.is_empty()
+        }));
+        let context = vec![
+            "https://example.com/".to_string(),
+            "2026-11-21T00:00:00Z".to_string(),
+            "HTML".to_string(),
+            "Completed · 10,000 pages".to_string(),
+        ];
+        let rows = (0..10_000)
+            .map(|index| StructuredExportRow::Page {
+                url: format!("https://example.com/page/{index}"),
+                report: report.clone(),
+            })
+            .collect::<Vec<_>>();
+        let source = StructuredExportSource {
+            subview: StructuredView::Pages,
+            rows,
+            context,
+            slug: "structured-data-pages",
+            retained_bytes: report.retained_bytes,
+        };
+        let estimate = estimate_structured_export_bytes(&source);
+        assert!(estimate < structured_data::STRUCTURED_DATA_BUDGET);
+        assert!(
+            source.retained_bytes.saturating_add(estimate)
+                <= structured_data::STRUCTURED_DATA_BUDGET,
+            "the estimate must fit the shared 128 MiB ledger"
+        );
+        let (headers, rows) = structured_export_rows(&source, &AtomicBool::new(false), estimate)
+            .expect("the reserved allowance must cover inventory labels for every row");
+        assert_eq!(rows.len(), source.rows.len());
+        let inventory = headers
+            .iter()
+            .position(|header| *header == "INVENTORY STATE")
+            .expect("inventory column");
+        assert_eq!(rows[0][inventory].matches("Complete").count(), 32);
+        let csv = calmtoad::export::to_csv(&headers, &rows);
+        assert!(
+            csv.len() <= estimate,
+            "the estimate must cover encoded CSV bytes: {} <= {}",
+            csv.len(),
+            estimate
+        );
+
+        // The Blocks projection emits one inventory label per row; keep that cost accounted too.
+        let blocks = StructuredExportSource {
+            subview: StructuredView::Blocks,
+            rows: (0..10_000)
+                .map(|index| StructuredExportRow::Block {
+                    url: format!("https://example.com/page/{index}"),
+                    report: report.clone(),
+                    block: index % report.blocks.len(),
+                })
+                .collect(),
+            context: source.context.clone(),
+            slug: "structured-data-blocks",
+            retained_bytes: report.retained_bytes,
+        };
+        let estimate = estimate_structured_export_bytes(&blocks);
+        let (headers, rows) = structured_export_rows(&blocks, &AtomicBool::new(false), estimate)
+            .expect("the Blocks estimate must cover its inventory label");
+        let csv = calmtoad::export::to_csv(&headers, &rows);
+        assert!(
+            csv.len() <= estimate,
+            "the Blocks estimate must cover encoded CSV bytes: {} <= {}",
+            csv.len(),
+            estimate
+        );
+    }
+
+    #[test]
+    fn structured_export_start_and_cancel_move_the_ledger_lease() {
+        let mut state = init();
+        scene_structured_data_pages(&mut state);
+        state.structured_subview = StructuredView::Pages;
+        state.structured_pages_view.query.replace_text("");
+        state.structured_pages_view.filter = CheckFilter::All;
+        refresh_visible_forced(&mut state);
+        let before = state.structured_budget.used();
+        assert!(start_structured_export(&mut state));
+        let during = state.structured_budget.used();
+        assert!(
+            during > before,
+            "snapshot and projection/encoding must be reserved before work"
+        );
+        assert!(state.structured_export_job.is_some());
+        stop_owned_work(&mut state);
+        assert!(state.structured_export_job.is_none());
+        let mut released = false;
+        for _ in 0..500 {
+            if state.structured_budget.used() <= before {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            released,
+            "the export lease releases only after the cancelled worker drops its allocations"
+        );
+    }
+
+    #[test]
+    fn cancelled_refresh_keeps_the_snapshot_lease_until_the_worker_drops_it() {
+        let mut state = structured_test_state(300, 1);
+        refresh_visible_forced(&mut state);
+        let gate = Arc::new(WorkerGate::closed());
+        state
+            .structured_refresh
+            .as_mut()
+            .expect("queued refresh")
+            .pause = Some(gate.clone());
+        let _ = poll_structured_view(&mut state);
+        assert!(
+            state
+                .structured_refresh
+                .as_ref()
+                .is_some_and(|job| job.rx.is_some()),
+            "the worker has the snapshot and is paused at the gate"
+        );
+        let used_before = state.structured_budget.used();
+        cancel_structured_refresh(&mut state);
+        assert!(state.structured_refresh.is_none());
+        assert_eq!(
+            state.structured_budget.used(),
+            used_before,
+            "cancelling the UI job must not release the worker's live snapshot"
+        );
+        gate.open();
+        let mut released = false;
+        for _ in 0..500 {
+            if state.structured_budget.used() < used_before {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            released,
+            "the snapshot lease must release when the worker ends"
+        );
+    }
+
+    #[test]
+    fn inactive_structured_results_do_not_touch_another_views_counts_or_selection() {
+        let mut state = structured_test_state(300, 1);
+        refresh_visible_forced(&mut state);
+        let _ = poll_structured_view(&mut state);
+        assert!(
+            state
+                .structured_refresh
+                .as_ref()
+                .is_some_and(|job| job.rx.is_some())
+        );
+        state.tab = Tab::Titles;
+        state.view_counts = ViewCounts {
+            total: 7,
+            findings: 3,
+            incomplete: 2,
+        };
+        state.visible = vec![0, 1, 2];
+        state.view_mut().selected = Some("titles-sentinel".into());
+        while state.structured_refresh.is_some() {
+            let _ = poll_structured_view(&mut state);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            state.view_counts,
+            ViewCounts {
+                total: 7,
+                findings: 3,
+                incomplete: 2
+            }
+        );
+        assert_eq!(state.visible, vec![0, 1, 2]);
+        assert_eq!(
+            state.view().selected.as_deref(),
+            Some("titles-sentinel"),
+            "an inactive worker result must not reselect another view"
+        );
+
+        let mut navigating = structured_test_state(300, 1);
+        refresh_visible_forced(&mut navigating);
+        switch_tab(&mut navigating, Tab::Titles);
+        assert!(
+            navigating.structured_refresh.is_none(),
+            "leaving the structured view cancels its owned work"
+        );
+    }
+
+    #[test]
+    #[ignore = "local 50k structured-data UI and export measurement"]
+    fn structured_data_50k_pages_ui_and_export_measure_bounded_work() {
+        let mut state = structured_test_state(50_000, 1);
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let pages_trigger = started.elapsed();
+        assert!(
+            pages_trigger < Duration::from_millis(8),
+            "pages trigger {pages_trigger:?}"
+        );
+        let (pages_step, pages_total, pages_wall) = pump_structured_view(&mut state);
+        assert!(
+            pages_step < Duration::from_millis(8),
+            "pages step {pages_step:?}"
+        );
+        assert_eq!(state.structured_pages_visible.len(), 50_000);
+        let pages_ledger = state.structured_budget.used();
+
+        state.structured_pages_view.query.replace_text("Person");
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let query_trigger = started.elapsed();
+        assert!(query_trigger < Duration::from_millis(8));
+        let (query_step, query_total, query_wall) = pump_structured_view(&mut state);
+        assert!(query_step < Duration::from_millis(8));
+        assert_eq!(state.structured_pages_visible.len(), 50_000);
+        let query_ledger = state.structured_budget.used();
+
+        // A second query replaces the previous result; it must not accumulate a second
+        // per-page search cache.
+        state.structured_pages_view.query.replace_text("Thing");
+        refresh_visible_forced(&mut state);
+        let (second_step, _, second_wall) = pump_structured_view(&mut state);
+        assert!(second_step < Duration::from_millis(8));
+        assert_eq!(state.structured_pages_visible.len(), 50_000);
+        let second_query_ledger = state.structured_budget.used();
+        assert!(
+            second_query_ledger <= query_ledger + 8 * 1024 * 1024,
+            "query caches must be replaced, not accumulated: {query_ledger} -> {second_query_ledger}"
+        );
+
+        state.structured_subview = StructuredView::Blocks;
+        state.structured_blocks_view.filter = CheckFilter::All;
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let blocks_trigger = started.elapsed();
+        assert!(blocks_trigger < Duration::from_millis(8));
+        let (blocks_step, blocks_total, blocks_wall) = pump_structured_view(&mut state);
+        assert!(blocks_step < Duration::from_millis(8));
+        assert_eq!(state.structured_block_visible.len(), 50_000);
+        let blocks_ledger = state.structured_budget.used();
+
+        state.structured_blocks_view.query.replace_text("Person");
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let block_query_trigger = started.elapsed();
+        assert!(block_query_trigger < Duration::from_millis(8));
+        let (block_query_step, block_query_total, block_query_wall) =
+            pump_structured_view(&mut state);
+        assert!(block_query_step < Duration::from_millis(8));
+        assert_eq!(state.structured_block_visible.len(), 50_000);
+
+        let started = Instant::now();
+        for page in state.pages.iter().take(128) {
+            std::hint::black_box(structured_page_matches(
+                &page.url,
+                &page.structured,
+                "thing",
+            ));
+        }
+        let page_search_step = started.elapsed();
+        let started = Instant::now();
+        for page in state.pages.iter().take(128) {
+            if let Some(block) = page.structured.blocks.first() {
+                std::hint::black_box(structured_block_matches(&page.url, block, "thing"));
+            }
+        }
+        let block_search_step = started.elapsed();
+        assert!(page_search_step < Duration::from_millis(8));
+        assert!(block_search_step < Duration::from_millis(8));
+        assert!(pages_ledger < 64 * 1024 * 1024);
+        assert!(query_ledger < 64 * 1024 * 1024);
+        assert!(second_query_ledger < 64 * 1024 * 1024);
+        assert!(blocks_ledger < 64 * 1024 * 1024);
+        assert!(state.structured_budget.used() <= structured_data::STRUCTURED_DATA_BUDGET);
+
+        state.structured_subview = StructuredView::Pages;
+        let started = Instant::now();
+        let source = structured_export_source(&state).expect("source");
+        let estimate = estimate_structured_export_bytes(&source);
+        assert!(
+            estimate < structured_data::STRUCTURED_DATA_BUDGET,
+            "a 50k-row export estimate must remain usable: {estimate}"
+        );
+        let export_trigger = started.elapsed();
+        let allowed = structured_export_rows(&source, &AtomicBool::new(false), estimate)
+            .expect("the reserved projection/encoding allowance must cover the real rows");
+        assert_eq!(allowed.1.len(), 50_000);
+        let export_trigger_target = if cfg!(debug_assertions) {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(8)
+        };
+        assert!(
+            export_trigger < export_trigger_target,
+            "one-off export snapshot trigger {export_trigger:?}"
+        );
+        let started = Instant::now();
+        let (headers, rows) =
+            structured_export_rows(&source, &AtomicBool::new(false), usize::MAX).expect("rows");
+        let projection = started.elapsed();
+        assert_eq!(rows.len(), 50_000);
+        let header_refs = headers.to_vec();
+        let started = Instant::now();
+        let csv = calmtoad::export::to_csv(&header_refs, &rows);
+        let encoding = started.elapsed();
+        eprintln!(
+            "structured 50k measured: pages trigger {pages_trigger:?} step {pages_step:?} ui {pages_total:?} wall {pages_wall:?} ledger {pages_ledger}; query trigger {query_trigger:?} step {query_step:?} ui {query_total:?} wall {query_wall:?} ledger {query_ledger}; second query step {second_step:?} wall {second_wall:?}; blocks trigger {blocks_trigger:?} step {blocks_step:?} ui {blocks_total:?} wall {blocks_wall:?} ledger {blocks_ledger}; block query trigger {block_query_trigger:?} step {block_query_step:?} ui {block_query_total:?} wall {block_query_wall:?}; export trigger {export_trigger:?} projection {projection:?} encoding {encoding:?} csv bytes {}",
+            csv.len()
+        );
+        assert!(projection < Duration::from_secs(5));
+        assert!(encoding < Duration::from_secs(2));
+        let started = Instant::now();
+        assert!(structured_export_rows(&source, &AtomicBool::new(true), usize::MAX).is_err());
+        assert!(started.elapsed() < Duration::from_millis(20));
+    }
+
+    #[test]
+    #[ignore = "local 100k-block structured-data cache exhaustion measurement"]
+    fn structured_data_100k_blocks_stop_at_the_aggregate_ledger() {
+        // 3,126 pages x 32 retained blocks = 100,032 rows, above the 100,000-row table cap.
+        let mut state = structured_test_state(3_126, 32);
+        state.structured_subview = StructuredView::Blocks;
+        let started = Instant::now();
+        refresh_visible_forced(&mut state);
+        let trigger = started.elapsed();
+        assert!(trigger < Duration::from_millis(8), "trigger {trigger:?}");
+        let (step, total, wall) = pump_structured_view(&mut state);
+        assert!(step < Duration::from_millis(8), "step {step:?}");
+        assert_eq!(state.structured_blocks.len(), MAX_STRUCTURED_BLOCK_ROWS);
+        assert!(state.structured_blocks_limited);
+        assert_eq!(
+            state.structured_block_visible.len(),
+            MAX_STRUCTURED_BLOCK_ROWS
+        );
+        let full_ledger = state.structured_budget.used();
+        assert!(full_ledger <= structured_data::STRUCTURED_DATA_BUDGET);
+
+        // Re-run with only 5 MiB left in the shared ledger. The retained block/key caches must
+        // stop where the reservation fails, and the failure must be reported rather than
+        // silently warning and allocating.
+        let mut limited = structured_test_state(3_126, 32);
+        limited.structured_subview = StructuredView::Blocks;
+        limited.structured_budget = Arc::new(structured_data::StructuredBudget::with_used(
+            structured_data::STRUCTURED_DATA_BUDGET - 5 * 1024 * 1024,
+        ));
+        refresh_visible_forced(&mut limited);
+        let (limited_step, limited_total, limited_wall) = pump_structured_view(&mut limited);
+        assert!(limited_step < Duration::from_millis(8));
+        assert!(limited.structured_index_limited.is_some());
+        assert!(limited.structured_blocks.len() < MAX_STRUCTURED_BLOCK_ROWS);
+        assert!(
+            limited.structured_budget.used() <= structured_data::STRUCTURED_DATA_BUDGET,
+            "ledger {}",
+            limited.structured_budget.used()
+        );
+        let exhausted_rows = limited.structured_blocks.len();
+        limit_check_after_failure(&mut limited, exhausted_rows);
+        eprintln!(
+            "structured 100k measured: trigger {trigger:?} step {step:?} ui {total:?} wall {wall:?} full ledger {full_ledger}; exhausted step {limited_step:?} ui {limited_total:?} wall {limited_wall:?} rows {exhausted_rows} ledger {}",
+            limited.structured_budget.used()
+        );
+    }
+
+    fn limit_check_after_failure(state: &mut State, rows: usize) {
+        // Another refresh cannot grow the retained rows after the ledger refused them.
+        state.structured_blocks_view.query.replace_text("Person");
+        refresh_visible_forced(state);
+        let _ = pump_structured_view(state);
+        assert_eq!(state.structured_blocks.len(), rows);
+        assert!(state.structured_budget.used() <= structured_data::STRUCTURED_DATA_BUDGET);
+    }
+
+    #[test]
+    fn structured_export_shares_the_exclusive_lifecycle_and_has_frozen_epochs() {
+        let mut state = init();
+        scene_structured_data_pages(&mut state);
+        assert!(start_structured_export(&mut state));
+        assert!(state.structured_export_job.is_some());
+        assert!(export_lifecycle_busy(&state));
+        assert!(!can_install(&state));
+        assert!(!start_content_export(&mut state));
+        assert!(!start_structured_export(&mut state));
+        assert!(
+            state
+                .export_notice
+                .as_ref()
+                .is_some_and(|notice| notice.is_err())
+        );
+        let cancel = state
+            .structured_export_job
+            .as_ref()
+            .expect("job")
+            .cancel
+            .clone();
+        assert!(!cancel.load(Ordering::Relaxed));
+        stop_owned_work(&mut state);
+        assert!(cancel.load(Ordering::Relaxed));
+        state.structured_export_job = None;
+        state.export_notice = None;
+
+        let epoch = state.pages_epoch;
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(PreparedStructuredExport {
+            csv: "stale".into(),
+            row_count: 1,
+            scope: "stale snapshot".into(),
+            slug: "structured-data-pages",
+        }))
+        .expect("queue stale result");
+        state.structured_export_job = Some(StructuredExportJob {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            epoch,
+            lease: LedgerLease::new(state.structured_budget.clone(), 0),
+        });
+        state.pages_epoch = state.pages_epoch.wrapping_add(1);
+        let mut rt = test_runtime(state);
+        rt.update(|state: &mut State, tx: &mut Tx| {
+            // A stale completion is dropped without opening a save dialog or replacing a
+            // destination.
+            assert!(!poll_structured_export(state, tx));
+            assert!(state.structured_export_job.is_none());
+            assert!(state.export_notice.is_none());
+        });
     }
 }

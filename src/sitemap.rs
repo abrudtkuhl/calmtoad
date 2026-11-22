@@ -2082,6 +2082,7 @@ mod tests {
             extraction: Vec::new().into(),
             extraction_limit: String::new(),
             content: std::sync::Arc::new(crate::content::ContentEvidence::default()),
+            structured: std::sync::Arc::new(crate::structured_data::PageReport::default()),
             indexability: assessment,
         };
         report.observe_page(&page);

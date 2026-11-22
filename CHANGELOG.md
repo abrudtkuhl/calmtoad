@@ -5,6 +5,37 @@ date are being prepared for release.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-22
+
+### Added
+
+- **Review JSON-LD on every captured page.** **Internal → Structured data** adds **Pages** and **Blocks** views for JSON-LD block discovery, JSON syntax diagnostics, duplicate-key review findings, and literal `@type`/`@id` values with JSON Pointer paths. HTML uses the server document; Browser uses only the rendered DOM.
+- **Export structured-data evidence.** Save the visible Pages or Blocks rows as CSV with capture completeness, syntax outcome, root and inventory state, observed/inspected/retained/skipped counts, literal types and identifiers, duplicate-key diagnostics, block-relative line/column positions, limitations, and frozen run context.
+- **See coverage instead of a false all-clear.** Reports keep capture availability, parser limits, literal-inventory coverage and evidence retention separate. Malformed or empty inline JSON and duplicate keys are confirmed findings only on complete captures; unavailable, partial, cancelled or resource-limited inspections stay visible in Overview and the Incomplete filter.
+
+### Improved
+
+- Update banners reflow their actions below the message when the window is narrow, keeping release actions readable and responsive.
+- Structured-data inspection reuses the DOM already parsed for the crate's existing audits. It makes no extra requests, does not fetch `src` or remote contexts, executes no scripts, and retains bounded evidence rather than a second JSON tree. A shared 128 MiB run budget covers captured evidence plus the Pages/Blocks index caches, export snapshots and copies; reservation failures are reported as limited coverage instead of allocating past the cap.
+- Large Structured data views index, search, filter and sort on a background worker in bounded steps. Refreshes reserve their snapshot before copying, and leaving the view cancels owned work. Search text is computed per page or block when needed instead of being cached per row, so a 100,000-block view stays inside the same ledger. Small result sets keep the immediate projection.
+- Structured data still shows its previous rows while a refresh is running, labels the view as refreshing, and refuses an export until the visible snapshot is settled.
+
+### Fixed
+
+- A JSON Pointer path shortened at the 1,024-byte bound no longer splits a multibyte character. A long key followed by an emoji key keeps the page's other audits instead of panicking the crawl worker.
+- Cancelling structured-data traversal is reported as **Cancelled** coverage, never as malformed JSON or a confirmed syntax finding. Parser limits remain distinct from syntax errors and cancellation.
+- Non-string `@type` and `@id` objects and arrays go through the same duplicate-key, depth, value-count and cancellation checks as every other JSON value, so a duplicate inside `{"@type":{"x":1,"x":2}}` is still diagnosed and a deep container cannot bypass the traversal bound.
+- A nested array directly under the document root, including `[[]]`, parses as JSON but reports an unsupported inventory shape instead of a complete literal inventory.
+- Non-string `@id` advisories now name `@id` instead of describing the value as a non-string `@type` entry.
+- Literal type/ID occurrence caps now apply across every block on a page, and value-object datatype evidence is fully rolled back (counts, bytes and budget) so later real nodes remain retainable.
+- Nested arrays inside non-string `@type`/`@id` values are validated without inventorying their inner strings.
+- Structured-data search checks every retained supported field instead of an 8 KiB concatenated prefix, so a marker in a later literal type, ID, path or diagnostic still matches. Raw JSON remains excluded.
+- Export now reserves its row snapshot plus a per-row context/projection/encoding allowance and keeps that ledger lease through the save dialog and background write.
+- A cancelled or inactive structured refresh cannot free bytes still owned by its worker snapshot or overwrite another tab's counts and selection.
+- Cancelling a structured-data export keeps its ledger reservation until the preparation worker, save dialog or background writer actually drops the projected rows and encoded CSV; a paused-worker regression covers the cancellation gap.
+- Exports whose retained `@type`/`@id` values contain control characters now reserve their JSON-escaped size, so a valid heavily escaped row is not rejected by an underestimate.
+- Structured-data Pages CSV exports now reserve every per-block **INVENTORY STATE** label and separator, so a valid multirow export is no longer rejected by an underestimate.
+
 ## [0.8.0] - 2026-11-20
 
 ### Added

@@ -10,4 +10,5 @@ pub mod inventory;
 pub mod links;
 pub mod render;
 pub mod sitemap;
+pub mod structured_data;
 pub mod update;

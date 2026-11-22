@@ -25,6 +25,7 @@ use crate::indexability::{
 use crate::links::{self, LinkCheckResult, LinkCheckState, LinkOccurrence};
 use crate::render::{self, BrowserRenderer, Capture, RenderMode, RenderState, SourceState};
 use crate::sitemap;
+use crate::structured_data::{self, StructuredBudget};
 
 /// A small, dependency-free hasher for the crawl's hot maps.
 ///
@@ -154,6 +155,9 @@ pub struct Page {
     pub extraction_limit: String,
     /// Duplicate-content evidence for the selected capture, shared across clones.
     pub content: Arc<ContentEvidence>,
+    /// JSON-LD block inventory and JSON syntax evidence for the selected capture, shared across
+    /// clones and snapshots.
+    pub structured: Arc<structured_data::PageReport>,
     /// The one evidence-backed indexability assessment every view reads.
     pub indexability: Assessment,
 }
@@ -208,7 +212,7 @@ pub struct Outcome {
 }
 
 /// Per-crawl choices. Links-only callers keep the old behavior with the default.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct CrawlOptions {
     /// Read the seed origin's sitemaps and schedule the URLs they list.
     pub sitemaps: bool,
@@ -220,6 +224,10 @@ pub struct CrawlOptions {
     pub check_links: bool,
     /// Draft rules are compiled once before any page work starts.
     pub extraction_rules: Vec<extract::ExtractionRule>,
+    /// The run's structured-data evidence ledger. The window supplies this so its immutable
+    /// page snapshots, visible-result caches and exports reserve against the same 128 MiB
+    /// budget as captured evidence instead of adding an unaccounted second cache.
+    pub structured_budget: Option<Arc<StructuredBudget>>,
 }
 
 /// Everything the window streams while a crawl runs.
@@ -1892,6 +1900,10 @@ fn crawl_engine(
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::channel::<EngineEvent>();
         let content_budget = Arc::new(ContentBudget::default());
+        let structured_budget = options
+            .structured_budget
+            .clone()
+            .unwrap_or_else(|| Arc::new(StructuredBudget::default()));
 
         for _ in 0..workers {
             let tx = tx.clone();
@@ -1901,6 +1913,7 @@ fn crawl_engine(
             let browser_allowed = browser_allowed.clone();
             let browser = browser.as_ref();
             let content_budget = content_budget.clone();
+            let structured_budget = structured_budget.clone();
             scope.spawn(move || {
                 loop {
                     let (url, depth) = {
@@ -1927,8 +1940,12 @@ fn crawl_engine(
                                 let capture =
                                     job.renderer
                                         .render(&url, allowed.clone(), job.cancel.clone());
-                                let (fetched, parsed, source, capture_info) =
-                                    browser_page(&capture, &content_budget, Some(cancel));
+                                let (fetched, parsed, source, capture_info) = browser_page(
+                                    &capture,
+                                    &content_budget,
+                                    &structured_budget,
+                                    Some(cancel),
+                                );
                                 let applicable =
                                     capture.status == 200 && is_html(&capture.content_type, "");
                                 let partial = !capture_info.is_complete();
@@ -1955,10 +1972,15 @@ fn crawl_engine(
                                 let parsed = if fetched.status == 200
                                     && is_html(&fetched.content_type, &fetched.body)
                                 {
+                                    let inspection = structured_data::Inspection::new(
+                                        &structured_budget,
+                                        Some(cancel),
+                                    );
                                     Some(parse_html_staged(
                                         &fetched.body,
                                         EvidenceStage::Document,
                                         &content_budget,
+                                        Some(&inspection),
                                         complete,
                                         Some(cancel),
                                     ))
@@ -2506,6 +2528,22 @@ fn crawl_engine(
                         content_stage,
                     ))
                 });
+            // Structured data follows the same selected-document rule: rendered DOM in Browser
+            // mode, document HTML in HTML mode. A missing selected DOM is unavailable evidence,
+            // never a fabricated empty result.
+            let structured = parsed
+                .as_ref()
+                .map(|parsed| parsed.structured.clone())
+                .unwrap_or_else(|| {
+                    Arc::new(structured_data::PageReport::unavailable(
+                        if content_stage == EvidenceStage::Rendered {
+                            "Rendered DOM unavailable; source fallback is not used for structured data"
+                        } else {
+                            "No complete HTML document"
+                        },
+                        content_stage,
+                    ))
+                });
             let had_html = parsed.is_some();
             let (title, meta_description, h1s, words, images, images_missing_alt, mut directives) =
                 match parsed {
@@ -2595,6 +2633,7 @@ fn crawl_engine(
                 extraction: Arc::new(extraction_results),
                 extraction_limit,
                 content,
+                structured,
                 indexability,
             };
             sitemap_report.observe_page(&page);
@@ -2763,6 +2802,7 @@ struct Parsed {
     images: usize,
     images_missing_alt: usize,
     content: ContentEvidence,
+    structured: Arc<structured_data::PageReport>,
 }
 
 /// The counts the audits read out of a parsed document.
@@ -2815,6 +2855,7 @@ fn is_word_block(name: &str) -> bool {
 fn browser_page(
     capture: &Capture,
     content_budget: &ContentBudget,
+    structured_budget: &StructuredBudget,
     cancel: Option<&AtomicBool>,
 ) -> (Fetched, Option<Parsed>, Option<Parsed>, CaptureInfo) {
     let mut fetched = Fetched {
@@ -2843,10 +2884,14 @@ fn browser_page(
         let capture_info = CaptureInfo::browser(capture);
         let complete = capture_info.is_complete();
         if let Some(body) = capture.rendered_html.as_deref() {
+            // The rendered DOM is the selected Browser document. Source parsing below must not
+            // masquerade as rendered JSON-LD or consume a second structured-data budget.
+            let inspection = structured_data::Inspection::new(structured_budget, cancel);
             parsed = Some(parse_html_staged(
                 body,
                 EvidenceStage::Rendered,
                 content_budget,
+                Some(&inspection),
                 complete,
                 cancel,
             ));
@@ -2856,6 +2901,7 @@ fn browser_page(
                 body,
                 EvidenceStage::Document,
                 content_budget,
+                None,
                 false,
                 cancel,
             ));
@@ -2914,12 +2960,13 @@ fn anchor_text(element: ElementRef<'_>) -> String {
 }
 
 fn parse_html(body: &str) -> Parsed {
-    // Parsing-only callers (tests and the benchmark gate) do not need content evidence.
-    // Real crawl workers use `parse_html_staged` with the capture-completeness decision.
+    // Parsing-only callers (tests and the benchmark gate) do not need content or structured-data
+    // evidence. Real crawl workers use `parse_html_staged` with the capture-completeness decision.
     parse_html_staged(
         body,
         EvidenceStage::Document,
         &ContentBudget::default(),
+        None,
         false,
         None,
     )
@@ -2929,6 +2976,7 @@ fn parse_html_staged(
     body: &str,
     stage: EvidenceStage,
     content_budget: &ContentBudget,
+    structured: Option<&structured_data::Inspection<'_>>,
     content_complete: bool,
     content_cancel: Option<&AtomicBool>,
 ) -> Parsed {
@@ -2947,6 +2995,17 @@ fn parse_html_staged(
     let mut images = 0_usize;
     let mut images_missing_alt = 0_usize;
     let mut words = 0_usize;
+    let mut structured_capture = structured.map(|inspection| {
+        inspection.begin_with_reason(
+            stage,
+            content_complete,
+            if content_complete {
+                "Selected capture completed"
+            } else {
+                "Selected capture is incomplete; structured-data evidence is partial"
+            },
+        )
+    });
 
     for node in doc.tree.nodes() {
         match node.value() {
@@ -3023,6 +3082,13 @@ fn parse_html_staged(
                         images_missing_alt += 1;
                     }
                 }
+                "script" => {
+                    if let Some(capture) = structured_capture.as_mut()
+                        && let Some(element) = ElementRef::wrap(node)
+                    {
+                        capture.observe_script(element);
+                    }
+                }
                 _ => {}
             },
             Node::Text(text) => {
@@ -3051,6 +3117,10 @@ fn parse_html_staged(
         content_budget,
         content_cancel,
     );
+    let structured = structured_capture.map_or_else(
+        || Arc::new(structured_data::PageReport::default()),
+        structured_data::PageCapture::finish,
+    );
     Parsed {
         title: title.unwrap_or_default(),
         meta,
@@ -3065,6 +3135,7 @@ fn parse_html_staged(
         images,
         images_missing_alt,
         content,
+        structured,
     }
 }
 
@@ -3602,6 +3673,9 @@ pub fn sample_pages() -> Vec<Page> {
         extraction: Arc::new(Vec::new()),
         extraction_limit: String::new(),
         content: Arc::new(ContentEvidence::default()),
+        structured: Arc::new(structured_data::PageReport::empty_complete(
+            EvidenceStage::Document,
+        )),
         indexability: Assessment::default(),
     };
     let ok_meta =
@@ -3753,6 +3827,9 @@ pub fn indexability_sample_pages() -> Vec<Page> {
         extraction: Arc::new(Vec::new()),
         extraction_limit: String::new(),
         content: Arc::new(ContentEvidence::default()),
+        structured: Arc::new(structured_data::PageReport::empty_complete(
+            EvidenceStage::Document,
+        )),
         indexability: Assessment::default(),
     };
     let generic = |raw: &str| indexability::parse_meta_directive("robots", raw).unwrap();
@@ -4049,7 +4126,12 @@ mod tests {
             state: RenderState::Captured,
             ..Capture::default()
         };
-        let (_, parsed, source, info) = browser_page(&capture, &ContentBudget::default(), None);
+        let (_, parsed, source, info) = browser_page(
+            &capture,
+            &ContentBudget::default(),
+            &StructuredBudget::default(),
+            None,
+        );
         assert!(parsed.is_none(), "no rendered DOM is audited");
         let source = source.expect("source fallback is retained");
         assert_eq!(source.anchors.len(), 1);

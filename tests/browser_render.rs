@@ -25,6 +25,20 @@ use calmtoad::render::{
     BrowserRenderer, Capture, RenderConfig, RenderMode, RenderState, SourceState, discover_browser,
     kill_owned_browsers,
 };
+use calmtoad::structured_data::{CaptureCompleteness, SyntaxOutcome};
+
+const STRUCTURED: &str = r##"<!doctype html><html><head><title>Structured rendered fixture title</title>
+<meta name="description" content="A structured rendered description comfortably long enough for the meta check.">
+<script type="application/ld+json" id="source">{"@type":"SourceType"}</script>
+<script>
+document.getElementById('source').remove();
+var s = document.createElement('script');
+s.type = 'application/ld+json';
+s.id = 'rendered';
+s.textContent = '{"@type":"RenderedType","@id":"#rendered"}';
+document.head.appendChild(s);
+</script>
+</head><body><h1>Structured rendered</h1></body></html>"##;
 
 const PLAIN: &str = "<!doctype html><html><head><title>Fixture page title that is long enough</title>\
 <meta name=\"description\" content=\"A fixture description that is comfortably long enough for the meta check to pass.\">\
@@ -271,6 +285,13 @@ fn serve(
             write_response(&mut stream, 200, "text/html; charset=utf-8", &[], &body)
         }
         "/plain" => write_response(&mut stream, 200, "text/html; charset=utf-8", &[], PLAIN),
+        "/structured" => write_response(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            &[],
+            STRUCTURED,
+        ),
         "/notes.txt" => write_response(
             &mut stream,
             200,
@@ -676,6 +697,54 @@ fn browser_extraction_uses_the_rendered_dom_not_source_html() {
     assert!(page.content.exact_eligible);
     assert_eq!(page.content.stage, EvidenceStage::Rendered);
     assert!(page.content.excerpt.contains("hydrated heading"));
+}
+
+#[test]
+fn browser_structured_data_uses_only_the_rendered_dom() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(_renderer) = renderer() else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let outcome = crawl_site_with(
+        &format!("{}/structured", fixture.base()),
+        Limits {
+            max_pages: 1,
+            max_depth: 0,
+        },
+        CrawlOptions {
+            rendering: RenderMode::Browser,
+            ..CrawlOptions::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
+    let page = outcome
+        .pages
+        .first()
+        .unwrap_or_else(|| panic!("no page: {}", outcome.message));
+    let report = &page.structured;
+    assert_eq!(report.capture, CaptureCompleteness::Complete);
+    assert_eq!(report.stage, EvidenceStage::Rendered);
+    assert_eq!(report.blocks_observed, 1);
+    assert_eq!(report.blocks.len(), 1);
+    assert_eq!(report.blocks[0].script_id.as_ref(), "rendered");
+    assert_eq!(report.blocks[0].syntax, SyntaxOutcome::Parsed);
+    assert_eq!(
+        report
+            .iter_types()
+            .map(|item| item.value.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["RenderedType"],
+        "the pre-script source block must not masquerade as rendered JSON-LD"
+    );
+    assert_eq!(
+        report
+            .iter_ids()
+            .map(|item| item.value.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["#rendered"]
+    );
 }
 
 #[test]

@@ -82,7 +82,7 @@ cargo run -- --scene sample --snap shots/sample.png --size 1180x740 --scale 1 --
 
 The `browser`, `browser-details`, `browser-evidence` (expanded details), and `browser-unavailable` scenes show Browser capture provenance, staged evidence, incomplete renders, and a machine without a usable browser. They need no network or browser.
 
-The workflow scenes are offline. `filter-empty`, `filter-findings` and `filter-incomplete` cover search/check-state outcomes; `titles-duplicate`, `h1-multiple`, `links-detail`, `response-redirect`, `canonical-detail` and `images-detail` open the contextual inspectors; `run-details`, `invalid-input`, `preparing`, `stopping`, `limited` and `failed` show run/setup state. `update-with-results` and `update-ready-with-results` keep an update strip over a populated table. Render the nine tabs plus Sitemap Files at 880x560 and 1180x740 in both themes, e.g.:
+The workflow scenes are offline. `structured-data-pages` and `structured-data-blocks` show the JSON-LD Pages/Blocks views, findings, literal types, incomplete coverage and the raw block inspector. `filter-empty`, `filter-findings` and `filter-incomplete` cover search/check-state outcomes; `titles-duplicate`, `h1-multiple`, `links-detail`, `response-redirect`, `canonical-detail` and `images-detail` open the contextual inspectors; `run-details`, `invalid-input`, `preparing`, `stopping`, `limited` and `failed` show run/setup state. `update-with-results` and `update-ready-with-results` keep an update strip over a populated table. Render the nine tabs plus Sitemap Files at 880x560 and 1180x740 in both themes, e.g.:
 
 ```sh
 for size in 880x560 1180x740; do for theme in light dark; do
