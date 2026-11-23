@@ -919,8 +919,13 @@ impl BrowserRenderer {
         stop_browser_process(&self.process);
         unregister_browser(&self.process, self.pid.take());
         runtime.shutdown_timeout(Duration::from_secs(2));
-        // Dropping the temp directory removes the application-owned profile.
-        self.profile.take();
+        // Remove the application-owned profile with the same bounded retry used by the emergency
+        // sweep. TempDir's single best-effort drop can race a just-killed browser on Linux.
+        if let Some(profile) = self.profile.take() {
+            let path = profile.path().to_path_buf();
+            drop(profile);
+            remove_profile(&path);
+        }
     }
 }
 
@@ -2489,6 +2494,7 @@ async fn evaluate_in_world(
     if remaining.is_zero() {
         return WorldEval::Deadline;
     }
+    let started = Instant::now();
     let params = match EvaluateParams::builder()
         .expression(expression)
         .context_id(context_id)
@@ -2513,7 +2519,9 @@ async fn evaluate_in_world(
         Ok(Err(error)) => {
             let text =
                 format!("the isolated accessibility world could not evaluate the scan: {error}");
-            if execution_timed_out(&text) {
+            if execution_timed_out(&text)
+                || started.elapsed().saturating_add(Duration::from_millis(100)) >= remaining
+            {
                 WorldEval::Deadline
             } else {
                 WorldEval::Failed(text)
