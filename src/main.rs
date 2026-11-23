@@ -10490,6 +10490,7 @@ const ACCESSIBILITY_OCCURRENCE_HEADERS: &[&str] = &[
     "PAGE BUDGET LIMITED",
     "PAGE RUN LIMITED",
     "PAGE PAYLOAD LIMITED",
+    "PAGE COVERAGE NOTES",
 ];
 
 fn accessibility_page_fields(
@@ -10621,6 +10622,8 @@ fn accessibility_occurrence_fields(
         yes_no(scan.is_some_and(|scan| scan.coverage.budget_limited)),
         yes_no(scan.is_some_and(|scan| scan.coverage.run_limited)),
         yes_no(scan.is_some_and(|scan| scan.coverage.payload_limited)),
+        scan.map(|scan| scan.coverage.notes.join("\n"))
+            .unwrap_or_default(),
     ]
 }
 
@@ -23346,6 +23349,8 @@ mod tests {
             report.scan.reason =
                 "Some accessibility nodes were dropped by a documented bound".into();
             report.scan.coverage.nodes_truncated = true;
+            report.scan.coverage.notes =
+                vec!["Projection reached the documented node bound".into()];
         }
         state.internal_view = InternalView::Accessibility;
         state.accessibility_view = AccessibilityView::Rules;
@@ -23389,6 +23394,10 @@ mod tests {
         assert_eq!(row[column("PAGE BUDGET LIMITED")], "");
         assert_eq!(row[column("PAGE RUN LIMITED")], "");
         assert_eq!(row[column("PAGE PAYLOAD LIMITED")], "");
+        assert_eq!(
+            row[column("PAGE COVERAGE NOTES")],
+            "Projection reached the documented node bound"
+        );
     }
 
     #[test]
@@ -23548,24 +23557,21 @@ mod tests {
         let budget = Arc::new(accessibility::Budget::default());
         assert!(budget.try_reserve(0, accessibility::MAX_RUN_OCCURRENCES));
         state.accessibility_budget = budget.clone();
-        for index in 0..2 {
-            state.pages[index].accessibility = accessibility_report_for_test(
+        for page in state.pages.iter_mut().take(2) {
+            let url = page.url.clone();
+            page.accessibility = accessibility_report_for_test(
                 &budget,
-                &state.pages[index].url.clone(),
+                &url,
                 Some(accessibility::ResultKind::Violation),
                 2,
                 "<img>",
             );
             assert_eq!(
-                state.pages[index].accessibility.state(),
+                page.accessibility.state(),
                 accessibility::ExecutionState::Limited
             );
             assert!(
-                state.pages[index]
-                    .accessibility
-                    .scan
-                    .coverage
-                    .budget_limited,
+                page.accessibility.scan.coverage.budget_limited,
                 "the regression uses the exhausted-ledger path"
             );
         }
@@ -23723,16 +23729,17 @@ mod tests {
         let budget = Arc::new(accessibility::Budget::default());
         assert!(budget.try_reserve(accessibility::BUDGET_BYTES, 0));
         state.accessibility_budget = budget.clone();
-        for index in 0..2 {
-            state.pages[index].accessibility = accessibility_report_for_test(
+        for page in state.pages.iter_mut().take(2) {
+            let url = page.url.clone();
+            page.accessibility = accessibility_report_for_test(
                 &budget,
-                &state.pages[index].url.clone(),
+                &url,
                 Some(accessibility::ResultKind::Violation),
                 2,
                 "<img>",
             );
             assert!(
-                state.pages[index].accessibility.scan.rules.is_empty(),
+                page.accessibility.scan.rules.is_empty(),
                 "full exhaustion retains no uncharged rule vectors"
             );
         }
