@@ -22,8 +22,8 @@ use calmtoad::crawl::{
 use calmtoad::extract::{ExtractionOutput, ExtractionRule, ExtractionState, MatchMode};
 use calmtoad::indexability::{CaptureInfo, EvidenceStage, FindingCode, Label};
 use calmtoad::render::{
-    BrowserRenderer, Capture, RenderConfig, RenderMode, RenderState, SourceState, discover_browser,
-    kill_owned_browsers,
+    AuditTestHook, BrowserRenderer, Capture, RenderConfig, RenderMode, RenderState, SourceState,
+    discover_browser, kill_owned_browsers,
 };
 use calmtoad::structured_data::{CaptureCompleteness, SyntaxOutcome};
 
@@ -39,6 +39,47 @@ s.textContent = '{"@type":"RenderedType","@id":"#rendered"}';
 document.head.appendChild(s);
 </script>
 </head><body><h1>Structured rendered</h1></body></html>"##;
+
+const A11Y: &str = r##"<!doctype html><html><head><title>Accessibility fixture page title that is long enough</title>
+<meta name="description" content="An accessibility fixture description that is comfortably long enough for the meta check.">
+<script>
+window.axe = {
+  getRules: function () { throw new Error('the page-owned axe must not be used'); },
+  run: function () { throw new Error('the page-owned axe must not be used'); }
+};
+</script>
+</head><body>
+<h1>Accessibility</h1>
+<img id="hero" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+<input id="name" type="text">
+<div id="host"></div>
+<script>
+var host = document.getElementById('host');
+var root = host.attachShadow({ mode: 'open' });
+root.innerHTML = '<button></button>';
+</script>
+</body></html>"##;
+
+const A11Y_FRAME: &str = r##"<!doctype html><html lang="en"><head><title>Frame exclusion accessibility fixture title long enough</title>
+<meta name="description" content="A frame exclusion accessibility description that is comfortably long enough for the meta check.">
+</head><body><h1>Frame exclusion</h1><p>Only the main document is audited.</p>
+<iframe title="Embedded example" srcdoc="<img src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='>"></iframe>
+</body></html>"##;
+
+const A11Y_HUGE: &str = r##"<!doctype html><html><head><title>Huge accessibility fixture page title that is long enough</title>
+<meta name="description" content="A huge accessibility fixture description that is comfortably long enough for the meta check.">
+</head><body><h1>Huge document</h1><script>
+const fragment = document.createDocumentFragment();
+for (let i = 0; i < 20100; i += 1) fragment.appendChild(document.createElement('div'));
+document.body.appendChild(fragment);
+</script></body></html>"##;
+
+const A11Y_CSP: &str = r##"<!doctype html><html><head><title>CSP accessibility fixture page title long enough</title>
+<meta name="description" content="A CSP accessibility fixture description that is comfortably long enough for the meta check.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">
+</head><body><h1>CSP accessibility</h1>
+<img id="csp-hero" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+<input id="csp-name" type="text"></body></html>"##;
 
 const PLAIN: &str = "<!doctype html><html><head><title>Fixture page title that is long enough</title>\
 <meta name=\"description\" content=\"A fixture description that is comfortably long enough for the meta check to pass.\">\
@@ -209,6 +250,19 @@ impl Fixture {
     fn hits(&self, path: &str) -> usize {
         hits_for(&self.hits, path)
     }
+
+    fn all_hits(&self) -> HashMap<String, usize> {
+        self.hits
+            .lock()
+            .map(|hits| hits.clone())
+            .unwrap_or_default()
+    }
+
+    fn clear_hits(&self) {
+        if let Ok(mut hits) = self.hits.lock() {
+            hits.clear();
+        }
+    }
 }
 
 impl Drop for Fixture {
@@ -285,6 +339,18 @@ fn serve(
             write_response(&mut stream, 200, "text/html; charset=utf-8", &[], &body)
         }
         "/plain" => write_response(&mut stream, 200, "text/html; charset=utf-8", &[], PLAIN),
+        "/a11y" => write_response(&mut stream, 200, "text/html; charset=utf-8", &[], A11Y),
+        "/a11y-csp" => write_response(&mut stream, 200, "text/html; charset=utf-8", &[], A11Y_CSP),
+        "/a11y-huge" => {
+            write_response(&mut stream, 200, "text/html; charset=utf-8", &[], A11Y_HUGE)
+        }
+        "/a11y-frame" => write_response(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            &[],
+            A11Y_FRAME,
+        ),
         "/structured" => write_response(
             &mut stream,
             200,
@@ -327,6 +393,10 @@ fn serve(
         "/destination" => write_response(&mut stream, 200, "text/html; charset=utf-8", &[], PLAIN),
         "/slow" => {
             thread::sleep(Duration::from_secs(8));
+            write_response(&mut stream, 200, "text/html; charset=utf-8", &[], PLAIN)
+        }
+        "/slow-a11y" => {
+            thread::sleep(Duration::from_secs(3));
             write_response(&mut stream, 200, "text/html; charset=utf-8", &[], PLAIN)
         }
         "/hang" => {
@@ -2356,4 +2426,565 @@ fn browser_launch_failure_is_typed_as_setup_not_a_domain_failure() {
         detail.contains("debugging endpoint") || detail.contains("Could not start"),
         "the detail names the controlled launch failure: {detail}"
     );
+}
+
+#[test]
+fn browser_accessibility_uses_the_pinned_engine_in_an_isolated_world() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mut renderer) = launch_renderer(RenderConfig {
+        settle: Duration::from_millis(300),
+        deadline: Duration::from_secs(15),
+        accessibility: true,
+        ..RenderConfig::default()
+    }) else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let url = format!("{}/a11y", fixture.base());
+    let capture = renderer.render(
+        &url,
+        allow_base(&fixture.base()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(
+        capture.state,
+        RenderState::Captured,
+        "SEO capture must survive the audit: {}",
+        capture.reason
+    );
+    let scan = capture
+        .accessibility
+        .expect("a requested Browser audit returns typed evidence");
+    assert!(
+        scan.state.has_results(),
+        "{:?}: {}",
+        scan.state,
+        scan.reason
+    );
+    assert_eq!(scan.engine_version, "4.14.1");
+    assert_eq!(scan.profile, calmtoad::accessibility::PROFILE_ID);
+    assert!(
+        scan.elapsed_ms < 10_000,
+        "the post-capture audit must fit its ten-second budget: {} ms",
+        scan.elapsed_ms
+    );
+    assert!(
+        scan.preflight_elements.unwrap_or(0) >= 5,
+        "preflight should count the fixture elements"
+    );
+    let ids: Vec<&str> = scan
+        .rules
+        .iter()
+        .map(|rule| rule.rule_id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"image-alt"),
+        "missing image alt is a confirmed violation; ids {ids:?}, reason {}",
+        scan.reason
+    );
+    assert!(
+        ids.contains(&"label"),
+        "unlabelled input is a confirmed violation; ids {ids:?}"
+    );
+    assert!(
+        scan.rules
+            .iter()
+            .any(|rule| rule.kind == calmtoad::accessibility::ResultKind::NeedsReview)
+            || scan.outcome.incomplete_rules == 0,
+        "needs review stays distinct from violations"
+    );
+    assert!(
+        scan.rules
+            .iter()
+            .flat_map(|rule| &rule.nodes)
+            .any(|node| node
+                .target
+                .iter()
+                .flatten()
+                .any(|part| part.contains("#host"))),
+        "open-shadow targets should be retained structurally; ids {ids:?}"
+    );
+    assert_eq!(
+        fixture.hits("/a11y"),
+        1,
+        "the audit must not navigate again"
+    );
+    renderer.shutdown();
+}
+
+#[test]
+fn browser_accessibility_runs_through_a_restrictive_csp_without_new_requests() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mut renderer) = launch_renderer(RenderConfig {
+        settle: Duration::from_millis(300),
+        deadline: Duration::from_secs(15),
+        accessibility: true,
+        ..RenderConfig::default()
+    }) else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let url = format!("{}/a11y-csp", fixture.base());
+    let capture = renderer.render(
+        &url,
+        allow_base(&fixture.base()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(capture.state, RenderState::Captured, "{}", capture.reason);
+    let scan = capture.accessibility.expect("requested audit");
+    assert!(
+        scan.state.has_results(),
+        "DevTools-created isolated worlds are not subject to page CSP: {:?} {}",
+        scan.state,
+        scan.reason
+    );
+    let ids: Vec<&str> = scan
+        .rules
+        .iter()
+        .map(|rule| rule.rule_id.as_str())
+        .collect();
+    assert!(ids.contains(&"image-alt"), "ids {ids:?}");
+    assert_eq!(fixture.hits("/a11y-csp"), 1);
+    renderer.shutdown();
+}
+
+#[test]
+fn browser_accessibility_bounds_a_wedged_engine_cleans_up_and_recovers() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let audit_started = Arc::new(Mutex::new(None));
+    let Some(mut renderer) = launch_renderer(RenderConfig {
+        settle: Duration::from_millis(100),
+        // Generous page/setup budget; the audit itself is capped independently at 10s from the
+        // moment the audit starts.
+        deadline: Duration::from_secs(15),
+        accessibility: true,
+        audit_test_hook: Some(AuditTestHook::StallInAudit {
+            millis: 12_000,
+            started: audit_started.clone(),
+        }),
+        ..RenderConfig::default()
+    }) else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let baseline_pages = renderer
+        .open_page_count()
+        .expect("owned browser page count");
+    let url = format!("{}/a11y", fixture.base());
+    let started = Instant::now();
+    let capture = renderer.render(
+        &url,
+        allow_base(&fixture.base()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let returned = Instant::now();
+    // Setup may use the generous render deadline. The host bound that matters starts when the
+    // audit hook signals that the isolated-world evaluation is in flight: 10s audit timeout +
+    // 1s page close + 2s context disposal = 13s.
+    let hook_started = audit_started
+        .lock()
+        .expect("audit start slot")
+        .expect("the audit hook signalled its start");
+    let host_bound = Duration::from_secs(13);
+    assert!(
+        returned.duration_since(hook_started) < host_bound,
+        "10s post-capture audit timeout + 3s bounded cleanup must finish within \
+         {host_bound:?} of audit start (took {:?})",
+        returned.duration_since(hook_started)
+    );
+    let render_bound = Duration::from_secs(28);
+    assert!(
+        returned.duration_since(started) < render_bound,
+        "15s render deadline + 10s audit timeout + 3s cleanup must finish within \
+         {render_bound:?} (took {:?})",
+        returned.duration_since(started)
+    );
+    assert_eq!(
+        capture.state,
+        RenderState::Captured,
+        "the pre-audit SEO capture survives the wedged engine: {}",
+        capture.reason
+    );
+    let scan = capture.accessibility.expect("requested audit");
+    assert_eq!(
+        scan.state,
+        calmtoad::accessibility::ExecutionState::TimedOut,
+        "{}",
+        scan.reason
+    );
+    assert!(
+        scan.rules.is_empty(),
+        "a timed-out audit never keeps partial findings"
+    );
+
+    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if renderer.open_page_count() == Some(baseline_pages) {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "the timed-out page and isolated context were not cleaned up: {:?} vs baseline {baseline_pages}",
+            renderer.open_page_count()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        renderer.is_retired(),
+        "a stuck audit retires this crawl's owned renderer"
+    );
+
+    // A crawl owns its renderer. The next crawl starts a fresh browser and audits normally.
+    renderer.shutdown();
+    fixture.clear_hits();
+    let Some(mut next_renderer) = launch_renderer(RenderConfig {
+        settle: Duration::from_millis(100),
+        deadline: Duration::from_secs(15),
+        accessibility: true,
+        ..RenderConfig::default()
+    }) else {
+        return;
+    };
+    let next = next_renderer.render(
+        &format!("{}/a11y", fixture.base()),
+        allow_base(&fixture.base()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(next.state, RenderState::Captured, "{}", next.reason);
+    let scan = next.accessibility.expect("next crawl still audits");
+    assert!(
+        scan.state.has_results(),
+        "a fresh renderer recovers after the wedged page: {:?} {}",
+        scan.state,
+        scan.reason
+    );
+    assert_eq!(fixture.hits("/a11y"), 1);
+    assert_eq!(
+        next_renderer.open_page_count(),
+        Some(baseline_pages),
+        "the recovery page is also cleaned up"
+    );
+    next_renderer.shutdown();
+}
+
+#[test]
+fn browser_accessibility_discards_findings_when_navigation_starts_during_the_audit() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mut renderer) = launch_renderer(RenderConfig {
+        settle: Duration::from_millis(100),
+        deadline: Duration::from_secs(15),
+        accessibility: true,
+        audit_test_hook: Some(AuditTestHook::NavigateDuringAudit {
+            url: "/a11y-nav-destination".into(),
+        }),
+        ..RenderConfig::default()
+    }) else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let url = format!("{}/a11y", fixture.base());
+    let capture = renderer.render(
+        &url,
+        allow_base(&fixture.base()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let scan = capture.accessibility.expect("requested audit");
+    assert_eq!(
+        scan.state,
+        calmtoad::accessibility::ExecutionState::Failed,
+        "a document identity change invalidates audit results: {:?} {}",
+        scan.state,
+        scan.reason
+    );
+    assert!(
+        scan.reason.to_ascii_lowercase().contains("changed"),
+        "the reason names the identity change: {}",
+        scan.reason
+    );
+    assert!(
+        scan.rules.is_empty(),
+        "findings from the old document were discarded"
+    );
+    assert_eq!(
+        fixture.hits("/a11y"),
+        1,
+        "the history navigation must not load a second document"
+    );
+    assert_eq!(
+        fixture.hits("/a11y-nav-destination"),
+        0,
+        "the audit itself must not request the destination"
+    );
+    renderer.shutdown();
+}
+
+#[test]
+fn browser_accessibility_adds_no_network_requests() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::start();
+    let url = format!("{}/a11y", fixture.base());
+    let allowed = allow_base(&fixture.base());
+
+    let off = {
+        let Some(mut renderer) = launch_renderer(RenderConfig {
+            settle: Duration::from_millis(200),
+            deadline: Duration::from_secs(15),
+            accessibility: false,
+            ..RenderConfig::default()
+        }) else {
+            return;
+        };
+        let capture = renderer.render(&url, allowed.clone(), Arc::new(AtomicBool::new(false)));
+        assert_eq!(capture.state, RenderState::Captured, "{}", capture.reason);
+        thread::sleep(Duration::from_millis(200));
+        let hits = fixture.all_hits();
+        let requests = capture.requests;
+        renderer.shutdown();
+        (hits, requests)
+    };
+
+    fixture.clear_hits();
+    let on = {
+        let Some(mut renderer) = launch_renderer(RenderConfig {
+            settle: Duration::from_millis(200),
+            deadline: Duration::from_secs(15),
+            accessibility: true,
+            ..RenderConfig::default()
+        }) else {
+            return;
+        };
+        let capture = renderer.render(&url, allowed, Arc::new(AtomicBool::new(false)));
+        assert_eq!(capture.state, RenderState::Captured, "{}", capture.reason);
+        assert!(
+            capture
+                .accessibility
+                .as_ref()
+                .is_some_and(|scan| scan.state.has_results()),
+            "the audit actually ran"
+        );
+        thread::sleep(Duration::from_millis(200));
+        let hits = fixture.all_hits();
+        let requests = capture.requests;
+        renderer.shutdown();
+        (hits, requests)
+    };
+
+    assert_eq!(
+        on.0, off.0,
+        "the audit must not add any server-observed request: on={:?} off={:?}",
+        on.0, off.0
+    );
+    assert_eq!(
+        on.1, off.1,
+        "the audited capture sees the same request count as the unaudited capture"
+    );
+    assert_eq!(
+        on.0.get("/a11y"),
+        Some(&1),
+        "the fixture document was requested exactly once: {:?}",
+        on.0
+    );
+    assert!(
+        on.0.keys()
+            .all(|path| !path.to_ascii_lowercase().contains("axe")),
+        "the embedded engine is never fetched: {:?}",
+        on.0
+    );
+}
+
+#[test]
+fn html_mode_marks_requested_accessibility_as_requires_browser_without_a_browser() {
+    let fixture = Fixture::start();
+    let url = format!("{}/plain", fixture.base());
+    let outcome = crawl_site_with(
+        &url,
+        Limits {
+            max_pages: 1,
+            max_depth: 0,
+        },
+        CrawlOptions {
+            rendering: RenderMode::Html,
+            accessibility: true,
+            ..CrawlOptions::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
+    let page = outcome.pages.first().expect("HTML page");
+    assert_eq!(
+        page.accessibility.state(),
+        calmtoad::accessibility::ExecutionState::RequiresBrowser
+    );
+    assert!(page.accessibility.scan.rules.is_empty());
+    assert_eq!(fixture.hits("/plain"), 1, "no audit fetch or repeat load");
+}
+
+#[test]
+fn browser_accessibility_crawl_retains_typed_evidence_on_the_run_ledger() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::start();
+    let url = format!("{}/a11y", fixture.base());
+    let budget = Arc::new(calmtoad::accessibility::Budget::default());
+    let outcome = crawl_site_with(
+        &url,
+        Limits {
+            max_pages: 1,
+            max_depth: 0,
+        },
+        CrawlOptions {
+            rendering: RenderMode::Browser,
+            accessibility: true,
+            accessibility_budget: Some(budget.clone()),
+            ..CrawlOptions::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
+    let page = outcome.pages.first().expect("audited page");
+    assert!(
+        page.accessibility.state().has_results(),
+        "{:?}: {}",
+        page.accessibility.state(),
+        page.accessibility.scan.reason
+    );
+    assert_eq!(page.accessibility.scan.engine_version, "4.14.1");
+    assert!(page.accessibility.violation_occurrences() > 0);
+    assert!(
+        budget.used() > 0 && budget.occurrences() > 0,
+        "retained evidence is charged to the accessibility ledger"
+    );
+}
+
+#[test]
+fn browser_accessibility_near_the_render_deadline_preserves_seo_capture() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mut renderer) = launch_renderer(RenderConfig {
+        settle: Duration::from_millis(50),
+        deadline: Duration::from_secs(8),
+        accessibility: true,
+        ..RenderConfig::default()
+    }) else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let url = format!("{}/slow-a11y", fixture.base());
+    let started = Instant::now();
+    let capture = renderer.render(
+        &url,
+        allow_base(&fixture.base()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(21),
+        "the 8s render deadline + 10s audit + 3s cleanup must stay under 21s (took {:?})",
+        started.elapsed()
+    );
+    assert_eq!(
+        capture.state,
+        RenderState::Captured,
+        "accessibility work must not fail a slow but successful SEO capture: {}",
+        capture.reason
+    );
+    let rendered = capture.rendered_html.as_deref().unwrap_or_default();
+    assert!(
+        !rendered.is_empty() && rendered.contains("<h1"),
+        "the rendered SEO DOM is preserved: {rendered:?}"
+    );
+    let scan = capture.accessibility.expect("accessibility was requested");
+    assert!(
+        scan.state.has_results() || scan.state == calmtoad::accessibility::ExecutionState::TimedOut,
+        "the audit either completes or times out honestly: {:?} {}",
+        scan.state,
+        scan.reason
+    );
+    assert!(
+        !scan
+            .reason
+            .contains("render deadline expired before the accessibility audit could start"),
+        "a successful capture at the render deadline still gets its post-capture audit window: {}",
+        scan.reason
+    );
+    renderer.shutdown();
+}
+
+#[test]
+fn browser_accessibility_declines_an_oversized_dom_but_keeps_the_seo_capture() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mut renderer) = launch_renderer(RenderConfig {
+        settle: Duration::from_millis(300),
+        deadline: Duration::from_secs(15),
+        accessibility: true,
+        ..RenderConfig::default()
+    }) else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let url = format!("{}/a11y-huge", fixture.base());
+    let capture = renderer.render(
+        &url,
+        allow_base(&fixture.base()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(capture.state, RenderState::Captured, "{}", capture.reason);
+    let scan = capture.accessibility.expect("requested audit");
+    assert_eq!(
+        scan.state,
+        calmtoad::accessibility::ExecutionState::Limited,
+        "{}",
+        scan.reason
+    );
+    assert!(scan.coverage.preflight_limited);
+    assert!(
+        scan.preflight_elements
+            .is_some_and(|count| count > calmtoad::accessibility::MAX_PREFLIGHT_ELEMENTS)
+    );
+    assert!(
+        capture
+            .rendered_html
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Huge document"),
+        "declining the audit does not erase rendered SEO evidence"
+    );
+    renderer.shutdown();
+}
+
+#[test]
+fn browser_accessibility_excludes_frame_contents_and_declares_the_scope() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(mut renderer) = launch_renderer(RenderConfig {
+        settle: Duration::from_millis(300),
+        deadline: Duration::from_secs(15),
+        accessibility: true,
+        ..RenderConfig::default()
+    }) else {
+        return;
+    };
+    let fixture = Fixture::start();
+    let url = format!("{}/a11y-frame", fixture.base());
+    let capture = renderer.render(
+        &url,
+        allow_base(&fixture.base()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(capture.state, RenderState::Captured, "{}", capture.reason);
+    let scan = capture.accessibility.expect("requested audit");
+    assert!(
+        scan.state.has_results(),
+        "{:?}: {}",
+        scan.state,
+        scan.reason
+    );
+    assert!(
+        scan.rules
+            .iter()
+            .flat_map(|rule| &rule.nodes)
+            .all(|node| !node.html.contains("<img")),
+        "the alt-less image inside srcdoc must not be audited with iframes:false"
+    );
+    assert!(
+        calmtoad::accessibility::SCOPE_NOTE.contains("Frame contents"),
+        "the permanent scope statement names frame exclusion"
+    );
+    renderer.shutdown();
 }

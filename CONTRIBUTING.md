@@ -46,6 +46,10 @@ The app finds a browser from the usual per-platform locations. Set `CALMTOAD_BRO
 
 CI sets `CALMTOAD_REQUIRE_BROWSER=1`, which turns the suite's skip into a failure if no browser can launch. The GitHub runner images provide Chrome; if a runner image stops doing so, install Chrome there or set `CALMTOAD_BROWSER_PATH` for that job. Set the variable locally when you want to verify that the real-browser tests actually ran.
 
+## Vendored accessibility engine
+
+Accessibility checks use a pinned browser engine under `assets/axe/4.14.1/`. `axe.min.js`, its MPL-2.0 license and third-party notices are embedded in the binary; there is no runtime CDN, npm or Node.js dependency. `PROVENANCE.md` records the official source tag, npm tarball, integrity values, SHA-256 hashes and reproduction steps. Do not replace the bundle silently or load an unversioned download. If the engine is updated, update the constants and hashes in `src/accessibility.rs`, run the offline provenance test, and rerun the real-browser fixtures because rule selection and result shape can change. Preserve the license and third-party notices in every distribution.
+
 ## Performance
 
 The harness reports the median time per page (or per parse) for each scenario, and can emit JSON or compare against the committed baseline:

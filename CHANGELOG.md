@@ -5,6 +5,26 @@ date are being prepared for release.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-22
+
+### Added
+
+- **Check accessibility on rendered pages.** Turn on **Check accessibility** in the crawl options with **Browser** mode to run a local, opt-in audit of the captured main document and supported open shadow roots. The app bundles Deque axe-core 4.14.1 and its notices, uses the explicit WCAG A/AA tag profile, and runs the engine in an isolated execution world so a page-owned `window.axe` is never used. HTML mode says **Requires Browser mode** and never audits static HTML as if it were rendered. Frame contents, closed shadow roots, responsive states and interactive journeys stay outside the declared scope; the app never calls a zero-violation result WCAG conformance or an accessibility score.
+- **Review accessibility evidence.** **Internal → Accessibility** adds compact **Pages** and **Rules** views. Pages lists every captured URL with execution state, retained violation and needs-review counts, maximum known impact and coverage. Rules groups by stable rule ID and outcome, keeps unique affected URLs separate from repeated occurrences, and opens page and occurrence evidence in the inspector. Search covers retained URL, rule, title, description, tags, impact, selector, HTML, failure and coverage fields. Selected and engine-returned rule inventories are kept separately, and rule-field, tag, selector, HTML and failure truncation carries explicit flags. Overview adds separate violation, needs-review and incomplete-coverage rows.
+- **Export accessibility coverage and occurrences.** Separate CSV actions save the visible Pages coverage or Rules occurrence rows in the current order, with execution state, reason, engine/profile/viewport, outcome counts, rule details, nested target arrays, bounded HTML and failure summaries, truncation, scope and frozen run context.
+
+### Improved
+
+- Accessibility evidence has its own 64 MiB run ledger, separate from structured-data evidence. The browser preflight declines documents over 20,000 elements; each page retains at most 128 rule/result groups and 200 occurrences, a run retains at most 10,000 occurrences, and a page's projected browser-to-Rust payload is capped at 512 KiB. Every drop or limit stays visible instead of becoming a clean result.
+- The audit gets at most ten additional seconds after a successful render, under the existing 25-second absolute job ceiling. Cancellation and timeout dispose the owned page/context; an audit failure never erases successful SEO capture. The off and HTML paths launch no audit work.
+- The bundled engine is embedded in the binary. No CDN, npm, Node.js, runtime download, second navigation or audit-originated iframe/CSS preload request is added. The pinned bundle, license and third-party notices ship with hashes and reproduction steps in `assets/axe/4.14.1/`.
+- Accessibility view grouping, filtering and sorting run on a bounded worker with active-view and generation guards. Export preparation and writing use the same frozen-snapshot and shared-lease discipline as other exports, including cancellation while a paused worker still owns projected rows.
+
+### Fixed
+
+- Accessibility export reservations now stay charged through the preparation worker, native save dialog and background writer rather than being released when the visible job is cancelled. Bounded CSV projection refuses to return a silently partial file.
+- An accessibility scan whose main-document URL or frame identity changes during the audit discards its findings instead of attributing them to the requested URL.
+
 ## [0.9.0] - 2026-11-22
 
 ### Added

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use scraper::{ElementRef, Html, Node};
 use url::Url;
 
+use crate::accessibility;
 use crate::content::{self, ContentBudget, ContentEvidence};
 use crate::extract::{self, ExtractionOutcome};
 use crate::indexability::{
@@ -158,6 +159,8 @@ pub struct Page {
     /// JSON-LD block inventory and JSON syntax evidence for the selected capture, shared across
     /// clones and snapshots.
     pub structured: Arc<structured_data::PageReport>,
+    /// Opt-in accessibility evidence for the selected Browser capture, shared across clones.
+    pub accessibility: Arc<accessibility::Report>,
     /// The one evidence-backed indexability assessment every view reads.
     pub indexability: Assessment,
 }
@@ -228,6 +231,10 @@ pub struct CrawlOptions {
     /// page snapshots, visible-result caches and exports reserve against the same 128 MiB
     /// budget as captured evidence instead of adding an unaccounted second cache.
     pub structured_budget: Option<Arc<StructuredBudget>>,
+    /// Run the opt-in accessibility audit after Browser capture. Off by default.
+    pub accessibility: bool,
+    /// The run's accessibility evidence ledger. Kept separate from structured-data evidence.
+    pub accessibility_budget: Option<Arc<accessibility::Budget>>,
 }
 
 /// Everything the window streams while a crawl runs.
@@ -1078,6 +1085,7 @@ pub fn crawl_site_with(
         RenderMode::Browser => {
             let config = render::RenderConfig {
                 browser_path: options.browser_path.clone(),
+                accessibility: options.accessibility,
                 ..render::RenderConfig::default()
             };
             match BrowserRenderer::launch(config, cancel.clone()) {
@@ -1180,6 +1188,7 @@ struct FetchedPage {
     source: Option<Parsed>,
     capture: CaptureInfo,
     extraction: ExtractionInput,
+    accessibility: Option<accessibility::Scan>,
 }
 
 struct ExtractionInput {
@@ -1904,6 +1913,10 @@ fn crawl_engine(
             .structured_budget
             .clone()
             .unwrap_or_else(|| Arc::new(StructuredBudget::default()));
+        let accessibility_budget = options
+            .accessibility_budget
+            .clone()
+            .unwrap_or_else(|| Arc::new(accessibility::Budget::default()));
 
         for _ in 0..workers {
             let tx = tx.clone();
@@ -1933,7 +1946,7 @@ fn crawl_engine(
                     }
                     // A panicking fetcher must still produce a result, or the crawl loop would
                     // wait forever for this URL.
-                    let (fetched, parsed, source, capture, extraction) =
+                    let (fetched, parsed, source, capture, extraction, accessibility_scan) =
                         catch_unwind(AssertUnwindSafe(|| {
                             if let (Some(job), Some(allowed)) = (browser, browser_allowed.as_ref())
                             {
@@ -1962,6 +1975,7 @@ fn crawl_engine(
                                         applicable,
                                         partial,
                                     },
+                                    capture.accessibility.clone(),
                                 )
                             } else {
                                 let fetched = fetch(&url);
@@ -2006,6 +2020,7 @@ fn crawl_engine(
                                         applicable: true,
                                         partial,
                                     },
+                                    None,
                                 )
                             }
                         }))
@@ -2024,6 +2039,7 @@ fn crawl_engine(
                                     applicable: false,
                                     partial: true,
                                 },
+                                None,
                             )
                         });
                     if fetched.status == 429 || fetched.status == 503 {
@@ -2046,6 +2062,7 @@ fn crawl_engine(
                             source,
                             capture,
                             extraction,
+                            accessibility: accessibility_scan,
                         })))
                         .is_err()
                     {
@@ -2201,6 +2218,7 @@ fn crawl_engine(
                 source,
                 capture,
                 extraction,
+                accessibility: accessibility_scan,
             } = *result;
             let page_url =
                 if parsed.is_some() || source.is_some() || (300..400).contains(&fetched.status) {
@@ -2609,6 +2627,33 @@ fn crawl_engine(
             } else {
                 String::new()
             };
+            let accessibility = if !options.accessibility {
+                Arc::new(accessibility::Report::not_requested())
+            } else if options.rendering == RenderMode::Html {
+                Arc::new(accessibility::Report::requires_browser(
+                    url.clone(),
+                    accessibility::Viewport {
+                        width: render::VIEWPORT.0,
+                        height: render::VIEWPORT.1,
+                    },
+                ))
+            } else if let Some(scan) = accessibility_scan {
+                Arc::new(accessibility::Report::from_scan(
+                    scan,
+                    &accessibility_budget,
+                ))
+            } else {
+                Arc::new(accessibility::Report::declined(
+                    accessibility::ExecutionState::Failed,
+                    "The Browser capture did not produce accessibility evidence",
+                    url.clone(),
+                    accessibility::Viewport {
+                        width: render::VIEWPORT.0,
+                        height: render::VIEWPORT.1,
+                    },
+                    String::new(),
+                ))
+            };
             let page = Page {
                 url,
                 status: fetched.status,
@@ -2634,6 +2679,7 @@ fn crawl_engine(
                 extraction_limit,
                 content,
                 structured,
+                accessibility,
                 indexability,
             };
             sitemap_report.observe_page(&page);
@@ -3676,6 +3722,7 @@ pub fn sample_pages() -> Vec<Page> {
         structured: Arc::new(structured_data::PageReport::empty_complete(
             EvidenceStage::Document,
         )),
+        accessibility: Arc::new(accessibility::Report::not_requested()),
         indexability: Assessment::default(),
     };
     let ok_meta =
@@ -3830,6 +3877,7 @@ pub fn indexability_sample_pages() -> Vec<Page> {
         structured: Arc::new(structured_data::PageReport::empty_complete(
             EvidenceStage::Document,
         )),
+        accessibility: Arc::new(accessibility::Report::not_requested()),
         indexability: Assessment::default(),
     };
     let generic = |raw: &str| indexability::parse_meta_directive("robots", raw).unwrap();
