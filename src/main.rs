@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use calmtoad::accessibility;
 use calmtoad::content::{self, ContentAnalysis, ContentEvidence, ContentInput};
 use calmtoad::crawl;
 use calmtoad::crawl::{
@@ -81,12 +82,19 @@ enum InternalView {
     Urls,
     DuplicateContent,
     StructuredData,
+    Accessibility,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StructuredView {
     Pages,
     Blocks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessibilityView {
+    Pages,
+    Rules,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +209,7 @@ struct RunContext {
     rendering: RenderMode,
     sitemaps: bool,
     check_links: bool,
+    accessibility: bool,
     started_utc: String,
     extraction_rules: Vec<ExtractionRule>,
 }
@@ -250,6 +259,7 @@ struct RelationPages {
     outbound: usize,
     structured_types: usize,
     structured_duplicates: usize,
+    accessibility_pages: usize,
 }
 
 const RELATION_PAGE: usize = 25;
@@ -466,6 +476,9 @@ struct OverviewCounts {
     content_similar_urls: usize,
     structured_urls: usize,
     structured_incomplete: usize,
+    accessibility_urls: usize,
+    accessibility_review_urls: usize,
+    accessibility_incomplete: usize,
 }
 
 impl OverviewCounts {
@@ -486,6 +499,8 @@ impl OverviewCounts {
             || self.content_same_urls > 0
             || self.content_similar_urls > 0
             || self.structured_urls > 0
+            || self.accessibility_urls > 0
+            || self.accessibility_review_urls > 0
     }
 }
 
@@ -558,7 +573,27 @@ fn overview_counts(
     sitemap: &SitemapReport,
     link_checks: &HashMap<String, LinkCheckResult>,
     content: Option<&ContentAnalysis>,
+    accessibility_enabled: bool,
 ) -> OverviewCounts {
+    let (accessibility_urls, accessibility_review_urls, accessibility_incomplete) =
+        if accessibility_enabled {
+            (
+                pages
+                    .iter()
+                    .filter(|page| page.accessibility.is_finding())
+                    .count(),
+                pages
+                    .iter()
+                    .filter(|page| page.accessibility.needs_review_occurrences() > 0)
+                    .count(),
+                pages
+                    .iter()
+                    .filter(|page| page.accessibility.has_coverage_gap())
+                    .count(),
+            )
+        } else {
+            (0, 0, 0)
+        };
     OverviewCounts {
         pages: counts.pages,
         response: counts.response,
@@ -604,6 +639,9 @@ fn overview_counts(
             .iter()
             .filter(|page| page.structured.is_incomplete())
             .count(),
+        accessibility_urls,
+        accessibility_review_urls,
+        accessibility_incomplete,
     }
 }
 
@@ -717,6 +755,57 @@ impl WorkerGate {
         self.ready.notify_all();
     }
 }
+
+/// One rule/result-kind group across the visible pages. Occurrences remain page-local and
+/// distinct; the group stores unique affected page indices separately.
+#[derive(Clone, Debug)]
+struct AccessibilityRuleRow {
+    key: String,
+    rule_id: String,
+    kind: accessibility::ResultKind,
+    title: String,
+    description: String,
+    impact: accessibility::Impact,
+    tags: Vec<String>,
+    help_url: String,
+    nodes_reported: usize,
+    nodes_truncated: bool,
+    fields_truncated: bool,
+    tags_truncated: bool,
+    affected: Vec<usize>,
+    occurrences: Vec<(usize, usize, usize)>,
+}
+
+struct AccessibilityOutcome {
+    view: AccessibilityView,
+    generation: u64,
+    epoch: u64,
+    pages_len: usize,
+    pages_visible: Vec<usize>,
+    rule_rows: Vec<AccessibilityRuleRow>,
+    rule_visible: Vec<usize>,
+    counts: ViewCounts,
+    limited: Option<Arc<str>>,
+}
+
+struct AccessibilityRefreshJob {
+    rx: mpsc::Receiver<AccessibilityOutcome>,
+    cancel: Arc<AtomicBool>,
+    generation: u64,
+    epoch: u64,
+    pages_len: usize,
+    view: AccessibilityView,
+    query: String,
+    filter: CheckFilter,
+    sort: (String, SortDir),
+    /// Owned pointer-only snapshot plus result vectors. Shared with the worker so a cancelled
+    /// UI job cannot release bytes that the worker still holds.
+    _lease: AccessibilityLease,
+}
+
+/// Groups are bounded by the engine's rule inventory, not by page count. This cap is a final
+/// guard on corrupt or future oversized inventories and is always reported when reached.
+const MAX_ACCESSIBILITY_RULE_GROUPS: usize = 1_024;
 
 struct StructuredRefreshOutcome {
     view: StructuredView,
@@ -1047,6 +1136,64 @@ impl LedgerLease {
     }
 }
 
+/// Accessibility export reservation. Clones share one charge through the worker, dialog and
+/// writer, so cancellation cannot release bytes that projected rows still own.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct AccessibilityLease {
+    inner: Arc<AccessibilityLeaseInner>,
+}
+
+struct AccessibilityLeaseInner {
+    budget: Arc<accessibility::Budget>,
+    bytes: usize,
+}
+
+impl Drop for AccessibilityLeaseInner {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes, 0);
+    }
+}
+
+impl AccessibilityLease {
+    fn new(budget: Arc<accessibility::Budget>, bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(AccessibilityLeaseInner { budget, bytes }),
+        }
+    }
+}
+
+/// One save/write owner can carry either feature's reservation.
+#[derive(Clone)]
+#[allow(dead_code)]
+enum ExportLease {
+    Structured(LedgerLease),
+    Accessibility(AccessibilityLease),
+}
+
+struct AccessibilityExportJob {
+    rx: mpsc::Receiver<Result<PreparedAccessibilityExport, String>>,
+    cancel: Arc<AtomicBool>,
+    epoch: u64,
+    lease: AccessibilityLease,
+}
+
+struct PreparedAccessibilityExport {
+    csv: String,
+    row_count: usize,
+    scope: String,
+    slug: &'static str,
+}
+
+struct AccessibilityExportSource {
+    view: AccessibilityView,
+    pages: Vec<(String, Arc<accessibility::Report>)>,
+    pages_visible: Vec<usize>,
+    rules: Vec<AccessibilityRuleRow>,
+    context: Vec<String>,
+    slug: &'static str,
+}
+
 struct State {
     url: TextEdit,
     rendering: RenderMode,
@@ -1161,7 +1308,22 @@ struct State {
     structured_blocks_cache_bytes: usize,
     /// The run's retained structured evidence plus derived index/snapshot ledger.
     structured_budget: Arc<structured_data::StructuredBudget>,
+    /// Opt-in accessibility checks for the next Browser crawl.
+    accessibility_checked: bool,
+    /// Retained accessibility evidence for the current run, separate from structured data.
+    accessibility_budget: Arc<accessibility::Budget>,
     structured_export_job: Option<StructuredExportJob>,
+    accessibility_export_job: Option<AccessibilityExportJob>,
+    accessibility_view: AccessibilityView,
+    accessibility_pages_view: ViewState,
+    accessibility_rules_view: ViewState,
+    /// Page indices after the Accessibility Pages query/filter, in display order.
+    accessibility_pages_visible: Vec<usize>,
+    accessibility_rule_rows: Vec<AccessibilityRuleRow>,
+    accessibility_rule_visible: Vec<usize>,
+    accessibility_refresh: Option<AccessibilityRefreshJob>,
+    accessibility_generation: u64,
+    accessibility_index_limited: Option<Arc<str>>,
     content_phase: ContentPhase,
     content_analysis: Option<Arc<ContentAnalysis>>,
     content_prepare: Option<ContentPrepareJob>,
@@ -1293,6 +1455,9 @@ fn init() -> State {
         structured_subview: StructuredView::Pages,
         structured_pages_view: ViewState::new("url"),
         structured_blocks_view: ViewState::new("url"),
+        accessibility_view: AccessibilityView::Pages,
+        accessibility_pages_view: ViewState::new("url"),
+        accessibility_rules_view: ViewState::new("rule"),
         structured_pages_visible: Vec::new(),
         structured_facts: Vec::new(),
         structured_facts_epoch: 0,
@@ -1309,7 +1474,16 @@ fn init() -> State {
         structured_pages_cache_bytes: 0,
         structured_blocks_cache_bytes: 0,
         structured_budget: Arc::new(structured_data::StructuredBudget::default()),
+        accessibility_checked: false,
+        accessibility_budget: Arc::new(accessibility::Budget::default()),
         structured_export_job: None,
+        accessibility_export_job: None,
+        accessibility_pages_visible: Vec::new(),
+        accessibility_rule_rows: Vec::new(),
+        accessibility_rule_visible: Vec::new(),
+        accessibility_refresh: None,
+        accessibility_generation: 0,
+        accessibility_index_limited: None,
         content_phase: ContentPhase::Idle,
         content_analysis: None,
         content_prepare: None,
@@ -1373,6 +1547,12 @@ impl State {
                         StructuredView::Blocks => &self.structured_blocks_view,
                     };
                 }
+                InternalView::Accessibility => {
+                    return match self.accessibility_view {
+                        AccessibilityView::Pages => &self.accessibility_pages_view,
+                        AccessibilityView::Rules => &self.accessibility_rules_view,
+                    };
+                }
                 InternalView::Urls => {}
             }
         }
@@ -1390,6 +1570,12 @@ impl State {
                     return match self.structured_subview {
                         StructuredView::Pages => &mut self.structured_pages_view,
                         StructuredView::Blocks => &mut self.structured_blocks_view,
+                    };
+                }
+                InternalView::Accessibility => {
+                    return match self.accessibility_view {
+                        AccessibilityView::Pages => &mut self.accessibility_pages_view,
+                        AccessibilityView::Rules => &mut self.accessibility_rules_view,
                     };
                 }
                 InternalView::Urls => {}
@@ -1412,6 +1598,18 @@ fn structured_blocks_active(state: &State) -> bool {
     structured_view_active(state) && state.structured_subview == StructuredView::Blocks
 }
 
+fn accessibility_view_active(state: &State) -> bool {
+    state.tab == Tab::Internal && state.internal_view == InternalView::Accessibility
+}
+
+fn accessibility_pages_active(state: &State) -> bool {
+    accessibility_view_active(state) && state.accessibility_view == AccessibilityView::Pages
+}
+
+fn accessibility_rules_active(state: &State) -> bool {
+    accessibility_view_active(state) && state.accessibility_view == AccessibilityView::Rules
+}
+
 fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
     if !state.update_confirmed {
         // The window has laid out a frame. Now the new copy is known to start, so the
@@ -1432,10 +1630,12 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
     let content_changed = poll_content_analysis(state) | poll_content_export(state, tx);
     let structured_changed = poll_structured_export(state, tx);
     let structured_view_changed = poll_structured_view(state);
+    let accessibility_view_changed =
+        poll_accessibility_view(state) | poll_accessibility_export(state, tx);
     if state.inventory_prepare.is_some() || state.content_prepare.is_some() {
         tx.wake_after(Duration::from_millis(1));
     }
-    if state.structured_refresh.is_some() {
+    if state.structured_refresh.is_some() || state.accessibility_refresh.is_some() {
         tx.wake_after(Duration::from_millis(1));
     }
     if state.crawl_more {
@@ -1452,6 +1652,7 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
         || content_changed
         || structured_changed
         || structured_view_changed
+        || accessibility_view_changed
 }
 
 fn cancel_content_analysis(state: &mut State, keep_worker: bool) {
@@ -1793,6 +1994,8 @@ fn start_extraction_preview(state: &mut State) {
                 check_links: false,
                 extraction_rules: rules.clone(),
                 structured_budget: None,
+                accessibility: false,
+                accessibility_budget: None,
             },
             worker_cancel,
             |_| {},
@@ -2204,6 +2407,7 @@ fn export_lifecycle_busy(state: &State) -> bool {
         || state.inventory_dialog_open
         || state.content_export_job.is_some()
         || state.structured_export_job.is_some()
+        || state.accessibility_export_job.is_some()
 }
 
 fn start_install(state: &mut State, tx: &mut Tx) {
@@ -2349,6 +2553,7 @@ fn start_crawl(state: &mut State) {
         rendering: state.rendering,
         sitemaps: state.use_sitemaps,
         check_links: state.check_links,
+        accessibility: state.accessibility_checked,
         started_utc: inventory::utc_now(),
         extraction_rules: state.extraction_rules.clone(),
     });
@@ -2367,7 +2572,9 @@ fn start_crawl(state: &mut State) {
         job.cancel.store(true, Ordering::Relaxed);
     }
     reset_structured_view_cache(state);
+    reset_accessibility_view_cache(state);
     state.structured_budget = Arc::new(structured_data::StructuredBudget::default());
+    state.accessibility_budget = Arc::new(accessibility::Budget::default());
     state.visible.clear();
     state.audit = Arc::new(Audit::default());
     state.counts = Counts::default();
@@ -2403,6 +2610,8 @@ fn start_crawl(state: &mut State) {
         check_links: state.check_links,
         extraction_rules: state.extraction_rules.clone(),
         structured_budget: Some(state.structured_budget.clone()),
+        accessibility: state.accessibility_checked,
+        accessibility_budget: Some(state.accessibility_budget.clone()),
     };
     state.job = Some(CrawlJob {
         rx,
@@ -2660,6 +2869,20 @@ fn visible_id_ref(state: &State, row: usize) -> Option<&str> {
         let row = *state.structured_block_visible.get(row)?;
         return state.structured_block_keys.get(row).map(String::as_str);
     }
+    if accessibility_pages_active(state) {
+        return state
+            .accessibility_pages_visible
+            .get(row)
+            .and_then(|index| state.pages.get(*index))
+            .map(|page| page.url.as_str());
+    }
+    if accessibility_rules_active(state) {
+        let row = *state.accessibility_rule_visible.get(row)?;
+        return state
+            .accessibility_rule_rows
+            .get(row)
+            .map(|rule| rule.key.as_str());
+    }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         let row = *state.link_visible.get(row)?;
         return state.link_row_keys.get(row).map(String::as_str);
@@ -2710,6 +2933,24 @@ fn sync_selection(state: &mut State) {
             }
             None => {
                 state.duplicate_view.selected = None;
+                state.table.clear_selection();
+            }
+        }
+        return;
+    }
+    if accessibility_view_active(state) {
+        let count = visible_len(state);
+        let current = state.view().selected.clone();
+        let chosen = current
+            .filter(|id| (0..count).any(|row| visible_id_ref(state, row) == Some(id.as_str())))
+            .or_else(|| visible_id(state, 0));
+        match chosen {
+            Some(id) => {
+                state.view_mut().selected = Some(id.clone());
+                state.table.select(id);
+            }
+            None => {
+                state.view_mut().selected = None;
                 state.table.clear_selection();
             }
         }
@@ -2797,6 +3038,10 @@ fn refresh_visible_forced(state: &mut State) {
 fn refresh_visible_inner(state: &mut State, force: bool) {
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         refresh_content_visible_inner(state, force);
+        return;
+    }
+    if accessibility_view_active(state) {
+        refresh_accessibility_visible_inner(state, force);
         return;
     }
     if structured_view_active(state) {
@@ -3251,6 +3496,473 @@ fn reset_structured_view_cache(state: &mut State) {
     reset_structured_caches(state);
 }
 
+fn cancel_accessibility_refresh(state: &mut State) {
+    state.accessibility_generation = state.accessibility_generation.wrapping_add(1);
+    if let Some(job) = state.accessibility_refresh.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn reset_accessibility_view_cache(state: &mut State) {
+    cancel_accessibility_refresh(state);
+    state.accessibility_pages_visible.clear();
+    state.accessibility_rule_rows.clear();
+    state.accessibility_rule_visible.clear();
+    state.accessibility_index_limited = None;
+}
+
+fn accessibility_job_matches(
+    state: &State,
+    view: AccessibilityView,
+    query: &str,
+    filter: CheckFilter,
+    sort: &(String, SortDir),
+) -> bool {
+    state.accessibility_refresh.as_ref().is_some_and(|job| {
+        job.view == view
+            && job.epoch == state.pages_epoch
+            && job.query == query
+            && job.filter == filter
+            && &job.sort == sort
+    })
+}
+
+/// One bounded pass over the retained reports. The ledger estimate comes from the coverage
+/// counters already kept on each report, so a 50k-page refresh does not walk every rule/node
+/// again on the UI thread before the worker starts.
+fn accessibility_snapshot(
+    pages: &[Page],
+    query_len: usize,
+) -> (Vec<(usize, Arc<accessibility::Report>)>, usize) {
+    let mut facts = Vec::with_capacity(pages.len());
+    let mut occurrences = 0usize;
+    let mut rules = 0usize;
+    for (index, page) in pages.iter().enumerate() {
+        let report = &page.accessibility;
+        occurrences = occurrences.saturating_add(report.scan.coverage.occurrences_retained);
+        rules = rules.saturating_add(report.scan.coverage.rules_retained);
+        facts.push((index, report.clone()));
+    }
+    let snapshot_bytes = facts
+        .len()
+        .saturating_mul(32)
+        .saturating_add(occurrences.saturating_mul(24))
+        .saturating_add(rules.min(MAX_ACCESSIBILITY_RULE_GROUPS).saturating_mul(256))
+        .saturating_add(query_len)
+        .saturating_add(4096);
+    (facts, snapshot_bytes)
+}
+
+fn refresh_accessibility_visible_inner(state: &mut State, force: bool) {
+    let view = state.accessibility_view;
+    let query = normalized_query(&state.view().query.text);
+    let filter = state.view().filter;
+    let sort = state.view().sort.clone();
+    if !force && accessibility_job_matches(state, view, &query, filter, &sort) {
+        return;
+    }
+    let epoch = state.pages_epoch;
+    let pages_len = state.pages.len();
+    cancel_accessibility_refresh(state);
+    if pages_len == 0 {
+        state.accessibility_pages_visible.clear();
+        state.accessibility_rule_rows.clear();
+        state.accessibility_rule_visible.clear();
+        state.accessibility_index_limited = None;
+        state.view_counts = ViewCounts::default();
+        sync_selection(state);
+        return;
+    }
+    let generation = state.accessibility_generation;
+    let (facts, snapshot_bytes) = accessibility_snapshot(&state.pages, query.len());
+    if !state.accessibility_budget.try_reserve(snapshot_bytes, 0) {
+        state.accessibility_index_limited = Some(Arc::from(
+            "The accessibility view snapshot could not fit the 64 MiB run ledger",
+        ));
+        return;
+    }
+    let lease = AccessibilityLease::new(state.accessibility_budget.clone(), snapshot_bytes);
+    let worker_lease = lease.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let (tx, rx) = mpsc::channel();
+    let waker = state.waker.clone();
+    state.accessibility_refresh = Some(AccessibilityRefreshJob {
+        rx,
+        cancel,
+        generation,
+        epoch,
+        pages_len,
+        view,
+        query: query.clone(),
+        filter,
+        sort: sort.clone(),
+        _lease: lease,
+    });
+    std::thread::spawn(move || {
+        let _worker_lease = worker_lease;
+        let outcome = compute_accessibility_outcome(
+            view,
+            generation,
+            epoch,
+            pages_len,
+            facts,
+            &query,
+            filter,
+            &sort,
+            &worker_cancel,
+        );
+        if let Some(outcome) = outcome
+            && tx.send(outcome).is_ok()
+            && let Some(wake) = &waker
+        {
+            wake();
+        }
+    });
+}
+
+fn poll_accessibility_view(state: &mut State) -> bool {
+    let Some(job) = state.accessibility_refresh.take() else {
+        return false;
+    };
+    if job.generation != state.accessibility_generation {
+        return false;
+    }
+    match job.rx.try_recv() {
+        Ok(outcome) => {
+            if outcome.generation != state.accessibility_generation
+                || outcome.view != state.accessibility_view
+                || outcome.epoch != state.pages_epoch
+            {
+                return false;
+            }
+            if outcome.pages_len != state.pages.len() {
+                refresh_visible_forced(state);
+                return true;
+            }
+            state.accessibility_pages_visible = outcome.pages_visible;
+            state.accessibility_rule_rows = outcome.rule_rows;
+            state.accessibility_rule_visible = outcome.rule_visible;
+            state.accessibility_index_limited = outcome.limited;
+            state.view_counts = outcome.counts;
+            sync_selection(state);
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            if job.pages_len != state.pages.len() {
+                refresh_visible_forced(state);
+                return true;
+            }
+            state.accessibility_refresh = Some(job);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            if job.view == state.accessibility_view {
+                state.accessibility_index_limited = Some(Arc::from(
+                    "The accessibility view worker stopped without a result",
+                ));
+            }
+            true
+        }
+    }
+}
+
+fn accessibility_page_order(
+    left: &(usize, Arc<accessibility::Report>),
+    right: &(usize, Arc<accessibility::Report>),
+    column: &str,
+) -> std::cmp::Ordering {
+    match column {
+        "url" => left.1.scan.requested_url.cmp(&right.1.scan.requested_url),
+        "state" => left
+            .1
+            .state()
+            .label()
+            .cmp(right.1.state().label())
+            .then_with(|| left.1.scan.requested_url.cmp(&right.1.scan.requested_url)),
+        "violations" => left
+            .1
+            .violation_occurrences()
+            .cmp(&right.1.violation_occurrences())
+            .then_with(|| left.1.scan.requested_url.cmp(&right.1.scan.requested_url)),
+        "review" => left
+            .1
+            .needs_review_occurrences()
+            .cmp(&right.1.needs_review_occurrences())
+            .then_with(|| left.1.scan.requested_url.cmp(&right.1.scan.requested_url)),
+        "impact" => left
+            .1
+            .max_impact()
+            .cmp(&right.1.max_impact())
+            .then_with(|| left.1.scan.requested_url.cmp(&right.1.scan.requested_url)),
+        "coverage" => left
+            .1
+            .coverage_label()
+            .cmp(&right.1.coverage_label())
+            .then_with(|| left.1.scan.requested_url.cmp(&right.1.scan.requested_url)),
+        _ => left.1.scan.requested_url.cmp(&right.1.scan.requested_url),
+    }
+}
+
+/// Retained occurrence rows, or the known reported total when the ledger kept only a rule
+/// summary. This keeps a budget-limited group from reading as zero affected occurrences.
+fn accessibility_rule_occurrence_count(rule: &AccessibilityRuleRow) -> usize {
+    if rule.occurrences.is_empty() && rule.nodes_truncated {
+        rule.nodes_reported
+    } else {
+        rule.occurrences.len()
+    }
+}
+
+fn accessibility_rule_order(
+    left: &AccessibilityRuleRow,
+    right: &AccessibilityRuleRow,
+    column: &str,
+) -> std::cmp::Ordering {
+    match column {
+        "rule" => left
+            .rule_id
+            .cmp(&right.rule_id)
+            .then_with(|| left.kind.cmp(&right.kind)),
+        "kind" => left
+            .kind
+            .cmp(&right.kind)
+            .then_with(|| left.rule_id.cmp(&right.rule_id)),
+        "impact" => left
+            .impact
+            .cmp(&right.impact)
+            .then_with(|| left.rule_id.cmp(&right.rule_id)),
+        "urls" => left
+            .affected
+            .len()
+            .cmp(&right.affected.len())
+            .then_with(|| left.rule_id.cmp(&right.rule_id)),
+        "occurrences" => accessibility_rule_occurrence_count(left)
+            .cmp(&accessibility_rule_occurrence_count(right))
+            .then_with(|| left.rule_id.cmp(&right.rule_id)),
+        "title" => left.title.cmp(&right.title),
+        _ => left.rule_id.cmp(&right.rule_id),
+    }
+}
+
+fn accessibility_rule_matches(
+    row: &AccessibilityRuleRow,
+    facts: &[(usize, Arc<accessibility::Report>)],
+    needle: &str,
+) -> bool {
+    if row.rule_id.to_lowercase().contains(needle)
+        || row.title.to_lowercase().contains(needle)
+        || row.description.to_lowercase().contains(needle)
+        || row
+            .tags
+            .iter()
+            .any(|tag| tag.to_lowercase().contains(needle))
+        || row.help_url.to_lowercase().contains(needle)
+        || row.impact.label().to_lowercase().contains(needle)
+        || row.kind.label().to_lowercase().contains(needle)
+    {
+        return true;
+    }
+    for page in &row.affected {
+        if let Some((_, report)) = facts.get(*page)
+            && (report.scan.requested_url.to_lowercase().contains(needle)
+                || report.scan.observed_url.to_lowercase().contains(needle))
+        {
+            return true;
+        }
+    }
+    row.occurrences.iter().any(|(page, rule, node)| {
+        facts
+            .get(*page)
+            .and_then(|(_, report)| report.scan.rules.get(*rule))
+            .and_then(|rule| rule.nodes.get(*node))
+            .is_some_and(|node| {
+                node.html.to_lowercase().contains(needle)
+                    || node.failure.to_lowercase().contains(needle)
+                    || node
+                        .target
+                        .iter()
+                        .flatten()
+                        .any(|part| part.to_lowercase().contains(needle))
+            })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_accessibility_outcome(
+    view: AccessibilityView,
+    generation: u64,
+    epoch: u64,
+    pages_len: usize,
+    facts: Vec<(usize, Arc<accessibility::Report>)>,
+    query: &str,
+    filter: CheckFilter,
+    sort: &(String, SortDir),
+    cancel: &AtomicBool,
+) -> Option<AccessibilityOutcome> {
+    let (column, direction) = sort;
+    match view {
+        AccessibilityView::Pages => {
+            let mut findings = 0usize;
+            let mut incomplete = 0usize;
+            let mut matching = Vec::new();
+            for (index, report) in &facts {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let is_finding = report.is_finding();
+                let is_incomplete = report.is_incomplete();
+                findings += usize::from(is_finding);
+                incomplete += usize::from(is_incomplete);
+                let keep = match filter {
+                    CheckFilter::All => true,
+                    CheckFilter::Findings => is_finding,
+                    CheckFilter::Incomplete => is_incomplete,
+                };
+                if !keep {
+                    continue;
+                }
+                if !query.is_empty()
+                    && !report.scan.requested_url.to_lowercase().contains(query)
+                    && !report.scan.observed_url.to_lowercase().contains(query)
+                    && !report.matches(query)
+                {
+                    continue;
+                }
+                matching.push(*index);
+            }
+            matching.sort_by(|left, right| {
+                direction.apply(accessibility_page_order(
+                    &facts[*left],
+                    &facts[*right],
+                    column,
+                ))
+            });
+            Some(AccessibilityOutcome {
+                view,
+                generation,
+                epoch,
+                pages_len,
+                pages_visible: matching,
+                rule_rows: Vec::new(),
+                rule_visible: Vec::new(),
+                counts: ViewCounts {
+                    total: facts.len(),
+                    findings,
+                    incomplete,
+                },
+                limited: None,
+            })
+        }
+        AccessibilityView::Rules => {
+            let mut groups: std::collections::BTreeMap<(String, u8), AccessibilityRuleRow> =
+                std::collections::BTreeMap::new();
+            let dropped_details = facts.iter().any(|(_, report)| {
+                report.scan.coverage.budget_limited
+                    && report.scan.rules.is_empty()
+                    && report.scan.coverage.rules_reported.unwrap_or(0) > 0
+            });
+            let mut limited = dropped_details.then(|| {
+                Arc::from(
+                    "Rule detail was dropped at the run evidence cap; page-level outcome counts remain",
+                )
+            });
+            'pages: for (page, report) in &facts {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                for (rule_index, rule) in report.scan.rules.iter().enumerate() {
+                    let rank = match rule.kind {
+                        accessibility::ResultKind::Violation => 0,
+                        accessibility::ResultKind::NeedsReview => 1,
+                    };
+                    let key = (rule.rule_id.clone(), rank);
+                    if !groups.contains_key(&key) && groups.len() >= MAX_ACCESSIBILITY_RULE_GROUPS {
+                        limited = Some(Arc::from(format!(
+                            "Rule grouping stopped at {MAX_ACCESSIBILITY_RULE_GROUPS} distinct rule/result groups"
+                        )));
+                        break 'pages;
+                    }
+                    let row = groups
+                        .entry(key.clone())
+                        .or_insert_with(|| AccessibilityRuleRow {
+                            key: format!("{}|{}", rule.rule_id, rule.kind.label()),
+                            rule_id: rule.rule_id.clone(),
+                            kind: rule.kind,
+                            title: rule.title.clone(),
+                            description: rule.description.clone(),
+                            impact: rule.impact,
+                            tags: rule.tags.clone(),
+                            help_url: rule.help_url.clone(),
+                            nodes_reported: 0,
+                            nodes_truncated: false,
+                            fields_truncated: false,
+                            tags_truncated: false,
+                            affected: Vec::new(),
+                            occurrences: Vec::new(),
+                        });
+                    row.nodes_reported = row.nodes_reported.saturating_add(rule.nodes_reported);
+                    row.nodes_truncated |= rule.nodes_truncated;
+                    row.fields_truncated |= rule.fields_truncated;
+                    row.tags_truncated |= rule.tags_truncated;
+                    let known_affected = !rule.nodes.is_empty()
+                        || (report.scan.coverage.budget_limited && rule.nodes_reported > 0);
+                    if known_affected && row.affected.last() != Some(page) {
+                        row.affected.push(*page);
+                    }
+                    for node_index in 0..rule.nodes.len() {
+                        row.occurrences.push((*page, rule_index, node_index));
+                    }
+                }
+            }
+            let groups_len = groups.len();
+            let rows = groups.into_values().collect::<Vec<_>>();
+            let mut findings = 0usize;
+            let mut incomplete = 0usize;
+            let mut visible = Vec::new();
+            for (index, row) in rows.iter().enumerate() {
+                let is_finding = row.kind == accessibility::ResultKind::Violation;
+                let is_incomplete = row.kind == accessibility::ResultKind::NeedsReview;
+                findings += usize::from(is_finding);
+                incomplete += usize::from(is_incomplete);
+                let keep = match filter {
+                    CheckFilter::All => true,
+                    CheckFilter::Findings => is_finding,
+                    CheckFilter::Incomplete => is_incomplete,
+                };
+                if !keep {
+                    continue;
+                }
+                if !query.is_empty() && !accessibility_rule_matches(row, &facts, query) {
+                    continue;
+                }
+                visible.push(index);
+            }
+            visible.sort_by(|left, right| {
+                direction.apply(accessibility_rule_order(
+                    &rows[*left],
+                    &rows[*right],
+                    column,
+                ))
+            });
+            Some(AccessibilityOutcome {
+                view,
+                generation,
+                epoch,
+                pages_len,
+                pages_visible: Vec::new(),
+                rule_rows: rows,
+                rule_visible: visible,
+                counts: ViewCounts {
+                    total: groups_len,
+                    findings,
+                    incomplete,
+                },
+                limited,
+            })
+        }
+    }
+}
 fn cancel_structured_refresh(state: &mut State) {
     state.structured_refresh_generation = state.structured_refresh_generation.wrapping_add(1);
     if let Some(job) = state.structured_refresh.take() {
@@ -4319,12 +5031,16 @@ fn refresh_counts(state: &mut State, force: bool) -> bool {
         return false;
     }
     state.counts = counts_with(&state.pages, &state.audit);
+    // The default and HTML/off paths must not walk every page's accessibility report just to
+    // discover that the feature was not requested. The run context is the authoritative fact.
+    let accessibility_enabled = state.run.as_ref().is_some_and(|run| run.accessibility);
     state.overview = overview_counts(
         &state.pages,
         &state.counts,
         &state.sitemap,
         &state.link_checks,
         state.content_analysis.as_deref(),
+        accessibility_enabled,
     );
     state.counts_at = Some(Instant::now());
     state.counts_dirty = false;
@@ -4358,11 +5074,16 @@ fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
     if let Some(job) = state.structured_export_job.take() {
         job.cancel.store(true, Ordering::Relaxed);
     }
+    if let Some(job) = state.accessibility_export_job.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
     state.overview.content_same_urls = 0;
     state.overview.content_similar_urls = 0;
     state.pages_epoch = state.pages_epoch.wrapping_add(1);
     reset_structured_view_cache(state);
+    reset_accessibility_view_cache(state);
     state.structured_budget = Arc::new(structured_data::StructuredBudget::default());
+    state.accessibility_budget = Arc::new(accessibility::Budget::default());
     let seed = pages
         .first()
         .map(|page| page.url.clone())
@@ -4381,6 +5102,7 @@ fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
         rendering: state.rendering,
         sitemaps: state.use_sitemaps,
         check_links: state.check_links,
+        accessibility: state.accessibility_checked,
         started_utc: inventory::utc_now(),
         extraction_rules: state.extraction_rules.clone(),
     });
@@ -4599,6 +5321,12 @@ fn visible_len(state: &State) -> usize {
     }
     if structured_blocks_active(state) {
         return state.structured_block_visible.len();
+    }
+    if accessibility_pages_active(state) {
+        return state.accessibility_pages_visible.len();
+    }
+    if accessibility_rules_active(state) {
+        return state.accessibility_rule_visible.len();
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return state.link_visible.len();
@@ -4860,6 +5588,12 @@ fn active_title(state: &State) -> &'static str {
             StructuredView::Blocks => "Structured data · blocks",
         };
     }
+    if accessibility_view_active(state) {
+        return match state.accessibility_view {
+            AccessibilityView::Pages => "Accessibility · pages",
+            AccessibilityView::Rules => "Accessibility · rules",
+        };
+    }
     match (state.tab, state.sitemap_view) {
         (Tab::Links, _) if state.links_view == LinksView::Evidence => "Link evidence",
         (Tab::Sitemaps, SitemapView::Urls) => "Sitemap URLs",
@@ -4871,6 +5605,9 @@ fn active_title(state: &State) -> &'static str {
 fn search_scope_label(state: &State) -> &'static str {
     if structured_view_active(state) {
         return "URL, literal type or @id, JSON Pointer path, diagnostic text, script ID and declared type";
+    }
+    if accessibility_view_active(state) {
+        return "URL, state, rule, kind, impact, selector, HTML, failure summary and coverage text";
     }
     "URL, title, meta description, H1, canonical, content type and finding text"
 }
@@ -4984,6 +5721,10 @@ fn focus_search_state(state: &mut State) -> bool {
             !state.pages.is_empty()
         } else if structured_blocks_active(state) {
             !state.structured_blocks.is_empty()
+        } else if accessibility_pages_active(state) {
+            !state.pages.is_empty()
+        } else if accessibility_rules_active(state) {
+            !state.accessibility_rule_rows.is_empty()
         } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
             !state.link_rows.is_empty()
         } else if state.tab == Tab::Sitemaps {
@@ -5017,12 +5758,13 @@ fn run_details_panel(k: &Kit, state: &State) -> El {
     if let Some(run) = &state.run {
         lines.push(format!("Seed {}", run.seed));
         lines.push(format!(
-            "{} pages · depth {} · {} · Sitemaps {} · Link checks {}",
+            "{} pages · depth {} · {} · Sitemaps {} · Link checks {} · Accessibility {}",
             run.limits.max_pages,
             run.limits.max_depth,
             run.rendering.label(),
             if run.sitemaps { "on" } else { "off" },
-            if run.check_links { "on" } else { "off" }
+            if run.check_links { "on" } else { "off" },
+            if run.accessibility { "on" } else { "off" }
         ));
         if !run.extraction_rules.is_empty() {
             lines.push(format!(
@@ -6127,6 +6869,43 @@ fn crawl_options_note(k: &Kit, state: &State) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(
+                    Checkbox::new(state.accessibility_checked)
+                        .label("Check accessibility")
+                        .disabled(
+                            state.phase.active()
+                                || state.rendering != RenderMode::Browser,
+                        )
+                        .on_toggle(|state: &mut State| {
+                            state.accessibility_checked ^= true;
+                        })
+                        .build(k)
+                        .key("check-accessibility"),
+                )
+                .child(
+                    text(if state.rendering == RenderMode::Browser {
+                        "Optional local axe-core audit after the rendered capture. Main document and open shadow roots only; no frames, CDN or extra navigation."
+                    } else {
+                        "Requires Browser mode"
+                    })
+                    .font(k.ty.text_xsmall)
+                    .color(k.c.text_muted)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate()
+                    .help(format!(
+                        "axe-core {} ({}) · {} · notices ship with the app",
+                        accessibility::ENGINE_VERSION,
+                        accessibility::ENGINE_LICENSE,
+                        accessibility::ENGINE_SOURCE_URL
+                    )),
+                ),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(
                     Button::new("Custom extraction…")
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
@@ -6580,6 +7359,54 @@ fn overview_findings(k: &Kit, state: &State) -> El {
             },
         ));
     }
+    if counts.accessibility_urls > 0 {
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-accessibility-violations",
+            format!(
+                "{} {} an automated accessibility violation",
+                counts.accessibility_urls,
+                if counts.accessibility_urls == 1 {
+                    "URL has"
+                } else {
+                    "URLs have"
+                }
+            ),
+            "Affected URLs with at least one confirmed axe violation retained in this crawl. Rule occurrences and URLs are counted separately.",
+            |state: &mut State| {
+                state.tab = Tab::Internal;
+                state.internal_view = InternalView::Accessibility;
+                state.accessibility_view = AccessibilityView::Pages;
+                state.accessibility_pages_view.query.replace_text("");
+                state.accessibility_pages_view.filter = CheckFilter::Findings;
+                refresh_visible_forced(state);
+            },
+        ));
+    }
+    if counts.accessibility_review_urls > 0 {
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-accessibility-review",
+            format!(
+                "{} {} accessibility results that need review",
+                counts.accessibility_review_urls,
+                if counts.accessibility_review_urls == 1 {
+                    "URL has"
+                } else {
+                    "URLs have"
+                }
+            ),
+            "Affected URLs with axe incomplete results. Needs review is not a confirmed violation or a pass.",
+            |state: &mut State| {
+                state.tab = Tab::Internal;
+                state.internal_view = InternalView::Accessibility;
+                state.accessibility_view = AccessibilityView::Rules;
+                state.accessibility_rules_view.query.replace_text("");
+                state.accessibility_rules_view.filter = CheckFilter::Incomplete;
+                refresh_visible_forced(state);
+            },
+        ));
+    }
     block.child(rows)
 }
 
@@ -6749,6 +7576,31 @@ fn overview_coverage(k: &Kit, state: &State) -> El {
                 state.structured_subview = StructuredView::Pages;
                 state.structured_pages_view.query.replace_text("");
                 state.structured_pages_view.filter = CheckFilter::Incomplete;
+                refresh_visible_forced(state);
+            },
+        ));
+    }
+    if counts.accessibility_incomplete > 0 && !state.phase.active() {
+        gaps += 1;
+        rows = rows.child(overview_coverage_row(
+            k,
+            "overview-accessibility-incomplete",
+            format!(
+                "{} {} incomplete accessibility coverage",
+                counts.accessibility_incomplete,
+                if counts.accessibility_incomplete == 1 {
+                    "URL has"
+                } else {
+                    "URLs have"
+                }
+            ),
+            "Enabled accessibility scans that failed, timed out, were limited, or retained partial evidence. This is not a zero-violation all-clear.",
+            |state: &mut State| {
+                state.tab = Tab::Internal;
+                state.internal_view = InternalView::Accessibility;
+                state.accessibility_view = AccessibilityView::Pages;
+                state.accessibility_pages_view.query.replace_text("");
+                state.accessibility_pages_view.filter = CheckFilter::Incomplete;
                 refresh_visible_forced(state);
             },
         ));
@@ -7531,14 +8383,19 @@ fn internal_view_controls(k: &Kit, state: &State) -> El {
         .center_y()
         .child(button("URLs", InternalView::Urls, "internal-urls"))
         .child(button(
-            "Duplicate content",
+            "Dupes",
             InternalView::DuplicateContent,
             "internal-duplicates",
         ))
         .child(button(
-            "Structured data",
+            "JSON-LD",
             InternalView::StructuredData,
             "internal-structured",
+        ))
+        .child(button(
+            "Access",
+            InternalView::Accessibility,
+            "internal-accessibility",
         ))
 }
 
@@ -7547,34 +8404,44 @@ fn structured_internal_view_controls(k: &Kit, state: &State) -> El {
         InternalView::Urls => 0,
         InternalView::DuplicateContent => 1,
         InternalView::StructuredData => 2,
+        InternalView::Accessibility => 3,
     };
     row().center_y().child(
-        SegmentedControl::new(&["URLs", "Duplicate", "Structured"], Some(selected))
-            .label("Internal view")
-            .fit()
-            .on_pick(|state: &mut State, index, _tx| {
-                state.internal_view = match index {
-                    0 => InternalView::Urls,
-                    1 => InternalView::DuplicateContent,
-                    _ => InternalView::StructuredData,
-                };
-                if state.internal_view != InternalView::StructuredData {
-                    cancel_structured_refresh(state);
-                }
-                if state.internal_view == InternalView::DuplicateContent
-                    && state.content_phase == ContentPhase::Idle
-                    && !state.pages.is_empty()
-                    && !state.phase.active()
-                {
-                    start_content_analysis(state);
-                }
-                let (column, dir) = state.view().sort.clone();
-                state.table.set_sort(column, dir);
-                refresh_visible_forced(state);
-            })
-            .build(k)
-            .key("internal-menu")
-            .help("Switch between Internal URLs, Duplicate content and Structured data"),
+        SegmentedControl::new(&["URLs", "Dupes", "JSON-LD", "Access"], Some(selected))
+        .label("Internal view")
+        .fit()
+        .on_pick(|state: &mut State, index, _tx| {
+            state.internal_view = match index {
+                0 => InternalView::Urls,
+                1 => InternalView::DuplicateContent,
+                2 => InternalView::StructuredData,
+                _ => InternalView::Accessibility,
+            };
+            if state.internal_view != InternalView::StructuredData {
+                cancel_structured_refresh(state);
+            }
+            if state.internal_view != InternalView::Accessibility {
+                cancel_accessibility_refresh(state);
+            }
+            if state.internal_view == InternalView::DuplicateContent
+                && state.content_phase == ContentPhase::Idle
+                && !state.pages.is_empty()
+                && !state.phase.active()
+            {
+                start_content_analysis(state);
+            }
+            if state.internal_view == InternalView::Accessibility
+                && state.pages.is_empty()
+            {
+                state.accessibility_index_limited = None;
+            }
+            let (column, dir) = state.view().sort.clone();
+            state.table.set_sort(column, dir);
+            refresh_visible_forced(state);
+        })
+        .build(k)
+        .key("internal-menu")
+        .help("Switch between Internal URLs, Duplicate content, Structured data and Accessibility"),
     )
 }
 
@@ -7621,6 +8488,101 @@ fn structured_subview_controls(k: &Kit, state: &State) -> El {
             StructuredView::Blocks,
             "structured-blocks",
         ))
+}
+
+fn accessibility_subview_controls(k: &Kit, state: &State) -> El {
+    let page_count = state.pages.len();
+    let rule_count = state.accessibility_rule_rows.len();
+    let button = |label: String, view: AccessibilityView, key: &'static str| {
+        Button::new(label)
+            .variant(if state.accessibility_view == view {
+                ButtonVariant::Neutral
+            } else {
+                ButtonVariant::Ghost
+            })
+            .control_size(ControlSize::Small)
+            .on_press(move |state: &mut State| {
+                state.accessibility_view = view;
+                state
+                    .table
+                    .set_sort(state.view().sort.0.clone(), state.view().sort.1);
+                refresh_visible_forced(state);
+            })
+            .build(k)
+            .key(key)
+    };
+    row()
+        .gap(1.0)
+        .center_y()
+        .child(button(
+            format!("Pages {page_count}"),
+            AccessibilityView::Pages,
+            "accessibility-pages",
+        ))
+        .child(button(
+            format!("Rules {rule_count}"),
+            AccessibilityView::Rules,
+            "accessibility-rules",
+        ))
+}
+
+fn accessibility_section_header(k: &Kit, state: &State) -> El {
+    let total = state.view_counts.total;
+    let shown = visible_len(state);
+    let noun = match state.accessibility_view {
+        AccessibilityView::Pages => "URLs",
+        AccessibilityView::Rules => "rule groups",
+    };
+    let mut summary = format!("{shown} of {total} {noun}");
+    if state.view_counts.findings > 0 || state.view_counts.incomplete > 0 {
+        summary.push_str(&format!(
+            " · {} violation{} · {} needs review",
+            state.view_counts.findings,
+            if state.view_counts.findings == 1 {
+                ""
+            } else {
+                "s"
+            },
+            state.view_counts.incomplete
+        ));
+    }
+    if state.accessibility_refresh.is_some() {
+        summary.push_str(" · refreshing…");
+    }
+    if state.accessibility_index_limited.is_some() {
+        summary.push_str(" · limited");
+    }
+    let mut help = format!(
+        "{} · {}",
+        accessibility::SCOPE_NOTE,
+        state.view().filter.help()
+    );
+    if let Some(reason) = &state.accessibility_index_limited {
+        help.push_str(" · ");
+        help.push_str(reason);
+    }
+    row()
+        .w_full()
+        .h(40.0)
+        .px(GUTTER)
+        .center_y()
+        .gap(3.0)
+        .child(accessibility_subview_controls(k, state))
+        .child(
+            text(summary)
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate()
+                .help(help),
+        )
+        .child(structured_internal_view_controls(k, state))
+        .children(search_field(k, state))
+        .child(check_filter(k, state))
+        .child(export_button(k, state, shown))
+        .child(copy_urls_button(k, state, shown))
+        .child(details_toggle(k, state))
 }
 
 fn structured_status_detail(state: &State) -> String {
@@ -7706,14 +8668,14 @@ fn structured_section_header(k: &Kit, state: &State) -> El {
         .h(40.0)
         .px(GUTTER)
         .center_y()
-        .gap(6.0)
+        .gap(3.0)
         .child(structured_subview_controls(k, state))
         .child(
             text(summary.clone())
                 .font(k.ty.text_xsmall)
                 .color(k.c.text_muted)
                 .grow(1.0)
-                .min_w(40.0)
+                .min_w(0.0)
                 .truncate()
                 .help(help),
         )
@@ -7840,6 +8802,9 @@ fn section_header(k: &Kit, state: &State) -> El {
     if structured_view_active(state) {
         return structured_section_header(k, state);
     }
+    if accessibility_view_active(state) {
+        return accessibility_section_header(k, state);
+    }
     let total = state.view_counts.total;
     let shown = visible_len(state);
     let query_active = !state.view().query.text.trim().is_empty();
@@ -7867,7 +8832,7 @@ fn section_header(k: &Kit, state: &State) -> El {
         .h(40.0)
         .px(GUTTER)
         .center_y()
-        .gap(10.0)
+        .gap(8.0)
         .children(if state.tab == Tab::Links {
             vec![links_view_controls(k, state)]
         } else {
@@ -7999,6 +8964,10 @@ fn search_field(k: &Kit, state: &State) -> Option<El> {
             !state.pages.is_empty()
         } else if structured_blocks_active(state) {
             !state.structured_blocks.is_empty()
+        } else if accessibility_pages_active(state) {
+            !state.pages.is_empty()
+        } else if accessibility_rules_active(state) {
+            !state.accessibility_rule_rows.is_empty()
         } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
             !state.link_rows.is_empty()
         } else if state.tab == Tab::Sitemaps {
@@ -8016,11 +8985,13 @@ fn search_field(k: &Kit, state: &State) -> Option<El> {
         rune_kit::TextInput::new(&state.view().query)
             .plain()
             .height(28.0)
-            .width(Some(if structured_view_active(state) {
-                132.0
-            } else {
-                160.0
-            }))
+            .width(Some(
+                if structured_view_active(state) || accessibility_view_active(state) {
+                    96.0
+                } else {
+                    160.0
+                },
+            ))
             .leading_icon(k.glyph.search)
             .leading_icon_size(14.0)
             .text_style(TextStyle::new(11.5, 400.0).lh(16.0))
@@ -8301,6 +9272,30 @@ fn visible_ids(state: &State) -> Vec<String> {
                     .map(|item| item.url.clone()),
             })
             .collect();
+    }
+    if accessibility_pages_active(state) {
+        return state
+            .accessibility_pages_visible
+            .iter()
+            .filter_map(|index| state.pages.get(*index).map(|page| page.url.clone()))
+            .collect();
+    }
+    if accessibility_rules_active(state) {
+        let mut urls = Vec::new();
+        let mut seen = HashSet::new();
+        for row in &state.accessibility_rule_visible {
+            let Some(rule) = state.accessibility_rule_rows.get(*row) else {
+                continue;
+            };
+            for page in &rule.affected {
+                if let Some(page) = state.pages.get(*page)
+                    && seen.insert(page.url.clone())
+                {
+                    urls.push(page.url.clone());
+                }
+            }
+        }
+        return urls;
     }
     if structured_view_active(state) {
         return (0..visible_len(state))
@@ -9382,6 +10377,589 @@ fn estimate_structured_export_bytes(source: &StructuredExportSource) -> usize {
     row_cost.saturating_mul(3).saturating_add(8_192)
 }
 
+fn accessibility_export_context(state: &State) -> Vec<String> {
+    let run = state.run.as_ref();
+    vec![
+        run.map(|run| run.seed.clone()).unwrap_or_default(),
+        run.map(|run| run.started_utc.clone()).unwrap_or_default(),
+        run.map(|run| run.rendering.label())
+            .unwrap_or("HTML")
+            .to_string(),
+    ]
+}
+
+fn accessibility_export_source(state: &State) -> Option<AccessibilityExportSource> {
+    let view = state.accessibility_view;
+    let pages = state
+        .pages
+        .iter()
+        .map(|page| (page.url.clone(), page.accessibility.clone()))
+        .collect::<Vec<_>>();
+    let (pages_visible, rules, slug) = match view {
+        AccessibilityView::Pages => (
+            state.accessibility_pages_visible.clone(),
+            Vec::new(),
+            "accessibility-pages",
+        ),
+        AccessibilityView::Rules => (
+            Vec::new(),
+            state
+                .accessibility_rule_visible
+                .iter()
+                .filter_map(|index| state.accessibility_rule_rows.get(*index).cloned())
+                .collect::<Vec<_>>(),
+            "accessibility-rules",
+        ),
+    };
+    if (view == AccessibilityView::Pages && pages_visible.is_empty())
+        || (view == AccessibilityView::Rules && rules.is_empty())
+    {
+        return None;
+    }
+    Some(AccessibilityExportSource {
+        view,
+        pages,
+        pages_visible,
+        rules,
+        context: accessibility_export_context(state),
+        slug,
+    })
+}
+
+const ACCESSIBILITY_COVERAGE_HEADERS: &[&str] = &[
+    "URL",
+    "EXECUTION",
+    "REASON",
+    "ENGINE",
+    "PROFILE",
+    "VIEWPORT",
+    "BROWSER",
+    "SCANNED UTC",
+    "VIOLATION OCCURRENCES",
+    "NEEDS REVIEW OCCURRENCES",
+    "MAX IMPACT",
+    "RULES RETAINED",
+    "SELECTED RULES",
+    "PREFLIGHT ELEMENTS",
+    "ELEMENT LIMIT",
+    "RULES REPORTED",
+    "NODES RETAINED",
+    "NODES REPORTED",
+    "PAYLOAD BYTES",
+    "PAYLOAD LIMITED",
+    "COVERAGE LIMITED",
+    "ZERO-VIOLATION ALL CLEAR",
+    "SCOPE",
+    "CRAWL SEED",
+    "RUN STARTED UTC",
+    "CAPTURE MODE",
+    "RETURNED RULES",
+    "RETURNED RULES TRUNCATED",
+];
+
+const ACCESSIBILITY_OCCURRENCE_HEADERS: &[&str] = &[
+    "URL",
+    "RULE ID",
+    "OUTCOME",
+    "TITLE",
+    "IMPACT",
+    "HELP URL",
+    "ORDINAL",
+    "TARGET",
+    "TARGET TRUNCATED",
+    "ELEMENT HTML",
+    "HTML TRUNCATED",
+    "FAILURE SUMMARY",
+    "FAILURE TRUNCATED",
+    "RULE NODES REPORTED",
+    "RULE NODES TRUNCATED",
+    "ENGINE",
+    "PROFILE",
+    "VIEWPORT",
+    "SCOPE",
+    "CRAWL SEED",
+    "RUN STARTED UTC",
+    "CAPTURE MODE",
+    "RULE FIELDS TRUNCATED",
+    "RULE TAGS TRUNCATED",
+    "PAGE EXECUTION",
+    "PAGE REASON",
+    "PAGE COVERAGE LIMITED",
+    "PAGE RULES TRUNCATED",
+    "PAGE NODES TRUNCATED",
+    "PAGE BUDGET LIMITED",
+    "PAGE RUN LIMITED",
+    "PAGE PAYLOAD LIMITED",
+    "PAGE COVERAGE NOTES",
+];
+
+fn accessibility_page_fields(
+    url: &str,
+    report: &accessibility::Report,
+    context: &[String],
+) -> Vec<String> {
+    let scan = &report.scan;
+    vec![
+        url.to_string(),
+        report.state().label().to_string(),
+        scan.reason.clone(),
+        scan.engine_version.clone(),
+        scan.profile.clone(),
+        scan.viewport.label(),
+        scan.browser.clone(),
+        if scan.scanned_at == 0 {
+            String::new()
+        } else {
+            inventory::format_utc(scan.scanned_at)
+        },
+        report.violation_occurrences().to_string(),
+        report.needs_review_occurrences().to_string(),
+        report.max_impact().label().to_string(),
+        scan.coverage.rules_retained.to_string(),
+        format!(
+            "{}{}",
+            scan.selected_rules.len(),
+            if scan.selected_rules_truncated {
+                " (truncated)"
+            } else {
+                ""
+            }
+        ),
+        scan.preflight_elements
+            .map(|count| count.to_string())
+            .unwrap_or_default(),
+        scan.coverage.elements_limit.to_string(),
+        scan.coverage
+            .rules_reported
+            .map(|count| count.to_string())
+            .unwrap_or_default(),
+        scan.coverage.nodes_retained.to_string(),
+        scan.coverage
+            .nodes_reported
+            .map(|count| count.to_string())
+            .unwrap_or_default(),
+        scan.coverage.payload_bytes.to_string(),
+        yes_no(scan.coverage.payload_limited),
+        yes_no(report.has_coverage_gap()),
+        yes_no(report.zero_violation_all_clear()),
+        accessibility::SCOPE_NOTE.to_string(),
+        context.first().cloned().unwrap_or_default(),
+        context.get(1).cloned().unwrap_or_default(),
+        context.get(2).cloned().unwrap_or_default(),
+        scan.returned_rules.len().to_string(),
+        yes_no(scan.returned_rules_truncated),
+    ]
+}
+
+/// A budget-limited rule keeps no node row, so its known affected pages become explicit
+/// page-level summary rows. If attribution is unavailable, keep one blank-URL row rather than
+/// silently dropping the group from the export.
+fn accessibility_summary_rows<'a>(
+    rule: &'a AccessibilityRuleRow,
+    pages: &'a [(String, Arc<accessibility::Report>)],
+) -> Vec<(&'a str, Option<&'a accessibility::Report>)> {
+    if rule.affected.is_empty() {
+        return vec![("", None)];
+    }
+    rule.affected
+        .iter()
+        .map(|page| {
+            pages
+                .get(*page)
+                .map(|(url, report)| (url.as_str(), Some(report.as_ref())))
+                .unwrap_or(("", None))
+        })
+        .collect()
+}
+
+fn accessibility_occurrence_fields(
+    url: &str,
+    rule: &AccessibilityRuleRow,
+    node: Option<&accessibility::NodeOccurrence>,
+    report: Option<&accessibility::Report>,
+    context: &[String],
+) -> Vec<String> {
+    let target = node
+        .map(|node| serde_json::to_string(&node.target).unwrap_or_default())
+        .unwrap_or_default();
+    let scan = report.map(|report| &report.scan);
+    vec![
+        url.to_string(),
+        rule.rule_id.clone(),
+        rule.kind.label().to_string(),
+        rule.title.clone(),
+        rule.impact.label().to_string(),
+        rule.help_url.clone(),
+        node.map(|node| node.ordinal.to_string())
+            .unwrap_or_default(),
+        target,
+        yes_no(node.is_some_and(|node| node.target_truncated)),
+        node.map(|node| node.html.clone()).unwrap_or_default(),
+        yes_no(node.is_some_and(|node| node.html_truncated)),
+        node.map(|node| node.failure.clone()).unwrap_or_default(),
+        yes_no(node.is_some_and(|node| node.failure_truncated)),
+        rule.nodes_reported.to_string(),
+        yes_no(rule.nodes_truncated),
+        accessibility::ENGINE_VERSION.to_string(),
+        accessibility::PROFILE_ID.to_string(),
+        report
+            .map(|report| report.scan.viewport.label())
+            .unwrap_or_default(),
+        accessibility::SCOPE_NOTE.to_string(),
+        context.first().cloned().unwrap_or_default(),
+        context.get(1).cloned().unwrap_or_default(),
+        context.get(2).cloned().unwrap_or_default(),
+        yes_no(rule.fields_truncated),
+        yes_no(rule.tags_truncated),
+        report
+            .map(|report| report.state().label())
+            .unwrap_or_default()
+            .to_string(),
+        scan.map(|scan| scan.reason.clone()).unwrap_or_default(),
+        yes_no(report.is_some_and(accessibility::Report::has_coverage_gap)),
+        yes_no(scan.is_some_and(|scan| scan.coverage.rules_truncated)),
+        yes_no(scan.is_some_and(|scan| scan.coverage.nodes_truncated)),
+        yes_no(scan.is_some_and(|scan| scan.coverage.budget_limited)),
+        yes_no(scan.is_some_and(|scan| scan.coverage.run_limited)),
+        yes_no(scan.is_some_and(|scan| scan.coverage.payload_limited)),
+        scan.map(|scan| scan.coverage.notes.join("\n"))
+            .unwrap_or_default(),
+    ]
+}
+
+fn yes_no(value: bool) -> String {
+    if value { "yes".into() } else { String::new() }
+}
+
+fn accessibility_row_cost(fields: &[String]) -> usize {
+    fields
+        .iter()
+        .map(|value| accessibility::csv_field_len(value).saturating_add(8))
+        .sum::<usize>()
+        .saturating_add(32)
+}
+
+fn push_accessibility_export_row(
+    rows: &mut Vec<Vec<String>>,
+    row: Vec<String>,
+    used: &mut usize,
+    max_bytes: usize,
+) -> bool {
+    let cost = accessibility_row_cost(&row);
+    let Some(next) = used.checked_add(cost) else {
+        return false;
+    };
+    if next > max_bytes {
+        return false;
+    }
+    *used = next;
+    rows.push(row);
+    true
+}
+
+fn estimate_accessibility_export_bytes(source: &AccessibilityExportSource) -> usize {
+    let mut rows_cost = 0_usize;
+    match source.view {
+        AccessibilityView::Pages => {
+            for index in &source.pages_visible {
+                let Some((url, report)) = source.pages.get(*index) else {
+                    continue;
+                };
+                rows_cost = rows_cost.saturating_add(accessibility_row_cost(
+                    &accessibility_page_fields(url, report, &source.context),
+                ));
+            }
+        }
+        AccessibilityView::Rules => {
+            for rule in &source.rules {
+                if rule.occurrences.is_empty() {
+                    for (url, report) in accessibility_summary_rows(rule, &source.pages) {
+                        rows_cost = rows_cost.saturating_add(accessibility_row_cost(
+                            &accessibility_occurrence_fields(
+                                url,
+                                rule,
+                                None,
+                                report,
+                                &source.context,
+                            ),
+                        ));
+                    }
+                } else {
+                    for (page, rule_index, node_index) in &rule.occurrences {
+                        let Some((url, report)) = source.pages.get(*page) else {
+                            continue;
+                        };
+                        let node = report
+                            .scan
+                            .rules
+                            .get(*rule_index)
+                            .and_then(|rule| rule.nodes.get(*node_index));
+                        rows_cost = rows_cost.saturating_add(accessibility_row_cost(
+                            &accessibility_occurrence_fields(
+                                url,
+                                rule,
+                                node,
+                                Some(report),
+                                &source.context,
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let snapshot_cost = source
+        .pages
+        .iter()
+        .map(|(url, _)| url.len().saturating_add(64))
+        .sum::<usize>()
+        .saturating_add(source.pages_visible.len().saturating_mul(8))
+        .saturating_add(
+            source
+                .rules
+                .iter()
+                .map(|rule| {
+                    256usize
+                        .saturating_add(rule.key.len())
+                        .saturating_add(rule.rule_id.len())
+                        .saturating_add(rule.title.len())
+                        .saturating_add(rule.help_url.len())
+                        .saturating_add(rule.affected.len().saturating_mul(8))
+                        .saturating_add(rule.occurrences.len().saturating_mul(24))
+                })
+                .sum::<usize>(),
+        );
+    snapshot_cost
+        .saturating_add(rows_cost.saturating_mul(2))
+        .saturating_add(4096)
+}
+
+fn accessibility_export_rows(
+    source: &AccessibilityExportSource,
+    max_bytes: usize,
+    cancel: &AtomicBool,
+) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let headers = match source.view {
+        AccessibilityView::Pages => ACCESSIBILITY_COVERAGE_HEADERS,
+        AccessibilityView::Rules => ACCESSIBILITY_OCCURRENCE_HEADERS,
+    }
+    .iter()
+    .map(|header| (*header).to_string())
+    .collect::<Vec<_>>();
+    let mut used = 0_usize;
+    let mut rows = Vec::new();
+    match source.view {
+        AccessibilityView::Pages => {
+            for index in &source.pages_visible {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let Some((url, report)) = source.pages.get(*index) else {
+                    continue;
+                };
+                if !push_accessibility_export_row(
+                    &mut rows,
+                    accessibility_page_fields(url, report, &source.context),
+                    &mut used,
+                    max_bytes,
+                ) {
+                    return None;
+                }
+            }
+        }
+        AccessibilityView::Rules => {
+            for rule in &source.rules {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if rule.occurrences.is_empty() {
+                    for (url, report) in accessibility_summary_rows(rule, &source.pages) {
+                        if !push_accessibility_export_row(
+                            &mut rows,
+                            accessibility_occurrence_fields(
+                                url,
+                                rule,
+                                None,
+                                report,
+                                &source.context,
+                            ),
+                            &mut used,
+                            max_bytes,
+                        ) {
+                            return None;
+                        }
+                    }
+                    continue;
+                }
+                for (page, rule_index, node_index) in &rule.occurrences {
+                    if cancel.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    let Some((url, report)) = source.pages.get(*page) else {
+                        continue;
+                    };
+                    let node = report
+                        .scan
+                        .rules
+                        .get(*rule_index)
+                        .and_then(|rule| rule.nodes.get(*node_index));
+                    if !push_accessibility_export_row(
+                        &mut rows,
+                        accessibility_occurrence_fields(
+                            url,
+                            rule,
+                            node,
+                            Some(report),
+                            &source.context,
+                        ),
+                        &mut used,
+                        max_bytes,
+                    ) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    Some((headers, rows))
+}
+
+fn start_accessibility_export(state: &mut State) -> bool {
+    start_accessibility_export_with_gate(state, None)
+}
+
+fn start_accessibility_export_with_gate(state: &mut State, pause: Option<Arc<WorkerGate>>) -> bool {
+    if export_lifecycle_busy(state) {
+        state.export_notice = Some(Err(
+            "Another export is already being prepared or written.".into()
+        ));
+        return false;
+    }
+    if state.accessibility_refresh.is_some() {
+        state.export_notice = Some(Err(
+            "The accessibility view is still refreshing; try Export again when it finishes.".into(),
+        ));
+        return false;
+    }
+    let Some(source) = accessibility_export_source(state) else {
+        return false;
+    };
+    let estimate = estimate_accessibility_export_bytes(&source);
+    if estimate > state.accessibility_budget.remaining()
+        || !state.accessibility_budget.try_reserve(estimate, 0)
+    {
+        state.export_notice = Some(Err(
+            "This export would exceed the 64 MiB accessibility evidence budget; narrow the visible scope first."
+                .into(),
+        ));
+        return false;
+    }
+    let epoch = state.pages_epoch;
+    let lease = AccessibilityLease::new(state.accessibility_budget.clone(), estimate);
+    let worker_lease = lease.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let (tx, rx) = mpsc::channel();
+    let waker = state.waker.clone();
+    let scope = match source.view {
+        AccessibilityView::Pages => "visible accessibility page coverage",
+        AccessibilityView::Rules => "visible accessibility rule occurrences",
+    }
+    .to_string();
+    state.accessibility_export_job = Some(AccessibilityExportJob {
+        rx,
+        cancel,
+        epoch,
+        lease,
+    });
+    state.export_notice = Some(Ok(format!(
+        "Preparing accessibility CSV · {} visible {}…",
+        match source.view {
+            AccessibilityView::Pages => source.pages_visible.len(),
+            AccessibilityView::Rules => source.rules.len(),
+        },
+        match source.view {
+            AccessibilityView::Pages => "pages",
+            AccessibilityView::Rules => "rule groups",
+        }
+    )));
+    std::thread::spawn(move || {
+        let _worker_lease = worker_lease;
+        if let Some(gate) = pause {
+            gate.wait();
+        }
+        let prepared = accessibility_export_rows(&source, estimate, &worker_cancel).and_then(
+            |(headers, rows)| {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let header_refs = headers.iter().map(String::as_str).collect::<Vec<_>>();
+                let csv =
+                    calmtoad::export::to_csv_cancellable(&header_refs, &rows, &worker_cancel)?;
+                Some(PreparedAccessibilityExport {
+                    csv,
+                    row_count: rows.len(),
+                    scope: scope.clone(),
+                    slug: source.slug,
+                })
+            },
+        );
+        let _ = tx.send(match prepared {
+            Some(prepared) => Ok(prepared),
+            None if worker_cancel.load(Ordering::Relaxed) => Err(String::new()),
+            None => Err(
+                "Accessibility CSV preparation exceeded its reserved estimate; narrow the visible scope first."
+                    .into(),
+            ),
+        });
+        if let Some(wake) = &waker {
+            wake();
+        }
+    });
+    true
+}
+
+fn poll_accessibility_export(state: &mut State, tx: &mut Tx) -> bool {
+    let Some(job) = state.accessibility_export_job.take() else {
+        return false;
+    };
+    match job.rx.try_recv() {
+        Ok(Ok(prepared)) => {
+            if job.epoch != state.pages_epoch {
+                return false;
+            }
+            save_prepared_csv(
+                state,
+                tx,
+                prepared.csv,
+                prepared.row_count,
+                prepared.scope,
+                prepared.slug,
+                true,
+                "accessibility",
+                Some(ExportLease::Accessibility(job.lease)),
+            );
+            true
+        }
+        Ok(Err(message)) => {
+            if !message.is_empty() {
+                state.export_notice = Some(Err(message));
+            }
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            state.accessibility_export_job = Some(job);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            state.export_notice = Some(Err(
+                "Accessibility CSV preparation stopped without a result.".into(),
+            ));
+            true
+        }
+    }
+}
+
 fn structured_export_snapshot_estimate(state: &State) -> usize {
     let row_overhead = std::mem::size_of::<StructuredExportRow>() + 32;
     match state.structured_subview {
@@ -9520,7 +11098,7 @@ fn poll_structured_export(state: &mut State, tx: &mut Tx) -> bool {
                 prepared.slug,
                 true,
                 "structured-data",
-                Some(job.lease),
+                Some(ExportLease::Structured(job.lease)),
             );
             true
         }
@@ -9560,6 +11138,10 @@ fn export_csv(state: &mut State, tx: &mut Tx) {
     }
     if structured_view_active(state) {
         let _ = start_structured_export(state);
+        return;
+    }
+    if accessibility_view_active(state) {
+        let _ = start_accessibility_export(state);
         return;
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
@@ -9729,7 +11311,7 @@ fn save_prepared_csv(
     slug: &'static str,
     background_write: bool,
     row_label: &'static str,
-    lease: Option<LedgerLease>,
+    lease: Option<ExportLease>,
 ) {
     if export_lifecycle_busy(state) {
         state.export_notice = Some(Err(
@@ -10092,6 +11674,10 @@ fn results(k: &Kit, state: &State) -> El {
             !state.pages.is_empty()
         } else if structured_blocks_active(state) {
             !state.structured_blocks.is_empty()
+        } else if accessibility_pages_active(state) {
+            !state.pages.is_empty()
+        } else if accessibility_rules_active(state) {
+            !state.accessibility_rule_rows.is_empty()
         } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
             !state.link_rows.is_empty()
         } else if state.tab == Tab::Sitemaps {
@@ -10324,6 +11910,44 @@ fn empty(k: &Kit, state: &State) -> El {
                 )
             }
         }
+    } else if accessibility_pages_active(state) {
+        if state.phase.active() {
+            (
+                "Collecting accessibility evidence".to_string(),
+                "Pages appear as captures finish. Audits run only after a successful Browser render; HTML captures are not audited.".to_string(),
+            )
+        } else if state.pages.is_empty() {
+            (
+                "Crawl a site".to_string(),
+                "Turn on Check accessibility with Browser mode, then crawl to audit rendered pages.".to_string(),
+            )
+        } else if state
+            .pages
+            .iter()
+            .all(|page| page.accessibility.state() == accessibility::ExecutionState::NotRequested)
+        {
+            (
+                "Accessibility checks are off".to_string(),
+                "Turn on Check accessibility in the crawl options and use Browser mode. Existing HTML or off-mode captures were not audited.".to_string(),
+            )
+        } else {
+            (
+                "No accessibility rows".to_string(),
+                "Every captured URL is listed here, including pages where the check was unavailable, limited or failed.".to_string(),
+            )
+        }
+    } else if accessibility_rules_active(state) {
+        if state.phase.active() {
+            (
+                "Collecting accessibility rule groups".to_string(),
+                "Rule and result-kind groups appear as audited captures finish.".to_string(),
+            )
+        } else {
+            (
+                "No accessibility rule groups".to_string(),
+                "No retained violation or needs-review groups match the current filter. Pages still lists coverage and unavailable checks.".to_string(),
+            )
+        }
     } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         if state.phase.active() {
             (
@@ -10476,6 +12100,9 @@ fn table(k: &Kit, state: &State) -> El {
     }
     if structured_view_active(state) {
         return structured_table(k, state);
+    }
+    if accessibility_view_active(state) {
+        return accessibility_table(k, state);
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return link_table(k, state);
@@ -10829,6 +12456,184 @@ fn content_table(k: &Kit, state: &State) -> El {
             },
         )
         .build(state, k)
+}
+
+fn accessibility_table(k: &Kit, state: &State) -> El {
+    let kit = k.clone();
+    let mut table = Table::new(
+        |state: &State| &state.table,
+        |state: &mut State| &mut state.table,
+        |state: &State| visible_len(state),
+        |state: &State, row| Cow::Borrowed(visible_id_ref(state, row).unwrap_or("")),
+    )
+    .name(active_title(state))
+    .style(structured_table_style(k))
+    .zebra(false)
+    .on_sort(|state: &mut State, column, direction, _| {
+        state.view_mut().sort = (column.to_string(), direction);
+        state.table.set_sort(column, direction);
+        refresh_visible_forced(state);
+    })
+    .on_select(|state: &mut State, id, _tx| {
+        state.view_mut().selected = Some(id.to_string());
+        state.details_open = true;
+    });
+    table = match state.accessibility_view {
+        AccessibilityView::Pages => table
+            .column(
+                TableColumn::new("url", "URL")
+                    .flex(2.2)
+                    .min(120.0)
+                    .sortable(),
+            )
+            .column(TableColumn::new("state", "STATE").width(96.0).sortable())
+            .column(
+                TableColumn::new("violations", "VIOLATIONS")
+                    .width(94.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("review", "REVIEW")
+                    .width(80.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("impact", "MAX IMPACT")
+                    .width(104.0)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("coverage", "COVERAGE")
+                    .width(120.0)
+                    .sortable(),
+            ),
+        AccessibilityView::Rules => table
+            .column(
+                TableColumn::new("rule", "RULE")
+                    .flex(1.6)
+                    .min(120.0)
+                    .sortable(),
+            )
+            .column(TableColumn::new("kind", "OUTCOME").width(104.0).sortable())
+            .column(TableColumn::new("impact", "IMPACT").width(92.0).sortable())
+            .column(
+                TableColumn::new("urls", "AFFECTED URLS")
+                    .width(112.0)
+                    .align(Align::End)
+                    .sortable(),
+            )
+            .column(
+                TableColumn::new("occurrences", "OCCURRENCES")
+                    .width(112.0)
+                    .align(Align::End)
+                    .sortable(),
+            ),
+    };
+    let view = state.accessibility_view;
+    table
+        .cell(move |state: &State, row, column| match view {
+            AccessibilityView::Pages => {
+                let Some(page) = state
+                    .accessibility_pages_visible
+                    .get(row)
+                    .and_then(|index| state.pages.get(*index))
+                else {
+                    return Cell::text("");
+                };
+                accessibility_page_cell(&kit, page, column)
+            }
+            AccessibilityView::Rules => {
+                let Some(index) = state.accessibility_rule_visible.get(row) else {
+                    return Cell::text("");
+                };
+                let Some(rule) = state.accessibility_rule_rows.get(*index) else {
+                    return Cell::text("");
+                };
+                accessibility_rule_cell(&kit, rule, column)
+            }
+        })
+        .build(state, k)
+}
+
+fn accessibility_page_cell(k: &Kit, page: &Page, column: &str) -> Cell {
+    let report = &page.accessibility;
+    match column {
+        "url" => Cell::text(page.url.clone()),
+        "state" => {
+            let label = report.state().label();
+            if matches!(
+                report.state(),
+                accessibility::ExecutionState::Failed | accessibility::ExecutionState::TimedOut
+            ) {
+                Cell::text(label).color(k.c.danger.fg)
+            } else if report.state().coverage_gap() {
+                Cell::text(label).color(k.c.warning.fg)
+            } else {
+                Cell::text(label).muted()
+            }
+        }
+        "violations" => {
+            let count = report.violation_occurrences();
+            let suffix = if report.scan.coverage.nodes_truncated {
+                "+"
+            } else {
+                ""
+            };
+            if count > 0 {
+                Cell::text(format!("{count}{suffix}")).color(k.c.danger.fg)
+            } else {
+                Cell::text(format!("{count}{suffix}")).mono().muted()
+            }
+        }
+        "review" => {
+            let count = report.needs_review_occurrences();
+            let suffix = if report.scan.coverage.nodes_truncated {
+                "+"
+            } else {
+                ""
+            };
+            if count > 0 {
+                Cell::text(format!("{count}{suffix}")).color(k.c.warning.fg)
+            } else {
+                Cell::text(format!("{count}{suffix}")).mono().muted()
+            }
+        }
+        "impact" => Cell::text(report.max_impact().label()).muted(),
+        "coverage" => {
+            let label = report.state().label();
+            if report.state().coverage_gap() {
+                Cell::text(label).color(k.c.warning.fg)
+            } else {
+                Cell::text(label).muted()
+            }
+        }
+        _ => Cell::text(""),
+    }
+}
+
+fn accessibility_rule_cell(k: &Kit, rule: &AccessibilityRuleRow, column: &str) -> Cell {
+    match column {
+        "rule" => Cell::text(rule.rule_id.clone()),
+        "kind" => match rule.kind {
+            accessibility::ResultKind::Violation => {
+                Cell::text(rule.kind.label()).color(k.c.danger.fg)
+            }
+            accessibility::ResultKind::NeedsReview => {
+                Cell::text(rule.kind.label()).color(k.c.warning.fg)
+            }
+        },
+        "impact" => Cell::text(rule.impact.label()).muted(),
+        "urls" => Cell::text(rule.affected.len().to_string()).mono(),
+        "occurrences" => Cell::text(format!(
+            "{}{}",
+            accessibility_rule_occurrence_count(rule),
+            if rule.nodes_truncated { "+" } else { "" }
+        ))
+        .mono(),
+        _ => Cell::text(""),
+    }
 }
 
 fn structured_table(k: &Kit, state: &State) -> El {
@@ -11979,12 +13784,483 @@ fn selected_page(state: &State) -> Option<&Page> {
         .and_then(|id| page_by_url(state, id))
 }
 
+enum AccessibilitySelection<'a> {
+    Page(&'a Page),
+    Rule(&'a AccessibilityRuleRow),
+}
+
+fn selected_accessibility(state: &State) -> Option<AccessibilitySelection<'_>> {
+    let id = state.view().selected.as_deref()?;
+    let row = (0..visible_len(state)).find(|row| visible_id_ref(state, *row) == Some(id))?;
+    match state.accessibility_view {
+        AccessibilityView::Pages => {
+            let index = *state.accessibility_pages_visible.get(row)?;
+            state.pages.get(index).map(AccessibilitySelection::Page)
+        }
+        AccessibilityView::Rules => {
+            let index = *state.accessibility_rule_visible.get(row)?;
+            state
+                .accessibility_rule_rows
+                .get(index)
+                .map(AccessibilitySelection::Rule)
+        }
+    }
+}
+
+fn open_accessibility_page(state: &mut State, url: String) {
+    state.internal_view = InternalView::Accessibility;
+    state.accessibility_view = AccessibilityView::Pages;
+    state.accessibility_pages_view.query.replace_text("");
+    state.accessibility_pages_view.filter = CheckFilter::All;
+    state.accessibility_pages_view.selected = Some(url);
+    let (column, direction) = state.accessibility_pages_view.sort.clone();
+    state.table.set_sort(column, direction);
+    refresh_visible_forced(state);
+}
+
+fn accessibility_detail(k: &Kit, state: &State) -> El {
+    let panel = col()
+        .key("detail")
+        .w(320.0)
+        .h_full()
+        .gap(10.0)
+        .px(14.0)
+        .py(12.0)
+        .border_sides([0.0, 0.0, 0.0, 1.0], k.c.border_weak);
+    let Some(selection) = selected_accessibility(state) else {
+        return panel.child(micro(k, "Accessibility")).child(
+            text("Select a page or rule group to inspect its automated accessibility evidence.")
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        );
+    };
+    let primary = match &selection {
+        AccessibilitySelection::Page(page) => page.url.clone(),
+        AccessibilitySelection::Rule(rule) => format!("{} · {}", rule.kind.label(), rule.rule_id),
+    };
+    let position = state
+        .table
+        .cursor()
+        .and_then(|id| (0..visible_len(state)).find(|row| visible_id_ref(state, *row) == Some(id)));
+    let prev = Button::new("Previous")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(position.is_none_or(|position| position == 0))
+        .on_press_tx(|state: &mut State, tx: &mut Tx| move_selection(state, tx, -1))
+        .build(k)
+        .key("detail-prev");
+    let next = Button::new("Next")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(position.is_none_or(|position| position + 1 >= visible_len(state)))
+        .on_press_tx(|state: &mut State, tx: &mut Tx| move_selection(state, tx, 1))
+        .build(k)
+        .key("detail-next");
+    let close = IconButton::new(k.glyph.close)
+        .variant(IconButtonVariant::GhostMuted)
+        .label("Close accessibility details")
+        .on_press(|state: &mut State| state.details_open = false)
+        .build(k)
+        .key("detail-close");
+    let mut body = col()
+        .key("accessibility-detail-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(10.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+    match selection {
+        AccessibilitySelection::Page(page) => {
+            let report = &page.accessibility;
+            let scan = &report.scan;
+            body = body
+                .child(
+                    text("Accessibility page evidence")
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_base),
+                )
+                .child(value_with_copy(k, "URL", &page.url, "Copy URL"))
+                .child(value_with_copy(
+                    k,
+                    "Execution",
+                    report.state().label(),
+                    "Copy execution state",
+                ));
+            if !scan.reason.is_empty() {
+                body = body.child(muted_note(k, &scan.reason));
+            }
+            body = body
+                .child(value_with_copy(
+                    k,
+                    "Engine",
+                    &format!("axe {} · {}", scan.engine_version, scan.profile),
+                    "Copy engine profile",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Viewport",
+                    &scan.viewport.label(),
+                    "Copy viewport",
+                ));
+            if !scan.browser.is_empty() {
+                body = body.child(value_with_copy(k, "Browser", &scan.browser, "Copy browser"));
+            }
+            if scan.scanned_at > 0 {
+                body = body.child(value_with_copy(
+                    k,
+                    "Scanned",
+                    &inventory::format_utc(scan.scanned_at),
+                    "Copy scan time",
+                ));
+            }
+            body = body.child(value_with_copy(
+                k,
+                "Outcome rules",
+                &format!(
+                    "{} violation · {} needs review · {} pass · {} inapplicable",
+                    scan.outcome.violation_rules,
+                    scan.outcome.incomplete_rules,
+                    scan.outcome.pass_rules,
+                    scan.outcome.inapplicable_rules
+                ),
+                "Copy outcome summary",
+            ));
+            body = body.child(value_with_copy(
+                k,
+                "Coverage",
+                &format!(
+                    "{} elements · {} rules retained{} · {} occurrences retained{}{}",
+                    scan.preflight_elements
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    scan.coverage.rules_retained,
+                    scan.coverage
+                        .rules_reported
+                        .map(|count| format!(" of {count}"))
+                        .unwrap_or_default(),
+                    scan.coverage.nodes_retained,
+                    scan.coverage
+                        .nodes_reported
+                        .map(|count| format!(" of {count}"))
+                        .unwrap_or_default(),
+                    if scan.coverage.has_gap() {
+                        " · coverage limited"
+                    } else {
+                        ""
+                    }
+                ),
+                "Copy coverage",
+            ));
+            if report.zero_violation_all_clear() {
+                body = body.child(
+                    text("No automated violations found within the declared scope.")
+                        .font(k.ty.text_small)
+                        .color(k.c.success.fg)
+                        .wrap()
+                        .w_full(),
+                );
+            }
+            for note in &scan.coverage.notes {
+                body = body.child(muted_note(k, note));
+            }
+            if !scan.selected_rules.is_empty() {
+                body = body.child(value_with_copy(
+                    k,
+                    "Selected rule inventory",
+                    &format!(
+                        "{}{} rule IDs",
+                        scan.selected_rules.len(),
+                        if scan.selected_rules_truncated {
+                            "+ (truncated)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    "Copy rule inventory count",
+                ));
+            }
+            let retained_rules = scan
+                .rules
+                .iter()
+                .filter(|rule| !rule.nodes.is_empty())
+                .collect::<Vec<_>>();
+            if retained_rules.is_empty() {
+                body = body.child(muted_note(
+                    k,
+                    "No affected-node evidence was retained for this page.",
+                ));
+            } else {
+                body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+                body = body.child(micro(k, "Retained rule groups"));
+                for rule in retained_rules {
+                    body = body.child(
+                        text(format!(
+                            "{} · {} — {}",
+                            rule.kind.label(),
+                            rule.rule_id,
+                            rule.title
+                        ))
+                        .font(k.ty.text_small)
+                        .color(if rule.kind == accessibility::ResultKind::Violation {
+                            k.c.danger.fg
+                        } else {
+                            k.c.warning.fg
+                        })
+                        .wrap()
+                        .w_full(),
+                    );
+                }
+            }
+            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+            body = body.child(muted_note(k, accessibility::SCOPE_NOTE));
+        }
+        AccessibilitySelection::Rule(rule) => {
+            body = body
+                .child(
+                    text("Accessibility rule group")
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_base),
+                )
+                .child(value_with_copy(k, "Rule", &rule.rule_id, "Copy rule ID"))
+                .child(value_with_copy(k, "Title", &rule.title, "Copy title"))
+                .child(value_with_copy(
+                    k,
+                    "Description",
+                    &rule.description,
+                    "Copy description",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Tags",
+                    &rule.tags.join(", "),
+                    "Copy tags",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Outcome",
+                    rule.kind.label(),
+                    "Copy outcome",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Impact",
+                    rule.impact.label(),
+                    "Copy impact",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Affected URLs",
+                    &rule.affected.len().to_string(),
+                    "Copy affected URL count",
+                ))
+                .child(value_with_copy(
+                    k,
+                    "Occurrences",
+                    &format!(
+                        "{} retained{} · {} reported",
+                        rule.occurrences.len(),
+                        if rule.nodes_truncated {
+                            " · truncated"
+                        } else {
+                            ""
+                        },
+                        rule.nodes_reported
+                    ),
+                    "Copy occurrence count",
+                ));
+            if rule.fields_truncated || rule.tags_truncated {
+                body = body.child(muted_note(
+                    k,
+                    "Some rule identity, description, help URL or tag text was shortened at a field bound.",
+                ));
+            }
+            if !rule.help_url.is_empty() {
+                let url = rule.help_url.clone();
+                body = body.child(
+                    row()
+                        .w_full()
+                        .gap(6.0)
+                        .center_y()
+                        .child(
+                            text(rule.help_url.clone())
+                                .font(k.ty.text_xsmall)
+                                .color(k.c.text_muted)
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .truncate()
+                                .help(rule.help_url.clone()),
+                        )
+                        .child(
+                            Button::new("Open help")
+                                .variant(ButtonVariant::GhostMuted)
+                                .control_size(ControlSize::Small)
+                                .on_press_tx(move |_state: &mut State, tx: &mut Tx| {
+                                    let _ = tx.open_url(&url);
+                                })
+                                .build(k),
+                        ),
+                );
+            }
+            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+            body = body.child(micro(k, "Affected pages"));
+            let (start, end) = relation_window(
+                state.relation_pages.accessibility_pages,
+                rule.affected.len(),
+            );
+            for page_index in rule.affected.iter().skip(start).take(end - start) {
+                let Some(page) = state.pages.get(*page_index) else {
+                    continue;
+                };
+                let count = rule
+                    .occurrences
+                    .iter()
+                    .filter(|(occurrence_page, _, _)| occurrence_page == page_index)
+                    .count();
+                let url = page.url.clone();
+                body = body.child(
+                    row()
+                        .w_full()
+                        .gap(6.0)
+                        .center_y()
+                        .child(
+                            text(page.url.clone())
+                                .font(k.ty.text_xsmall)
+                                .color(k.c.text_muted)
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .truncate()
+                                .help(page.url.clone()),
+                        )
+                        .child(text(format!("{count}")).font(k.ty.text_xsmall))
+                        .child(
+                            Button::new("Open page")
+                                .variant(ButtonVariant::GhostMuted)
+                                .control_size(ControlSize::Small)
+                                .on_press(move |state: &mut State| {
+                                    open_accessibility_page(state, url.clone());
+                                })
+                                .build(k),
+                        ),
+                );
+            }
+            if rule.affected.len() > RELATION_PAGE {
+                body = body.child(
+                    row()
+                        .w_full()
+                        .gap(6.0)
+                        .child(
+                            Button::new("Previous")
+                                .variant(ButtonVariant::GhostMuted)
+                                .control_size(ControlSize::Small)
+                                .disabled(start == 0)
+                                .on_press(|state: &mut State| {
+                                    state.relation_pages.accessibility_pages =
+                                        state.relation_pages.accessibility_pages.saturating_sub(1);
+                                })
+                                .build(k),
+                        )
+                        .child(
+                            Button::new("Next")
+                                .variant(ButtonVariant::GhostMuted)
+                                .control_size(ControlSize::Small)
+                                .disabled(end >= rule.affected.len())
+                                .on_press(|state: &mut State| {
+                                    state.relation_pages.accessibility_pages =
+                                        state.relation_pages.accessibility_pages.saturating_add(1);
+                                })
+                                .build(k),
+                        ),
+                );
+            }
+            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak));
+            body = body.child(micro(k, "Retained occurrences"));
+            for (page, rule_index, node_index) in rule.occurrences.iter().take(10) {
+                let Some(report) = state.pages.get(*page).map(|page| &page.accessibility) else {
+                    continue;
+                };
+                let Some(node) = report
+                    .scan
+                    .rules
+                    .get(*rule_index)
+                    .and_then(|rule| rule.nodes.get(*node_index))
+                else {
+                    continue;
+                };
+                body = body.child(value_with_copy(
+                    k,
+                    &format!("Target {}", node.ordinal),
+                    &node.target_label(),
+                    "Copy selector",
+                ));
+                if !node.html.is_empty() {
+                    body = body.child(value_with_copy(
+                        k,
+                        "Element HTML",
+                        &node.html,
+                        "Copy element HTML",
+                    ));
+                }
+                if !node.failure.is_empty() {
+                    body = body.child(value_with_copy(
+                        k,
+                        "Failure summary",
+                        &node.failure,
+                        "Copy failure summary",
+                    ));
+                }
+            }
+            if rule.occurrences.len() > 10 {
+                body = body.child(muted_note(
+                    k,
+                    format!(
+                        "Showing the first 10 of {} retained occurrences. Export expands every retained occurrence.",
+                        rule.occurrences.len()
+                    ),
+                ));
+            }
+            body = body.child(muted_note(k, accessibility::SCOPE_NOTE));
+        }
+    }
+    row().w_full().h_full().gap(0.0).child(
+        col()
+            .w_full()
+            .grow(1.0)
+            .min_w(0.0)
+            .gap(8.0)
+            .child(
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .center_y()
+                    .child(
+                        text(primary)
+                            .font(k.ty.body_medium)
+                            .color(k.c.text_base)
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .truncate(),
+                    )
+                    .child(prev)
+                    .child(next)
+                    .child(close),
+            )
+            .child(body),
+    )
+}
+
 fn detail(k: &Kit, state: &State) -> El {
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         return content_detail(k, state);
     }
     if structured_view_active(state) {
         return structured_detail(k, state);
+    }
+    if accessibility_view_active(state) {
+        return accessibility_detail(k, state);
     }
     if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         return link_detail(k, state);
@@ -14513,6 +16789,216 @@ fn sample_structured(html: &str, complete: bool) -> Arc<structured_data::PageRep
     structured_data::Inspection::new(&budget, None).inspect(&doc, EvidenceStage::Document, complete)
 }
 
+fn scene_accessibility_report(
+    budget: &Arc<accessibility::Budget>,
+    url: &str,
+    kind: Option<accessibility::ResultKind>,
+    nodes: usize,
+    html: &str,
+) -> Arc<accessibility::Report> {
+    let rules = kind
+        .map(|kind| {
+            vec![accessibility::RuleResult {
+                rule_id: "image-alt".into(),
+                title: "Images must have alternate text".into(),
+                description: "Ensures every image has alternate text".into(),
+                impact: accessibility::Impact::Critical,
+                kind,
+                tags: vec!["wcag2a".into(), "wcag111".into()],
+                help_url: "https://dequeuniversity.com/rules/axe/4.14/image-alt".into(),
+                nodes_reported: nodes,
+                nodes_truncated: false,
+                fields_truncated: false,
+                tags_truncated: false,
+                nodes: (0..nodes)
+                    .map(|index| accessibility::NodeOccurrence {
+                        ordinal: index + 1,
+                        impact: accessibility::Impact::Critical,
+                        target: vec![vec!["#hero".into(), "img.hero".into()]],
+                        target_truncated: false,
+                        html: format!("{html}#{index}"),
+                        html_truncated: false,
+                        failure: "Fix any of the following: element has no alt".into(),
+                        failure_truncated: false,
+                    })
+                    .collect(),
+            }]
+        })
+        .unwrap_or_default();
+    let scan = accessibility::Scan {
+        state: accessibility::ExecutionState::Completed,
+        reason: String::new(),
+        requested_url: url.into(),
+        observed_url: url.into(),
+        frame_id: "scene-frame".into(),
+        browser: "Chrome (scene)".into(),
+        elapsed_ms: 42,
+        scanned_at: 1_765_000_000,
+        document_url: url.into(),
+        engine_version: accessibility::ENGINE_VERSION.into(),
+        profile: accessibility::PROFILE_ID.into(),
+        tags: accessibility::PROFILE_TAGS
+            .iter()
+            .map(|tag| (*tag).to_string())
+            .collect(),
+        viewport: accessibility::Viewport {
+            width: 1365,
+            height: 768,
+        },
+        preflight_elements: Some(38),
+        selected_rules: vec!["image-alt".into(), "label".into()],
+        selected_rules_truncated: false,
+        returned_rules: vec!["image-alt".into(), "label".into()],
+        returned_rules_truncated: false,
+        outcome: accessibility::OutcomeSummary {
+            violation_rules: usize::from(kind == Some(accessibility::ResultKind::Violation)),
+            incomplete_rules: usize::from(kind == Some(accessibility::ResultKind::NeedsReview)),
+            pass_rules: 12,
+            inapplicable_rules: 31,
+        },
+        coverage: accessibility::Coverage {
+            elements_limit: accessibility::MAX_PREFLIGHT_ELEMENTS,
+            preflight_elements: Some(38),
+            rules_reported: kind.map(|_| 1),
+            rules_retained: usize::from(kind.is_some()),
+            nodes_reported: kind.map(|_| nodes),
+            nodes_retained: if kind.is_some() { nodes } else { 0 },
+            occurrences_reported: kind.map(|_| nodes),
+            occurrences_retained: if kind.is_some() { nodes } else { 0 },
+            payload_bytes: 2048,
+            ..Default::default()
+        },
+        rules,
+        payload_bytes: 2048,
+    };
+    Arc::new(accessibility::Report::from_scan(scan, budget))
+}
+
+fn scene_refresh_accessibility_now(state: &mut State) {
+    let view = state.accessibility_view;
+    let query = normalized_query(&state.view().query.text);
+    let filter = state.view().filter;
+    let sort = state.view().sort.clone();
+    let facts = state
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(index, page)| (index, page.accessibility.clone()))
+        .collect::<Vec<_>>();
+    if let Some(outcome) = compute_accessibility_outcome(
+        view,
+        0,
+        0,
+        facts.len(),
+        facts,
+        &query,
+        filter,
+        &sort,
+        &AtomicBool::new(false),
+    ) {
+        state.accessibility_pages_visible = outcome.pages_visible;
+        state.accessibility_rule_rows = outcome.rule_rows;
+        state.accessibility_rule_visible = outcome.rule_visible;
+        state.accessibility_index_limited = outcome.limited;
+        state.view_counts = outcome.counts;
+    }
+    sync_selection(state);
+}
+
+fn scene_accessibility_pages(state: &mut State) {
+    let pages = crawl::sample_pages();
+    set_pages(state, pages, "9 pages on example.com".into());
+    let budget = state.accessibility_budget.clone();
+    state.pages[0].accessibility = scene_accessibility_report(
+        &budget,
+        &state.pages[0].url.clone(),
+        Some(accessibility::ResultKind::Violation),
+        2,
+        "<img class=\"hero\">",
+    );
+    state.pages[1].accessibility = scene_accessibility_report(
+        &budget,
+        &state.pages[1].url.clone(),
+        Some(accessibility::ResultKind::NeedsReview),
+        1,
+        "<span>",
+    );
+    state.pages[2].accessibility = Arc::new(accessibility::Report::declined(
+        accessibility::ExecutionState::Failed,
+        "The accessibility audit did not finish within its bounded window",
+        state.pages[2].url.clone(),
+        accessibility::Viewport {
+            width: 1365,
+            height: 768,
+        },
+        "Chrome (scene)",
+    ));
+    state.pages[3].accessibility = Arc::new(accessibility::Report::requires_browser(
+        state.pages[3].url.clone(),
+        accessibility::Viewport {
+            width: 1365,
+            height: 768,
+        },
+    ));
+    state.pages[4].accessibility = Arc::new(accessibility::Report::not_requested());
+    state.accessibility_checked = true;
+    if let Some(run) = &mut state.run {
+        run.accessibility = true;
+    }
+    state.internal_view = InternalView::Accessibility;
+    state.accessibility_view = AccessibilityView::Pages;
+    state.accessibility_pages_view.filter = CheckFilter::All;
+    switch_tab(state, Tab::Internal);
+    scene_refresh_accessibility_now(state);
+    if let Some(key) = state
+        .accessibility_pages_visible
+        .iter()
+        .filter_map(|index| state.pages.get(*index))
+        .find(|page| page.accessibility.is_finding())
+        .map(|page| page.url.clone())
+    {
+        state.accessibility_pages_view.selected = Some(key.clone());
+        state.table.select(key);
+        state.details_open = true;
+    }
+}
+
+fn scene_accessibility_rules(state: &mut State) {
+    scene_accessibility_pages(state);
+    state.accessibility_view = AccessibilityView::Rules;
+    state.accessibility_rules_view.filter = CheckFilter::All;
+    scene_refresh_accessibility_now(state);
+    if let Some(key) = state
+        .accessibility_rule_visible
+        .first()
+        .and_then(|index| state.accessibility_rule_rows.get(*index))
+        .map(|rule| rule.key.clone())
+    {
+        state.accessibility_rules_view.selected = Some(key.clone());
+        state.table.select(key);
+        state.details_open = true;
+    }
+}
+
+fn scene_accessibility_partial(state: &mut State) {
+    scene_accessibility_pages(state);
+    state.accessibility_pages_view.filter = CheckFilter::Incomplete;
+    scene_refresh_accessibility_now(state);
+}
+
+fn scene_accessibility_off(state: &mut State) {
+    load_sample(state);
+    state.accessibility_checked = false;
+    if let Some(run) = &mut state.run {
+        run.accessibility = false;
+    }
+    state.internal_view = InternalView::Accessibility;
+    state.accessibility_view = AccessibilityView::Pages;
+    state.accessibility_pages_view.filter = CheckFilter::All;
+    switch_tab(state, Tab::Internal);
+    scene_refresh_accessibility_now(state);
+}
+
 fn scene_structured_data_pages(state: &mut State) {
     let mut pages = crawl::sample_pages();
     pages[0].structured = sample_structured(
@@ -14883,6 +17369,7 @@ fn scene_failed(state: &mut State) {
         rendering: RenderMode::Html,
         sitemaps: true,
         check_links: false,
+        accessibility: false,
         started_utc: inventory::utc_now(),
         extraction_rules: Vec::new(),
     });
@@ -15242,6 +17729,10 @@ fn main() {
             ("link-evidence-detail", scene_link_evidence_detail),
             ("inventory-scope", scene_inventory_scope),
             ("structured-data-pages", scene_structured_data_pages),
+            ("accessibility-pages", scene_accessibility_pages),
+            ("accessibility-rules", scene_accessibility_rules),
+            ("accessibility-partial", scene_accessibility_partial),
+            ("accessibility-off", scene_accessibility_off),
             ("structured-data-blocks", scene_structured_data_blocks),
             ("duplicate-content", scene_duplicate_content),
             ("duplicate-content-similar", scene_duplicate_content_similar),
@@ -15496,6 +17987,7 @@ mod tests {
             rendering: RenderMode::Html,
             sitemaps: false,
             check_links: false,
+            accessibility: false,
             started_utc: inventory::utc_now(),
             extraction_rules: Vec::new(),
         });
@@ -16489,6 +18981,7 @@ mod tests {
             rendering: RenderMode::Html,
             sitemaps: true,
             check_links: true,
+            accessibility: false,
             started_utc: inventory::utc_now(),
             extraction_rules: (0..2)
                 .map(|index| extract::ExtractionRule {
@@ -17618,6 +20111,7 @@ mod tests {
             extraction_limit: String::new(),
             content: Arc::new(ContentEvidence::default()),
             structured: Arc::new(calmtoad::structured_data::PageReport::default()),
+            accessibility: Arc::new(calmtoad::accessibility::Report::not_requested()),
             indexability: assessment,
         };
         assert_eq!(page.indexability.label, Label::NotAssessed);
@@ -17755,6 +20249,7 @@ mod tests {
             extraction_limit: String::new(),
             content: Arc::new(ContentEvidence::default()),
             structured: Arc::new(calmtoad::structured_data::PageReport::default()),
+            accessibility: Arc::new(calmtoad::accessibility::Report::not_requested()),
             indexability: assessment,
         };
         assert_eq!(page.indexability.label, Label::NotAssessed);
@@ -20592,5 +23087,847 @@ mod tests {
             assert!(state.structured_export_job.is_none());
             assert!(state.export_notice.is_none());
         });
+    }
+    fn accessibility_report_for_test(
+        budget: &Arc<accessibility::Budget>,
+        url: &str,
+        kind: Option<accessibility::ResultKind>,
+        nodes: usize,
+        html: &str,
+    ) -> Arc<accessibility::Report> {
+        let rules = kind
+            .map(|kind| {
+                vec![accessibility::RuleResult {
+                    rule_id: "image-alt".into(),
+                    title: "Images must have alternate text".into(),
+                    description: "Ensures every image has alternate text".into(),
+                    impact: accessibility::Impact::Critical,
+                    kind,
+                    tags: vec!["wcag2a".into(), "wcag111".into()],
+                    help_url: "https://example.test/rules/image-alt".into(),
+                    nodes_reported: nodes,
+                    nodes_truncated: false,
+                    fields_truncated: false,
+                    tags_truncated: false,
+                    nodes: (0..nodes)
+                        .map(|index| accessibility::NodeOccurrence {
+                            ordinal: index + 1,
+                            impact: accessibility::Impact::Critical,
+                            target: vec![vec!["#host".into(), "img.hero".into()]],
+                            target_truncated: false,
+                            html: format!("{html}#{index}"),
+                            html_truncated: false,
+                            failure: "Fix any of the following: element has no alt".into(),
+                            failure_truncated: false,
+                        })
+                        .collect(),
+                }]
+            })
+            .unwrap_or_default();
+        let scan = accessibility::Scan {
+            state: accessibility::ExecutionState::Completed,
+            reason: String::new(),
+            requested_url: url.into(),
+            observed_url: url.into(),
+            frame_id: "frame".into(),
+            browser: "Test Chrome".into(),
+            elapsed_ms: 12,
+            scanned_at: 1_765_000_000,
+            document_url: url.into(),
+            engine_version: accessibility::ENGINE_VERSION.into(),
+            profile: accessibility::PROFILE_ID.into(),
+            tags: accessibility::PROFILE_TAGS
+                .iter()
+                .map(|tag| (*tag).to_string())
+                .collect(),
+            viewport: accessibility::Viewport {
+                width: 1365,
+                height: 768,
+            },
+            preflight_elements: Some(12),
+            selected_rules: vec!["image-alt".into()],
+            selected_rules_truncated: false,
+            returned_rules: vec!["image-alt".into()],
+            returned_rules_truncated: false,
+            outcome: accessibility::OutcomeSummary {
+                violation_rules: usize::from(kind == Some(accessibility::ResultKind::Violation)),
+                incomplete_rules: usize::from(kind == Some(accessibility::ResultKind::NeedsReview)),
+                pass_rules: 2,
+                inapplicable_rules: 3,
+            },
+            coverage: accessibility::Coverage {
+                elements_limit: accessibility::MAX_PREFLIGHT_ELEMENTS,
+                preflight_elements: Some(12),
+                rules_reported: kind.map(|_| 1),
+                rules_retained: usize::from(kind.is_some()),
+                nodes_reported: kind.map(|_| nodes),
+                nodes_retained: if kind.is_some() { nodes } else { 0 },
+                occurrences_reported: kind.map(|_| nodes),
+                occurrences_retained: if kind.is_some() { nodes } else { 0 },
+                payload_bytes: 1024,
+                ..Default::default()
+            },
+            rules,
+            payload_bytes: 1024,
+        };
+        Arc::new(accessibility::Report::from_scan(scan, budget))
+    }
+
+    fn accessibility_scene(state: &mut State) -> Arc<accessibility::Budget> {
+        state.pages = crawl::sample_pages().into_iter().take(3).collect();
+        state.accessibility_budget = Arc::new(accessibility::Budget::default());
+        let budget = state.accessibility_budget.clone();
+        state.pages[0].accessibility = accessibility_report_for_test(
+            &budget,
+            &state.pages[0].url.clone(),
+            Some(accessibility::ResultKind::Violation),
+            2,
+            "<img class=\"hero\">\n",
+        );
+        state.pages[1].accessibility = accessibility_report_for_test(
+            &budget,
+            &state.pages[1].url.clone(),
+            Some(accessibility::ResultKind::NeedsReview),
+            1,
+            "<span>",
+        );
+        state.pages[2].accessibility = Arc::new(accessibility::Report::requires_browser(
+            state.pages[2].url.clone(),
+            accessibility::Viewport {
+                width: 1365,
+                height: 768,
+            },
+        ));
+        state.accessibility_checked = true;
+        state.tab = Tab::Internal;
+        state.phase = RunPhase::Completed;
+        state.internal_view = InternalView::Accessibility;
+        state.accessibility_view = AccessibilityView::Pages;
+        state.accessibility_pages_visible = vec![2, 0, 1];
+        state.view_counts = ViewCounts {
+            total: 3,
+            findings: 1,
+            incomplete: 2,
+        };
+        budget
+    }
+
+    #[test]
+    fn accessibility_coverage_export_keeps_unavailable_pages_and_frozen_order() {
+        let mut state = init();
+        let budget = accessibility_scene(&mut state);
+        let source = accessibility_export_source(&state).expect("coverage source");
+        let estimate = estimate_accessibility_export_bytes(&source);
+        assert!(estimate <= budget.remaining());
+        let (headers, rows) = accessibility_export_rows(&source, estimate, &AtomicBool::new(false))
+            .expect("coverage rows fit the estimate");
+        assert_eq!(rows.len(), 3, "every visible page appears in coverage");
+        assert_eq!(
+            rows.iter().map(|row| row[0].as_str()).collect::<Vec<_>>(),
+            vec![
+                state.pages[2].url.as_str(),
+                state.pages[0].url.as_str(),
+                state.pages[1].url.as_str()
+            ],
+            "the frozen visible order is preserved"
+        );
+        assert_eq!(rows[0][1], "Requires Browser mode");
+        assert_eq!(rows[1][8], "2");
+        assert_eq!(rows[1][9], "0");
+        assert_eq!(rows[2][8], "0");
+        assert_eq!(rows[2][9], "1");
+        assert_eq!(
+            rows[2][21], "yes",
+            "completed needs-review scan has no violation"
+        );
+        assert!(!headers.is_empty());
+        let header_refs = headers.iter().map(String::as_str).collect::<Vec<_>>();
+        let csv = calmtoad::export::to_csv(&header_refs, &rows);
+        assert!(
+            csv.len() <= estimate,
+            "encoded CSV {} <= estimate {estimate}",
+            csv.len()
+        );
+        assert!(
+            accessibility_export_rows(&source, estimate, &AtomicBool::new(true)).is_none(),
+            "cancelling preparation returns no partial CSV"
+        );
+        assert!(
+            accessibility_export_rows(&source, 64, &AtomicBool::new(false)).is_none(),
+            "a runtime ceiling never returns a silently partial CSV"
+        );
+    }
+
+    #[test]
+    fn accessibility_rule_export_expands_occurrences_and_preserves_nested_targets() {
+        let mut state = init();
+        state.pages = crawl::sample_pages().into_iter().take(2).collect();
+        state.accessibility_budget = Arc::new(accessibility::Budget::default());
+        let budget = state.accessibility_budget.clone();
+        state.pages[0].accessibility = accessibility_report_for_test(
+            &budget,
+            &state.pages[0].url.clone(),
+            Some(accessibility::ResultKind::Violation),
+            2,
+            "<button title=\"x\">\n",
+        );
+        state.pages[1].accessibility = accessibility_report_for_test(
+            &budget,
+            &state.pages[1].url.clone(),
+            Some(accessibility::ResultKind::Violation),
+            1,
+            "<img>",
+        );
+        // Preserve nested shadow/frame paths and a control character in a selector.
+        let page0 = Arc::get_mut(&mut state.pages[0].accessibility).unwrap();
+        page0.scan.rules[0].nodes[0].target =
+            vec![vec!["#host".into(), "button".into()], vec!["#other".into()]];
+        page0.scan.rules[0].nodes[1].target = vec![vec!["#nul\u{0}".into()]];
+        state.internal_view = InternalView::Accessibility;
+        state.accessibility_view = AccessibilityView::Rules;
+        state.accessibility_rule_rows = vec![AccessibilityRuleRow {
+            key: "image-alt|Violation".into(),
+            rule_id: "image-alt".into(),
+            kind: accessibility::ResultKind::Violation,
+            title: "Images must have alternate text".into(),
+            description: "Ensures every image has alternate text".into(),
+            impact: accessibility::Impact::Critical,
+            tags: vec!["wcag2a".into(), "wcag111".into()],
+            help_url: "https://example.test/rules/image-alt".into(),
+            nodes_reported: 3,
+            nodes_truncated: false,
+            fields_truncated: false,
+            tags_truncated: false,
+            affected: vec![0, 1],
+            occurrences: vec![(0, 0, 0), (0, 0, 1), (1, 0, 0)],
+        }];
+        state.accessibility_rule_visible = vec![0];
+        let source = accessibility_export_source(&state).expect("rule source");
+        let estimate = estimate_accessibility_export_bytes(&source);
+        let (headers, rows) = accessibility_export_rows(&source, estimate, &AtomicBool::new(false))
+            .expect("occurrence rows fit");
+        assert_eq!(rows.len(), 3, "every retained occurrence is exported");
+        assert_eq!(rows[0][0], state.pages[0].url);
+        assert_eq!(rows[2][0], state.pages[1].url);
+        assert_eq!(
+            rows[0][7], r##"[["#host","button"],["#other"]]"##,
+            "nested target arrays stay structural"
+        );
+        assert!(
+            rows[1][7].contains(r"\u0000"),
+            "control characters in selectors are JSON-escaped"
+        );
+        assert!(rows[0][9].contains('\n'), "element text is not markup");
+        let header_refs = headers.iter().map(String::as_str).collect::<Vec<_>>();
+        let csv = calmtoad::export::to_csv(&header_refs, &rows);
+        assert!(
+            csv.len() <= estimate,
+            "encoded CSV {} <= estimate {estimate}",
+            csv.len()
+        );
+        assert_eq!(rows[0][1], "image-alt");
+        assert_eq!(rows[0][2], "Violation");
+        assert_eq!(rows[0][13], "3", "rule nodes reported for the group");
+    }
+
+    #[test]
+    fn accessibility_occurrence_export_carries_page_limitation_provenance() {
+        let mut state = init();
+        state.pages = crawl::sample_pages().into_iter().take(1).collect();
+        state.accessibility_budget = Arc::new(accessibility::Budget::default());
+        let budget = state.accessibility_budget.clone();
+        state.pages[0].accessibility = accessibility_report_for_test(
+            &budget,
+            &state.pages[0].url.clone(),
+            Some(accessibility::ResultKind::Violation),
+            1,
+            "<img>",
+        );
+        {
+            let report = Arc::get_mut(&mut state.pages[0].accessibility).expect("unique report");
+            report.scan.state = accessibility::ExecutionState::Partial;
+            report.scan.reason =
+                "Some accessibility nodes were dropped by a documented bound".into();
+            report.scan.coverage.nodes_truncated = true;
+            report.scan.coverage.notes =
+                vec!["Projection reached the documented node bound".into()];
+        }
+        state.internal_view = InternalView::Accessibility;
+        state.accessibility_view = AccessibilityView::Rules;
+        state.accessibility_rule_rows = vec![AccessibilityRuleRow {
+            key: "image-alt|Violation".into(),
+            rule_id: "image-alt".into(),
+            kind: accessibility::ResultKind::Violation,
+            title: "Images must have alternate text".into(),
+            description: "Ensures every image has alternate text".into(),
+            impact: accessibility::Impact::Critical,
+            tags: vec!["wcag2a".into(), "wcag111".into()],
+            help_url: "https://example.test/rules/image-alt".into(),
+            nodes_reported: 1,
+            nodes_truncated: true,
+            fields_truncated: false,
+            tags_truncated: false,
+            affected: vec![0],
+            occurrences: vec![(0, 0, 0)],
+        }];
+        state.accessibility_rule_visible = vec![0];
+        let source = accessibility_export_source(&state).expect("rule source");
+        let estimate = estimate_accessibility_export_bytes(&source);
+        let (headers, rows) = accessibility_export_rows(&source, estimate, &AtomicBool::new(false))
+            .expect("limited occurrence rows fit");
+        let column = |name: &str| {
+            headers
+                .iter()
+                .position(|header| header == name)
+                .unwrap_or_else(|| panic!("missing {name} header"))
+        };
+        assert_eq!(rows.len(), 1, "the retained violation still exports");
+        let row = &rows[0];
+        assert_eq!(row[column("PAGE EXECUTION")], "Partial");
+        assert_eq!(
+            row[column("PAGE REASON")],
+            "Some accessibility nodes were dropped by a documented bound"
+        );
+        assert_eq!(row[column("PAGE COVERAGE LIMITED")], "yes");
+        assert_eq!(row[column("PAGE RULES TRUNCATED")], "");
+        assert_eq!(row[column("PAGE NODES TRUNCATED")], "yes");
+        assert_eq!(row[column("PAGE BUDGET LIMITED")], "");
+        assert_eq!(row[column("PAGE RUN LIMITED")], "");
+        assert_eq!(row[column("PAGE PAYLOAD LIMITED")], "");
+        assert_eq!(
+            row[column("PAGE COVERAGE NOTES")],
+            "Projection reached the documented node bound"
+        );
+    }
+
+    #[test]
+    fn cancelled_accessibility_export_keeps_the_lease_until_the_paused_worker_drops() {
+        let mut state = init();
+        let budget = accessibility_scene(&mut state);
+        let before = budget.used();
+        let gate = Arc::new(WorkerGate::closed());
+        assert!(start_accessibility_export_with_gate(
+            &mut state,
+            Some(gate.clone())
+        ));
+        for _ in 0..500 {
+            if gate.has_entered() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            gate.has_entered(),
+            "the export worker reaches its allocation"
+        );
+        let reserved = budget.used();
+        assert!(reserved > before);
+        let job = state
+            .accessibility_export_job
+            .take()
+            .expect("export job is queued");
+        job.cancel.store(true, Ordering::Relaxed);
+        drop(job);
+        assert_eq!(
+            budget.used(),
+            reserved,
+            "dropping the UI job must not release worker-owned rows or CSV"
+        );
+        gate.open();
+        let mut released = false;
+        for _ in 0..500 {
+            if budget.used() < reserved {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            released,
+            "the export reservation releases when the cancelled worker drops"
+        );
+    }
+
+    #[test]
+    fn accessibility_filters_keep_violations_review_and_off_scans_distinct() {
+        let mut state = init();
+        accessibility_scene(&mut state);
+        let mut off = crawl::sample_pages().into_iter().nth(3).unwrap();
+        off.accessibility = Arc::new(accessibility::Report::not_requested());
+        state.pages.push(off);
+        let facts = state
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (index, page.accessibility.clone()))
+            .collect::<Vec<_>>();
+        let cancel = AtomicBool::new(false);
+        let findings = compute_accessibility_outcome(
+            AccessibilityView::Pages,
+            1,
+            0,
+            facts.len(),
+            facts.clone(),
+            "",
+            CheckFilter::Findings,
+            &("url".into(), SortDir::Ascending),
+            &cancel,
+        )
+        .expect("pages findings");
+        assert_eq!(findings.pages_visible, vec![0]);
+        let incomplete = compute_accessibility_outcome(
+            AccessibilityView::Pages,
+            1,
+            0,
+            facts.len(),
+            facts.clone(),
+            "",
+            CheckFilter::Incomplete,
+            &("url".into(), SortDir::Ascending),
+            &cancel,
+        )
+        .expect("pages incomplete");
+        assert_eq!(
+            incomplete.pages_visible.len(),
+            2,
+            "needs-review and Requires Browser are incomplete; an off scan is not"
+        );
+        assert!(incomplete.pages_visible.contains(&1));
+        assert!(incomplete.pages_visible.contains(&2));
+        let rules = compute_accessibility_outcome(
+            AccessibilityView::Rules,
+            1,
+            0,
+            facts.len(),
+            facts.clone(),
+            "",
+            CheckFilter::All,
+            &("rule".into(), SortDir::Ascending),
+            &cancel,
+        )
+        .expect("rule groups");
+        assert_eq!(rules.counts.total, 2);
+        assert_eq!(rules.counts.findings, 1);
+        assert_eq!(rules.counts.incomplete, 1);
+        assert_eq!(rules.rule_visible.len(), 2);
+        let violation = &rules.rule_rows[0];
+        assert_eq!(violation.kind, accessibility::ResultKind::Violation);
+        assert_eq!(violation.affected.len(), 1, "unique affected URLs");
+        assert_eq!(violation.occurrences.len(), 2, "distinct occurrences");
+        let review = &rules.rule_rows[1];
+        assert_eq!(review.kind, accessibility::ResultKind::NeedsReview);
+        assert_eq!(review.affected.len(), 1);
+        assert_eq!(review.occurrences.len(), 1);
+        let matched = compute_accessibility_outcome(
+            AccessibilityView::Rules,
+            1,
+            0,
+            facts.len(),
+            facts.clone(),
+            "img class",
+            CheckFilter::All,
+            &("rule".into(), SortDir::Ascending),
+            &cancel,
+        )
+        .expect("rule search");
+        assert_eq!(
+            matched.rule_visible.len(),
+            1,
+            "field-wise selector/HTML search"
+        );
+        let absent = compute_accessibility_outcome(
+            AccessibilityView::Rules,
+            1,
+            0,
+            facts.len(),
+            facts,
+            "not-present-anywhere",
+            CheckFilter::All,
+            &("rule".into(), SortDir::Ascending),
+            &cancel,
+        )
+        .expect("rule search miss");
+        assert!(absent.rule_visible.is_empty());
+    }
+
+    #[test]
+    fn occurrence_capped_accessibility_ledger_keeps_pages_rules_and_csv_attribution() {
+        let mut state = init();
+        state.pages = crawl::sample_pages().into_iter().take(2).collect();
+        let budget = Arc::new(accessibility::Budget::default());
+        assert!(budget.try_reserve(0, accessibility::MAX_RUN_OCCURRENCES));
+        state.accessibility_budget = budget.clone();
+        for page in state.pages.iter_mut().take(2) {
+            let url = page.url.clone();
+            page.accessibility = accessibility_report_for_test(
+                &budget,
+                &url,
+                Some(accessibility::ResultKind::Violation),
+                2,
+                "<img>",
+            );
+            assert_eq!(
+                page.accessibility.state(),
+                accessibility::ExecutionState::Limited
+            );
+            assert!(
+                page.accessibility.scan.coverage.budget_limited,
+                "the regression uses the exhausted-ledger path"
+            );
+        }
+        let facts = state
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (index, page.accessibility.clone()))
+            .collect::<Vec<_>>();
+        let cancel = AtomicBool::new(false);
+
+        let pages = compute_accessibility_outcome(
+            AccessibilityView::Pages,
+            1,
+            0,
+            facts.len(),
+            facts.clone(),
+            "",
+            CheckFilter::Findings,
+            &("url".into(), SortDir::Ascending),
+            &cancel,
+        )
+        .expect("pages findings");
+        assert_eq!(pages.pages_visible, vec![0, 1]);
+        assert_eq!(pages.counts.findings, 2);
+        for page in &state.pages {
+            assert!(page.accessibility.is_finding());
+            assert_eq!(page.accessibility.violation_occurrences(), 2);
+        }
+
+        let rules = compute_accessibility_outcome(
+            AccessibilityView::Rules,
+            1,
+            0,
+            facts.len(),
+            facts,
+            "",
+            CheckFilter::Findings,
+            &("rule".into(), SortDir::Ascending),
+            &cancel,
+        )
+        .expect("rule groups");
+        assert_eq!(rules.rule_rows.len(), 1);
+        let rule = &rules.rule_rows[0];
+        assert_eq!(rule.affected, vec![0, 1], "known pages stay attributed");
+        assert!(
+            rule.occurrences.is_empty(),
+            "node rows were removed by the ledger"
+        );
+        assert!(rule.nodes_truncated);
+        assert_eq!(rule.nodes_reported, 4);
+        assert_eq!(accessibility_rule_occurrence_count(rule), 4);
+        assert_eq!(rules.counts.findings, 1);
+
+        state.internal_view = InternalView::Accessibility;
+        state.accessibility_view = AccessibilityView::Rules;
+        state.accessibility_rule_rows = rules.rule_rows;
+        state.accessibility_rule_visible = vec![0];
+        let source = accessibility_export_source(&state).expect("limited rule source");
+        let estimate = estimate_accessibility_export_bytes(&source);
+        let (headers, rows) = accessibility_export_rows(&source, estimate, &AtomicBool::new(false))
+            .expect("limited summary rows fit");
+        let column = |name: &str| {
+            headers
+                .iter()
+                .position(|header| header == name)
+                .unwrap_or_else(|| panic!("missing {name} header"))
+        };
+        assert_eq!(rows.len(), 2, "one explicit summary row per known page");
+        assert_eq!(rows[0][column("URL")], state.pages[0].url);
+        assert_eq!(rows[1][column("URL")], state.pages[1].url);
+        for row in &rows {
+            assert_eq!(row[column("RULE ID")], "image-alt");
+            assert_eq!(row[column("ORDINAL")], "");
+            assert_eq!(row[column("TARGET")], "");
+            assert_eq!(row[column("ELEMENT HTML")], "");
+            assert_eq!(row[column("PAGE EXECUTION")], "Limited");
+            assert_eq!(row[column("PAGE COVERAGE LIMITED")], "yes");
+            assert_eq!(row[column("PAGE BUDGET LIMITED")], "yes");
+            assert_eq!(row[column("PAGE RUN LIMITED")], "yes");
+        }
+    }
+
+    fn accessibility_50k_state() -> State {
+        let mut state = init();
+        state.accessibility_budget = Arc::new(accessibility::Budget::default());
+        let budget = state.accessibility_budget.clone();
+        let sample = crawl::sample_pages();
+        let report = accessibility_report_for_test(
+            &budget,
+            "https://example.com/accessibility",
+            Some(accessibility::ResultKind::Violation),
+            3,
+            "<img>",
+        );
+        let mut pages = Vec::with_capacity(50_000);
+        for index in 0..50_000 {
+            let mut page = sample[index % sample.len()].clone();
+            page.url = format!("https://example.com/page-{index}");
+            page.accessibility = report.clone();
+            pages.push(page);
+        }
+        state.pages = pages;
+        state
+    }
+
+    #[test]
+    fn accessibility_refresh_snapshot_keeps_50k_page_indices_and_ledger_estimate() {
+        let state = accessibility_50k_state();
+        let (facts, snapshot_bytes) = accessibility_snapshot(&state.pages, 12);
+        assert_eq!(facts.len(), 50_000);
+        assert_eq!(facts.first().map(|(index, _)| *index), Some(0));
+        assert_eq!(facts.last().map(|(index, _)| *index), Some(49_999));
+        assert_eq!(
+            facts[12_345].1.scan.coverage.occurrences_retained, 3,
+            "the retained report pointer is preserved"
+        );
+        assert!(
+            snapshot_bytes >= 50_000 * 32 + 50_000 * 3 * 24,
+            "the ledger estimate covers page facts and retained occurrences"
+        );
+    }
+
+    #[test]
+    #[ignore = "local 50k accessibility refresh measurement"]
+    fn accessibility_50k_refresh_snapshot_stays_under_eight_ms() {
+        let state = accessibility_50k_state();
+        let mut samples = Vec::with_capacity(9);
+        for _ in 0..9 {
+            let started = Instant::now();
+            let (facts, snapshot_bytes) = accessibility_snapshot(&state.pages, 0);
+            let elapsed = started.elapsed();
+            std::hint::black_box(&facts);
+            std::hint::black_box(snapshot_bytes);
+            assert_eq!(facts.len(), 50_000);
+            samples.push(elapsed);
+        }
+        samples.sort();
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+        eprintln!(
+            "accessibility 50k refresh snapshot: p50 {p50:?}, p95 {p95:?}, max {:?}",
+            samples[samples.len() - 1]
+        );
+        assert!(
+            p95 < Duration::from_millis(8),
+            "normal 50k-page accessibility refresh prep must stay under 8 ms: p95 {p95:?}"
+        );
+    }
+
+    #[test]
+    fn exhausted_accessibility_ledger_keeps_pages_and_reports_limited_rules() {
+        let mut state = init();
+        state.pages = crawl::sample_pages().into_iter().take(2).collect();
+        let budget = Arc::new(accessibility::Budget::default());
+        assert!(budget.try_reserve(accessibility::BUDGET_BYTES, 0));
+        state.accessibility_budget = budget.clone();
+        for page in state.pages.iter_mut().take(2) {
+            let url = page.url.clone();
+            page.accessibility = accessibility_report_for_test(
+                &budget,
+                &url,
+                Some(accessibility::ResultKind::Violation),
+                2,
+                "<img>",
+            );
+            assert!(
+                page.accessibility.scan.rules.is_empty(),
+                "full exhaustion retains no uncharged rule vectors"
+            );
+        }
+        let facts = state
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (index, page.accessibility.clone()))
+            .collect::<Vec<_>>();
+        let cancel = AtomicBool::new(false);
+        let pages = compute_accessibility_outcome(
+            AccessibilityView::Pages,
+            1,
+            0,
+            facts.len(),
+            facts.clone(),
+            "",
+            CheckFilter::Findings,
+            &("url".into(), SortDir::Ascending),
+            &cancel,
+        )
+        .expect("pages findings");
+        assert_eq!(pages.pages_visible, vec![0, 1]);
+        assert_eq!(pages.counts.findings, 2);
+        for page in &state.pages {
+            assert_eq!(page.accessibility.violation_occurrences(), 2);
+            assert_eq!(
+                page.accessibility.state(),
+                accessibility::ExecutionState::Limited
+            );
+        }
+
+        let rules = compute_accessibility_outcome(
+            AccessibilityView::Rules,
+            1,
+            0,
+            facts.len(),
+            facts,
+            "",
+            CheckFilter::Findings,
+            &("rule".into(), SortDir::Ascending),
+            &cancel,
+        )
+        .expect("rules outcome");
+        assert!(rules.rule_rows.is_empty(), "no fabricated rule groups");
+        assert_eq!(rules.counts.findings, 0);
+        assert!(
+            rules
+                .limited
+                .as_deref()
+                .is_some_and(|reason| reason.contains("run evidence cap")),
+            "Rules must explain that detail was dropped: {:?}",
+            rules.limited
+        );
+        state.accessibility_index_limited = rules.limited;
+        assert!(state.accessibility_index_limited.is_some());
+
+        state.internal_view = InternalView::Accessibility;
+        state.accessibility_view = AccessibilityView::Pages;
+        state.accessibility_pages_visible = pages.pages_visible;
+        let source = accessibility_export_source(&state).expect("pages coverage source");
+        let estimate = estimate_accessibility_export_bytes(&source);
+        let (headers, rows) = accessibility_export_rows(&source, estimate, &AtomicBool::new(false))
+            .expect("pages coverage rows fit");
+        let column = |name: &str| {
+            headers
+                .iter()
+                .position(|header| header == name)
+                .unwrap_or_else(|| panic!("missing {name} header"))
+        };
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row[column("VIOLATION OCCURRENCES")], "2");
+            assert_eq!(row[column("COVERAGE LIMITED")], "yes");
+            assert_eq!(row[column("RULES RETAINED")], "0");
+        }
+    }
+
+    #[test]
+    fn accessibility_views_fit_the_minimum_window_in_pages_and_rules() {
+        let mut state = init();
+        accessibility_scene(&mut state);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        let mut narrow = Runtime::new(
+            rt.state,
+            view,
+            (880.0, 560.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        narrow.frame(0.016);
+        assert!(narrow.find("internal-menu").is_some());
+        assert!(narrow.find("accessibility-pages").is_some());
+        assert!(narrow.find("accessibility-rules").is_some());
+        for key in ["export-csv", "copy-urls", "details-toggle"] {
+            let (x, _) = narrow.find(key).unwrap_or_else(|| panic!("{key} missing"));
+            assert!(x < 880.0, "{key} sits outside the 880px window at x={x}");
+        }
+        click_key(&mut narrow, "accessibility-rules");
+        assert_eq!(narrow.state.accessibility_view, AccessibilityView::Rules);
+        narrow.frame(0.016);
+        assert!(narrow.find("export-csv").is_some());
+        let _ = pump_accessibility_view(&mut narrow.state);
+        narrow.frame(0.016);
+    }
+
+    fn pump_accessibility_view(state: &mut State) -> bool {
+        for _ in 0..200 {
+            if poll_accessibility_view(state) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    #[test]
+    fn accessibility_scenes_render_at_both_review_sizes_and_themes() {
+        for (scene_index, scene) in [
+            scene_accessibility_pages as fn(&mut State),
+            scene_accessibility_rules,
+            scene_accessibility_partial,
+            scene_accessibility_off,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (width, height) in [(880.0, 560.0), (1180.0, 740.0)] {
+                for dark in [true, false] {
+                    let mut state = init();
+                    scene(&mut state);
+                    let mut rt = Runtime::new(
+                        state,
+                        view,
+                        (width, height),
+                        Env {
+                            system_dark: dark,
+                            scale: 1.0,
+                        },
+                    );
+                    rt.frame(0.016);
+                    assert!(
+                        rt.find("internal-menu").is_some(),
+                        "scene controls render at {width}x{height}"
+                    );
+                    assert!(rt.find("accessibility-pages").is_some());
+                    assert!(rt.find("export-csv").is_some());
+                    if rt.state.details_open {
+                        assert!(
+                            rt.find("accessibility-detail-body").is_some(),
+                            "scene {scene_index} at {width}x{height} dark={dark} visible={} selected={:?}",
+                            visible_len(&rt.state),
+                            rt.state.view().selected
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn internal_view_menu_fits_the_minimum_window() {
+        let mut state = init();
+        load_sample(&mut state);
+        state.internal_view = InternalView::Urls;
+        switch_tab(&mut state, Tab::Internal);
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        let mut narrow = Runtime::new(
+            rt.state,
+            view,
+            (880.0, 560.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        narrow.frame(0.016);
+        for key in [
+            "internal-accessibility",
+            "export-csv",
+            "copy-urls",
+            "details-toggle",
+        ] {
+            let (x, _) = narrow.find(key).unwrap_or_else(|| panic!("{key} missing"));
+            assert!(x < 880.0, "{key} sits outside the 880px window at x={x}");
+        }
     }
 }

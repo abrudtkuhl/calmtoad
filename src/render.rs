@@ -46,16 +46,20 @@ use chromiumoxide::cdp::browser_protocol::network::{
     SetUserAgentOverrideParams,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    EventFrameNavigated, EventLifecycleEvent, EventNavigatedWithinDocument, StopLoadingParams,
+    CreateIsolatedWorldParams, EventFrameNavigated, EventLifecycleEvent,
+    EventNavigatedWithinDocument, FrameId, StopLoadingParams,
 };
 use chromiumoxide::cdp::browser_protocol::target::{CreateTargetParams, EventTargetCreated};
-use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+use chromiumoxide::cdp::js_protocol::runtime::{
+    EvaluateParams, ExecutionContextId, TerminateExecutionParams, TimeDelta,
+};
 use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::page::Page;
 use futures_util::StreamExt;
 use tokio::sync::Mutex;
 
+use crate::accessibility;
 use crate::crawl::USER_AGENT;
 
 /// The first main-document request belongs to the requested URL. Later document requests
@@ -106,6 +110,28 @@ pub struct RenderConfig {
     pub max_transfer_bytes: u64,
     /// Same DOM evidence cap as HTML mode.
     pub max_body_bytes: usize,
+    /// Run the opt-in accessibility audit after a successful rendered capture.
+    pub accessibility: bool,
+    /// Test-only browser-fixture control, compiled out of release builds. Production paths
+    /// always leave this `None`.
+    #[cfg(debug_assertions)]
+    pub audit_test_hook: Option<AuditTestHook>,
+}
+
+/// Deterministic real-browser fixture hooks for audit lifecycle regressions. They run after the
+/// SEO capture and audit setup, so a page timer cannot accidentally stall source/DOM extraction.
+/// This control is only compiled into debug/test builds.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub enum AuditTestHook {
+    /// Stall the isolated accessibility world in a finite loop after the audit has started.
+    StallInAudit {
+        millis: u64,
+        started: Arc<StdMutex<Option<Instant>>>,
+    },
+    /// Change the main document URL while the audit is awaiting its result.
+    NavigateDuringAudit { url: String },
 }
 
 impl Default for RenderConfig {
@@ -118,6 +144,9 @@ impl Default for RenderConfig {
             max_requests: 300,
             max_transfer_bytes: 50 * 1024 * 1024,
             max_body_bytes: 1_000_000,
+            accessibility: false,
+            #[cfg(debug_assertions)]
+            audit_test_hook: None,
         }
     }
 }
@@ -222,6 +251,8 @@ pub struct Capture {
     /// The rendered main-document DOM after the readiness policy.
     pub rendered_html: Option<String>,
     pub rendered_truncated: bool,
+    /// Opt-in accessibility evidence. `None` only when the crawl did not request an audit.
+    pub accessibility: Option<accessibility::Scan>,
     /// Same-origin scripts that failed to load or returned an HTTP error.
     pub resource_failures: Vec<ResourceFailure>,
     pub requested_url: String,
@@ -249,6 +280,7 @@ impl Default for Capture {
             source_note: String::new(),
             rendered_html: None,
             rendered_truncated: false,
+            accessibility: None,
             resource_failures: Vec::new(),
             requested_url: String::new(),
             observed_url: String::new(),
@@ -568,6 +600,9 @@ pub struct BrowserRenderer {
     /// The spawned child shared with emergency cleanup; only its locked handle may be killed.
     process: OwnedProcess,
     monitor: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// A timed-out audit can leave Chrome's renderer thread executing uninterruptible JS.
+    /// Retire this owned browser so the rest of this crawl cannot reuse it.
+    retired: AtomicBool,
     closed: bool,
 }
 
@@ -617,10 +652,13 @@ impl BrowserRenderer {
                 "disable-client-side-phishing-detection",
                 "disable-component-extensions-with-background-pages",
                 "disable-dev-shm-usage",
+                "disable-background-timer-throttling",
+                "disable-backgrounding-occluded-windows",
+                "disable-renderer-backgrounding",
                 "disable-extensions",
                 "disable-sync",
                 "deny-permission-prompts",
-                "disable-features=TranslateUI",
+                "disable-features=TranslateUI,IntensiveWakeUpThrottling",
                 "force-color-profile=srgb",
                 "password-store=basic",
                 "use-mock-keychain",
@@ -742,12 +780,20 @@ impl BrowserRenderer {
             pid,
             process,
             monitor: StdMutex::new(Some(monitor)),
+            retired: AtomicBool::new(false),
             closed: false,
         })
     }
 
     pub fn info(&self) -> &BrowserInfo {
         &self.info
+    }
+
+    /// Test-only hook control, used by the real-browser lifecycle fixtures.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn set_audit_test_hook(&mut self, hook: Option<AuditTestHook>) {
+        self.config.audit_test_hook = hook;
     }
 
     /// The application-owned profile directory, while the browser is running.
@@ -761,9 +807,44 @@ impl BrowserRenderer {
         self.pid
     }
 
+    /// Whether a stuck audit retired this browser for the rest of the current crawl.
+    #[doc(hidden)]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
+    }
+
+    /// Number of page targets currently open in the owned browser. Exposed so lifecycle tests
+    /// can prove that a timed-out audit page and its isolated context were cleaned up.
+    #[doc(hidden)]
+    pub fn open_page_count(&self) -> Option<usize> {
+        let runtime = self.runtime.as_ref()?;
+        let browser = self.browser.clone();
+        runtime.block_on(async move {
+            let guard = tokio::time::timeout(Duration::from_secs(2), browser.lock())
+                .await
+                .ok()?;
+            tokio::time::timeout(Duration::from_secs(2), guard.pages())
+                .await
+                .ok()?
+                .ok()
+                .map(|pages| pages.len())
+        })
+    }
+
     /// Render one URL. Runs off the UI thread and may be called from two crawl workers.
     pub fn render(&self, url: &str, allowed: UrlFilter, cancel: Arc<AtomicBool>) -> Capture {
         let started = Instant::now();
+        if self.retired.load(Ordering::Relaxed) {
+            return Capture {
+                state: RenderState::Failed,
+                requested_url: url.to_string(),
+                observed_url: url.to_string(),
+                reason: "The Browser renderer was retired after a stuck accessibility audit; remaining pages in this crawl are unavailable."
+                    .into(),
+                browser: self.info.version.clone(),
+                ..Capture::default()
+            };
+        }
         if cancel.load(Ordering::Relaxed) {
             return stopped_capture(url, &self.info.version, "Stopped before rendering");
         }
@@ -799,6 +880,12 @@ impl BrowserRenderer {
             },
         };
         capture.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if let Some(scan) = capture.accessibility.as_mut() {
+            scan.browser = self.info.version.clone();
+            if scan.state == accessibility::ExecutionState::TimedOut {
+                self.retired.store(true, Ordering::Relaxed);
+            }
+        }
         capture
     }
 
@@ -832,8 +919,13 @@ impl BrowserRenderer {
         stop_browser_process(&self.process);
         unregister_browser(&self.process, self.pid.take());
         runtime.shutdown_timeout(Duration::from_secs(2));
-        // Dropping the temp directory removes the application-owned profile.
-        self.profile.take();
+        // Remove the application-owned profile with the same bounded retry used by the emergency
+        // sweep. TempDir's single best-effort drop can race a just-killed browser on Linux.
+        if let Some(profile) = self.profile.take() {
+            let path = profile.path().to_path_buf();
+            drop(profile);
+            remove_profile(&path);
+        }
     }
 }
 
@@ -945,7 +1037,8 @@ async fn run_job(
 ) -> Result<Capture, String> {
     // One absolute deadline covers queueing, setup, navigation, settling, source capture,
     // extraction and the bounded cleanup that follows. No phase gets its own fresh budget.
-    let deadline = Instant::now() + config.deadline;
+    let job_started = Instant::now();
+    let deadline = job_started + config.deadline;
 
     let permit = {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1102,7 +1195,16 @@ async fn run_job(
         set.insert(page.target_id().inner().clone());
     }
 
-    let result = capture_page(&page, &config, &url, allowed, cancel.clone(), deadline).await;
+    let result = capture_page(
+        &page,
+        &config,
+        &url,
+        allowed,
+        cancel.clone(),
+        deadline,
+        job_started,
+    )
+    .await;
 
     if let Ok(mut set) = owned.lock() {
         set.remove(page.target_id().inner());
@@ -1228,6 +1330,7 @@ async fn capture_page(
     allowed: UrlFilter,
     cancel: Arc<AtomicBool>,
     deadline: Instant,
+    job_started: Instant,
 ) -> Capture {
     let progress = Arc::new(StdMutex::new(Progress {
         observed_url: url.to_string(),
@@ -1794,8 +1897,29 @@ async fn capture_page(
         && !same_document
         && status == 200
         && html;
+    let mut accessibility_prepared = None;
     if should_extract {
-        match extract_dom(page, config.max_body_bytes, deadline, &cancel).await {
+        let extract = extract_dom(page, config.max_body_bytes, deadline, &cancel);
+        let dom_result = if config.accessibility && !cancel.load(Ordering::Relaxed) {
+            let (dom_result, prepared) = tokio::join!(
+                extract,
+                prepare_accessibility_world(
+                    page,
+                    &main_frame,
+                    config,
+                    url,
+                    deadline,
+                    job_started,
+                    None,
+                    &cancel,
+                )
+            );
+            accessibility_prepared = Some(prepared);
+            dom_result
+        } else {
+            extract.await
+        };
+        match dom_result {
             Ok((dom, truncated)) => {
                 rendered = Some(dom);
                 rendered_truncated = truncated;
@@ -1823,6 +1947,154 @@ async fn capture_page(
         rendered = None;
         rendered_truncated = false;
         should_extract = false;
+    }
+
+    // The audit runs only after the selected DOM and its identity are settled. It gets its own
+    // bounded window, never a fresh render deadline, and can never turn successful SEO capture
+    // into a render failure. The document and frame identity are checked again below.
+    let capture_completed = Instant::now();
+    let mut accessibility_scan = None;
+    if config.accessibility {
+        let viewport = accessibility::Viewport {
+            width: config.viewport.0,
+            height: config.viewport.1,
+        };
+        let declined = if cancel.load(Ordering::Relaxed) {
+            Some((
+                accessibility::ExecutionState::Stopped,
+                "Stopped by the user before the accessibility audit".to_string(),
+            ))
+        } else if let Some(reason) = failure.clone() {
+            Some((accessibility::ExecutionState::Failed, reason))
+        } else if !html {
+            Some((
+                accessibility::ExecutionState::NotApplicable,
+                "The captured document is not HTML; it was not audited".to_string(),
+            ))
+        } else if redirected {
+            Some((
+                accessibility::ExecutionState::NotApplicable,
+                "The main response redirected; the destination is audited separately if queued"
+                    .to_string(),
+            ))
+        } else if blocked {
+            Some((
+                accessibility::ExecutionState::NotApplicable,
+                "The main document request was blocked, so there was no page to audit".to_string(),
+            ))
+        } else if limited {
+            Some((
+                accessibility::ExecutionState::Limited,
+                "Resource limits stopped loading before the page was complete, so the audit was declined"
+                    .to_string(),
+            ))
+        } else if same_document {
+            Some((
+                accessibility::ExecutionState::NotApplicable,
+                "A script changed the document URL; findings would belong to the destination"
+                    .to_string(),
+            ))
+        } else if rendered.is_none() {
+            Some((
+                accessibility::ExecutionState::Failed,
+                "The rendered DOM was not available for the accessibility audit".to_string(),
+            ))
+        } else if rendered_truncated {
+            Some((
+                accessibility::ExecutionState::Limited,
+                "The DOM capture was truncated, so the accessibility audit was declined"
+                    .to_string(),
+            ))
+        } else {
+            None
+        };
+        accessibility_scan = Some(match declined {
+            Some((state, reason)) => {
+                accessibility::Scan::declined(state, reason, url, viewport, String::new())
+            }
+            None => {
+                capture_accessibility(
+                    page,
+                    &main_frame,
+                    config,
+                    url,
+                    deadline,
+                    job_started,
+                    capture_completed,
+                    &cancel,
+                    accessibility_prepared.take(),
+                )
+                .await
+            }
+        });
+    }
+
+    // Re-read the same transition evidence after the audit. A path/query change, blocked
+    // navigation or resource limit during the scan invalidates its findings; it never inherits
+    // them for the requested URL.
+    let (post_blocked, post_limited, post_same_document) = {
+        let state = lock(&progress);
+        (
+            state.blocked,
+            state.resource_limited,
+            !state.same_document_to.is_empty(),
+        )
+    };
+    if post_blocked || post_limited || post_same_document {
+        rendered = None;
+        rendered_truncated = false;
+        should_extract = false;
+        if let Some(scan) = accessibility_scan.as_mut()
+            && (scan.state.has_results() || scan.state == accessibility::ExecutionState::TimedOut)
+        {
+            scan.rules.clear();
+            scan.coverage.rules_retained = 0;
+            scan.coverage.nodes_retained = 0;
+            scan.coverage.occurrences_retained = 0;
+            scan.coverage.rules_truncated = scan.coverage.rules_reported.unwrap_or(0) > 0;
+            scan.coverage.nodes_truncated = scan.coverage.nodes_reported.unwrap_or(0) > 0;
+            scan.state = accessibility::ExecutionState::Failed;
+            scan.reason = "The document identity changed during the accessibility audit; findings were discarded"
+                .to_string();
+        }
+    }
+
+    if let Some(scan) = accessibility_scan.as_mut() {
+        let observed = {
+            let state = lock(&progress);
+            state.observed_url.clone()
+        };
+        scan.observed_url = observed.clone();
+        if (scan.state.has_results() || scan.state == accessibility::ExecutionState::TimedOut)
+            && !scan.document_url.is_empty()
+            && !same_document_identity(&scan.document_url, &observed)
+        {
+            scan.rules.clear();
+            scan.coverage.rules_retained = 0;
+            scan.coverage.nodes_retained = 0;
+            scan.coverage.occurrences_retained = 0;
+            scan.coverage.rules_truncated = scan.coverage.rules_reported.unwrap_or(0) > 0;
+            scan.coverage.nodes_truncated = scan.coverage.nodes_reported.unwrap_or(0) > 0;
+            scan.state = accessibility::ExecutionState::Failed;
+            scan.reason = format!(
+                "The audited document URL changed from {} to {observed}; findings were discarded",
+                scan.document_url
+            );
+        }
+    }
+
+    // A timed-out audit can still be executing synchronous JS in the isolated world. CDP
+    // evaluation timeouts stop the host wait, not the renderer work. Terminate the page's JS
+    // before target/context disposal so the renderer thread is reusable by the next crawl.
+    if accessibility_scan
+        .as_ref()
+        .is_some_and(|scan| scan.state == accessibility::ExecutionState::TimedOut)
+    {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            page.execute(TerminateExecutionParams::default()),
+        )
+        .await;
     }
 
     watcher.abort();
@@ -1898,6 +2170,7 @@ async fn capture_page(
             source_note: state.source_note.clone(),
             rendered_html: rendered.clone(),
             rendered_truncated,
+            accessibility: accessibility_scan,
             resource_failures: state.resource_failures.clone(),
             requested_url: url.to_string(),
             observed_url: state.observed_url.clone(),
@@ -2199,6 +2472,725 @@ async fn extract_dom(
         .unwrap_or(false);
     let (html, cut) = truncate_text(&html, max_bytes);
     Ok((html, truncated || cut))
+}
+
+/// Evaluate one bounded expression in a specific isolated execution world.
+enum WorldEval {
+    Value(serde_json::Value),
+    Cancelled,
+    Deadline,
+    Failed(String),
+}
+
+async fn evaluate_in_world(
+    page: &Page,
+    context_id: ExecutionContextId,
+    expression: String,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    await_promise: bool,
+) -> WorldEval {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return WorldEval::Deadline;
+    }
+    let started = Instant::now();
+    let params = match EvaluateParams::builder()
+        .expression(expression)
+        .context_id(context_id)
+        .return_by_value(true)
+        .await_promise(await_promise)
+        .timeout(TimeDelta::new(remaining.as_millis().max(1) as f64))
+        .build()
+    {
+        Ok(params) => params,
+        Err(error) => {
+            return WorldEval::Failed(format!(
+                "the accessibility evaluation could not be built: {error}"
+            ));
+        }
+    };
+    let evaluated = tokio::select! {
+        _ = wait_cancelled(cancel) => return WorldEval::Cancelled,
+        result = tokio::time::timeout(remaining, page.evaluate_expression(params)) => result,
+    };
+    match evaluated {
+        Err(_) => WorldEval::Deadline,
+        Ok(Err(error)) => {
+            let text =
+                format!("the isolated accessibility world could not evaluate the scan: {error}");
+            if execution_timed_out(&text)
+                || started.elapsed().saturating_add(Duration::from_millis(100)) >= remaining
+            {
+                WorldEval::Deadline
+            } else {
+                WorldEval::Failed(text)
+            }
+        }
+        Ok(Ok(evaluated)) => match evaluated.into_value::<serde_json::Value>() {
+            Ok(value) => WorldEval::Value(value),
+            Err(error) => WorldEval::Failed(format!(
+                "the accessibility scan returned an unreadable value: {error}"
+            )),
+        },
+    }
+}
+
+fn execution_timed_out(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timed out") || error.contains("timeout") || error.contains("terminated")
+}
+
+/// Preflight counts elements, including supported open-shadow descendants, without running the
+/// engine. A document over the limit is declined rather than partially audited.
+const ACCESSIBILITY_PREFLIGHT: &str = r##"(() => {
+  const LIMIT = __LIMIT__;
+  let count = 0;
+  const stack = document.documentElement ? [document.documentElement] : [];
+  while (stack.length) {
+    const element = stack.pop();
+    count += 1;
+    if (count > LIMIT) return { elements: count, limited: true };
+    const shadow = element.shadowRoot;
+    if (shadow && shadow.firstElementChild) stack.push(shadow.firstElementChild);
+    if (element.firstElementChild) stack.push(element.firstElementChild);
+    if (element.nextElementSibling) stack.push(element.nextElementSibling);
+  }
+  return { elements: count, limited: false };
+})()"##;
+
+const ACCESSIBILITY_AUDIT: &str = r##"(async () => {
+  const TAGS = __TAGS__;
+  const ENGINE = __ENGINE__;
+  const PROFILE = __PROFILE__;
+  const LIMIT_RULES = __MAX_RULES__;
+  const LIMIT_NODES = __MAX_NODES__;
+  const LIMIT_PAYLOAD = __MAX_PAYLOAD__;
+  const MAX_TARGET = __MAX_TARGET__;
+  const MAX_TARGET_PART = __MAX_TARGET_PART__;
+  const MAX_HTML = __MAX_HTML__;
+  const MAX_TEXT = __MAX_TEXT__;
+  const MAX_ID = __MAX_ID__;
+  const MAX_HELP = __MAX_HELP__;
+  const MAX_TAGS = __MAX_TAGS__;
+  const MAX_SELECTED = __MAX_SELECTED__;
+  const PREFLIGHT = __PREFLIGHT__;
+  const enc = new TextEncoder();
+  const bytes = (value) => enc.encode(value).length;
+  const text = (value) => (typeof value === 'string' ? value : '');
+  const cut = (value, cap) => {
+    const source = text(value);
+    if (bytes(source) <= cap) return [source, false];
+    let lo = 0;
+    let hi = source.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (bytes(source.slice(0, mid)) <= cap) lo = mid; else hi = mid - 1;
+    }
+    if (lo > 0) {
+      const last = source.charCodeAt(lo - 1);
+      if (last >= 0xD800 && last <= 0xDBFF) lo -= 1;
+    }
+    return [source.slice(0, lo), true];
+  };
+  const impact = (value) => (
+    ['minor', 'moderate', 'serious', 'critical'].includes(value) ? value : 'unknown'
+  );
+  const normalizeTarget = (raw) => {
+    let truncated = false;
+    if (!Array.isArray(raw)) return { target: [], targetTruncated: true };
+    const paths = raw.map((part) => {
+      const list = Array.isArray(part) ? part : [part];
+      return list.map((item) => {
+        const [value, clipped] = cut(String(item), MAX_TARGET_PART);
+        truncated = truncated || clipped;
+        return value;
+      });
+    });
+    let used = 0;
+    const kept = [];
+    for (const path of paths) {
+      const pieces = [];
+      for (const part of path) {
+        const cost = bytes(part) + 1;
+        if (used + cost > MAX_TARGET) {
+          truncated = true;
+          break;
+        }
+        used += cost;
+        pieces.push(part);
+      }
+      if (pieces.length) kept.push(pieces);
+      else if (path.length) truncated = true;
+    }
+    return { target: kept, targetTruncated: truncated };
+  };
+
+  let selectedRulesTruncated = false;
+  const rawSelected = axe.getRules(TAGS);
+  const selectedRules = [];
+  for (const rule of rawSelected) {
+    if (selectedRules.length >= MAX_SELECTED) {
+      selectedRulesTruncated = true;
+      break;
+    }
+    const [value, clipped] = cut(rule && rule.ruleId, MAX_ID);
+    if (clipped) selectedRulesTruncated = true;
+    selectedRules.push(value);
+  }
+
+  const auditPromise = axe.run(document, {
+    runOnly: { type: 'tag', values: TAGS },
+    reporter: 'v2',
+    resultTypes: ['violations', 'incomplete'],
+    iframes: false,
+    preload: false,
+    selectors: true,
+    elementRef: false
+  });
+  __TEST_HOOK__
+  const results = await auditPromise;
+
+  const outcome = {
+    violationRules: results.violations.length,
+    incompleteRules: results.incomplete.length,
+    passRules: results.passes.length,
+    inapplicableRules: results.inapplicable.length
+  };
+  const returnedRules = [];
+  let returnedRulesTruncated = false;
+  for (const list of [results.violations, results.incomplete, results.passes, results.inapplicable]) {
+    for (const rule of list) {
+      if (returnedRules.length >= MAX_SELECTED) {
+        returnedRulesTruncated = true;
+        break;
+      }
+      const [value, clipped] = cut(rule && rule.id, MAX_ID);
+      if (clipped) returnedRulesTruncated = true;
+      returnedRules.push(value);
+    }
+    if (returnedRulesTruncated) break;
+  }
+  const rules = [];
+  let nodes = 0;
+  let rulesTruncated = false;
+  let nodesTruncated = false;
+  let payloadLimited = false;
+  const groups = [
+    ['violation', results.violations],
+    ['needs_review', results.incomplete]
+  ];
+  for (const group of groups) {
+    const kind = group[0];
+    const list = group[1];
+    for (const rule of list) {
+      if (rules.length >= LIMIT_RULES) {
+        rulesTruncated = true;
+        break;
+      }
+      const reported = Array.isArray(rule.nodes) ? rule.nodes.length : 0;
+      const nodesOut = [];
+      for (let index = 0; index < reported; index += 1) {
+        if (nodes >= LIMIT_NODES) {
+          nodesTruncated = true;
+          break;
+        }
+        const item = rule.nodes[index] || {};
+        const [html, htmlCut] = cut(item.html, MAX_HTML);
+        const [failure, failureCut] = cut(item.failureSummary, MAX_TEXT);
+        const target = normalizeTarget(item.target);
+        nodesOut.push({
+          ordinal: index + 1,
+          impact: impact(item.impact),
+          target: target.target,
+          targetTruncated: target.targetTruncated,
+          html: html,
+          htmlTruncated: htmlCut,
+          failure: failure,
+          failureTruncated: failureCut
+        });
+        nodes += 1;
+      }
+      const [ruleId, idCut] = cut(rule.id, MAX_ID);
+      const [title, titleCut] = cut(rule.help, MAX_TEXT);
+      const [description, descriptionCut] = cut(rule.description, MAX_TEXT);
+      const [helpUrl, helpCut] = cut(rule.helpUrl, MAX_HELP);
+      const tags = [];
+      let tagsTruncated = false;
+      const rawTags = Array.isArray(rule.tags) ? rule.tags : [];
+      for (const tag of rawTags) {
+        if (tags.length >= MAX_TAGS) {
+          tagsTruncated = true;
+          break;
+        }
+        const [value, clipped] = cut(tag, MAX_ID);
+        if (clipped) tagsTruncated = true;
+        tags.push(value);
+      }
+      const reportedNodes = nodesOut.length < reported;
+      nodesTruncated = nodesTruncated || reportedNodes;
+      rules.push({
+        ruleId: ruleId,
+        title: title,
+        description: description,
+        impact: impact(rule.impact),
+        kind: kind,
+        tags: tags,
+        helpUrl: helpUrl,
+        nodesReported: reported,
+        nodesTruncated: reportedNodes,
+        fieldsTruncated: idCut || titleCut || descriptionCut || helpCut,
+        tagsTruncated: tagsTruncated,
+        nodes: nodesOut
+      });
+    }
+  }
+
+  const reportedNodes = results.violations.reduce(
+    (total, rule) => total + (Array.isArray(rule.nodes) ? rule.nodes.length : 0),
+    0
+  ) + results.incomplete.reduce(
+    (total, rule) => total + (Array.isArray(rule.nodes) ? rule.nodes.length : 0),
+    0
+  );
+  const out = {
+    state: 'completed',
+    engineVersion: ENGINE,
+    profile: PROFILE,
+    tags: TAGS,
+    viewport: { width: __VIEWPORT_W__, height: __VIEWPORT_H__ },
+    preflightElements: PREFLIGHT,
+    documentUrl: document.URL,
+    selectedRules: selectedRules,
+    selectedRulesTruncated: selectedRulesTruncated,
+    returnedRules: returnedRules,
+    returnedRulesTruncated: returnedRulesTruncated,
+    outcome: outcome,
+    coverage: {
+      elementsLimit: __ELEMENT_LIMIT__,
+      preflightElements: PREFLIGHT,
+      preflightLimited: false,
+      rulesReported: results.violations.length + results.incomplete.length,
+      rulesRetained: rules.length,
+      rulesTruncated: rulesTruncated,
+      nodesReported: reportedNodes,
+      nodesRetained: nodes,
+      nodesTruncated: nodesTruncated,
+      occurrencesReported: reportedNodes,
+      occurrencesRetained: nodes,
+      payloadBytes: 0,
+      payloadLimited: false,
+      budgetLimited: false,
+      runLimited: false,
+      notes: []
+    },
+    rules: rules,
+    payloadBytes: 0
+  };
+  const sync = () => {
+    out.coverage.rulesRetained = rules.length;
+    out.coverage.nodesRetained = nodes;
+    out.coverage.occurrencesRetained = nodes;
+    out.coverage.rulesTruncated = rulesTruncated;
+    out.coverage.nodesTruncated = nodesTruncated;
+  };
+  let encoded = bytes(JSON.stringify(out));
+  let guard = 0;
+  while (encoded > LIMIT_PAYLOAD && guard < LIMIT_RULES + LIMIT_NODES + 32) {
+    guard += 1;
+    payloadLimited = true;
+    let dropped = false;
+    for (let index = rules.length - 1; index >= 0; index -= 1) {
+      if (rules[index].nodes.length) {
+        nodes -= rules[index].nodes.length;
+        rules[index].nodes = [];
+        rules[index].nodesTruncated = true;
+        nodesTruncated = true;
+        dropped = true;
+        break;
+      }
+    }
+    if (!dropped && rules.length) {
+      rules.pop();
+      rulesTruncated = true;
+      dropped = true;
+    }
+    if (!dropped) break;
+    sync();
+    encoded = bytes(JSON.stringify(out));
+  }
+  if (encoded > LIMIT_PAYLOAD) {
+    out.selectedRules = [];
+    out.selectedRulesTruncated = true;
+    payloadLimited = true;
+    encoded = bytes(JSON.stringify(out));
+  }
+  out.coverage.payloadLimited = payloadLimited;
+  out.coverage.payloadBytes = encoded;
+  out.payloadBytes = encoded;
+  return out;
+})()"##;
+
+#[cfg(debug_assertions)]
+fn accessibility_test_hook_script(hook: &AuditTestHook) -> String {
+    match hook {
+        AuditTestHook::StallInAudit { millis, .. } => {
+            format!("const until = Date.now() + {millis}; while (Date.now() < until) {{}}")
+        }
+        AuditTestHook::NavigateDuringAudit { url } => format!(
+            "setTimeout(() => history.pushState(null, '', {}), 0);",
+            serde_json::to_string(&url).unwrap_or_else(|_| "\"/\"".into())
+        ),
+    }
+}
+
+fn accessibility_audit_script(
+    preflight_expression: &str,
+    viewport: accessibility::Viewport,
+    test_hook: &str,
+) -> String {
+    ACCESSIBILITY_AUDIT
+        .replace(
+            "__TAGS__",
+            &serde_json::to_string(&accessibility::PROFILE_TAGS).unwrap_or_else(|_| "[]".into()),
+        )
+        .replace(
+            "__ENGINE__",
+            &format!("\"{}\"", accessibility::ENGINE_VERSION),
+        )
+        .replace("__PROFILE__", &format!("\"{}\"", accessibility::PROFILE_ID))
+        .replace(
+            "__MAX_RULES__",
+            &accessibility::MAX_RULES_PER_PAGE.to_string(),
+        )
+        .replace(
+            "__MAX_NODES__",
+            &accessibility::MAX_NODES_PER_PAGE.to_string(),
+        )
+        .replace(
+            "__MAX_PAYLOAD__",
+            &accessibility::MAX_PAYLOAD_BYTES.to_string(),
+        )
+        .replace(
+            "__MAX_TARGET__",
+            &accessibility::MAX_TARGET_BYTES.to_string(),
+        )
+        .replace(
+            "__MAX_TARGET_PART__",
+            &accessibility::MAX_TARGET_COMPONENT_BYTES.to_string(),
+        )
+        .replace("__MAX_HTML__", &accessibility::MAX_HTML_BYTES.to_string())
+        .replace("__MAX_TEXT__", &accessibility::MAX_TEXT_BYTES.to_string())
+        .replace(
+            "__MAX_ID__",
+            &accessibility::MAX_IDENTIFIER_BYTES.to_string(),
+        )
+        .replace(
+            "__MAX_HELP__",
+            &accessibility::MAX_HELP_URL_BYTES.to_string(),
+        )
+        .replace("__MAX_TAGS__", &accessibility::MAX_TAGS.to_string())
+        .replace(
+            "__MAX_SELECTED__",
+            &accessibility::MAX_SELECTED_RULES.to_string(),
+        )
+        .replace("__PREFLIGHT__", preflight_expression)
+        .replace(
+            "__ELEMENT_LIMIT__",
+            &accessibility::MAX_PREFLIGHT_ELEMENTS.to_string(),
+        )
+        .replace("__VIEWPORT_W__", &viewport.width.to_string())
+        .replace("__VIEWPORT_H__", &viewport.height.to_string())
+        .replace("__TEST_HOOK__", test_hook)
+}
+
+/// Run the opt-in audit in a named isolated world bound to the main frame. Universal cross-origin
+/// access stays disabled; the engine is embedded and never fetched. Any failure is reported as
+/// accessibility evidence only and leaves the successful SEO capture untouched.
+///
+/// Prepare only the isolated world and installed engine during capture. The axe scan still runs
+/// after settled capture. Setup is bounded by the original render deadline; if the render budget
+/// is insufficient it declines without delaying or erasing the SEO capture.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_accessibility_world(
+    page: &Page,
+    main_frame: &FrameId,
+    config: &RenderConfig,
+    url: &str,
+    deadline: Instant,
+    job_started: Instant,
+    capture_completed: Option<Instant>,
+    cancel: &AtomicBool,
+) -> Result<ExecutionContextId, Box<accessibility::Scan>> {
+    let viewport = accessibility::Viewport {
+        width: config.viewport.0,
+        height: config.viewport.1,
+    };
+    let declined = |state, reason: String| {
+        Box::new(accessibility::Scan::declined(
+            state,
+            reason,
+            url,
+            viewport,
+            String::new(),
+        ))
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(declined(
+            accessibility::ExecutionState::Stopped,
+            "Stopped by the user before the accessibility audit".into(),
+        ));
+    }
+    let ceiling = if let Some(completed) = capture_completed {
+        (deadline + accessibility::AUDIT_BUDGET)
+            .min(job_started + accessibility::MAX_AUDIT_JOB)
+            .min(completed + accessibility::AUDIT_BUDGET)
+    } else {
+        deadline.min(job_started + accessibility::MAX_AUDIT_JOB)
+    };
+    if capture_completed.is_none()
+        && ceiling.saturating_duration_since(Instant::now()) < Duration::from_secs(6)
+    {
+        return Err(declined(
+            accessibility::ExecutionState::TimedOut,
+            "The render deadline left too little time to prepare the accessibility audit".into(),
+        ));
+    }
+    let world_params = match CreateIsolatedWorldParams::builder()
+        .frame_id(main_frame.clone())
+        .world_name("calmtoad-accessibility")
+        .grant_univeral_access(false)
+        .build()
+    {
+        Ok(params) => params,
+        Err(error) => {
+            return Err(declined(
+                accessibility::ExecutionState::Failed,
+                format!("The isolated accessibility world request was invalid: {error}"),
+            ));
+        }
+    };
+    let remaining = ceiling.saturating_duration_since(Instant::now());
+    let world = tokio::select! {
+        _ = wait_cancelled(cancel) => return Err(declined(
+            accessibility::ExecutionState::Stopped,
+            "Stopped by the user before the accessibility world was ready".into(),
+        )),
+        result = tokio::time::timeout(remaining, page.execute(world_params)) => result,
+    };
+    let context_id = match world {
+        Err(_) => {
+            return Err(declined(
+                accessibility::ExecutionState::TimedOut,
+                "The isolated accessibility world did not start before the audit deadline".into(),
+            ));
+        }
+        Ok(Err(error)) => {
+            return Err(declined(
+                accessibility::ExecutionState::Failed,
+                format!("The isolated accessibility world could not be created: {error}"),
+            ));
+        }
+        Ok(Ok(response)) => response.result.execution_context_id,
+    };
+    let engine = evaluate_in_world(
+        page,
+        context_id,
+        format!(
+            "{}
+true",
+            accessibility::ENGINE_SOURCE
+        ),
+        ceiling,
+        cancel,
+        false,
+    )
+    .await;
+    match engine {
+        WorldEval::Value(_) => {}
+        WorldEval::Cancelled => {
+            return Err(declined(
+                accessibility::ExecutionState::Stopped,
+                "Stopped by the user while installing the accessibility engine".into(),
+            ));
+        }
+        WorldEval::Deadline => {
+            return Err(declined(
+                accessibility::ExecutionState::TimedOut,
+                "The accessibility engine did not install before the audit deadline".into(),
+            ));
+        }
+        WorldEval::Failed(reason) => {
+            return Err(declined(accessibility::ExecutionState::Failed, reason));
+        }
+    }
+    Ok(context_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn capture_accessibility(
+    page: &Page,
+    main_frame: &FrameId,
+    config: &RenderConfig,
+    url: &str,
+    deadline: Instant,
+    job_started: Instant,
+    capture_completed: Instant,
+    cancel: &AtomicBool,
+    prepared: Option<Result<ExecutionContextId, Box<accessibility::Scan>>>,
+) -> accessibility::Scan {
+    let viewport = accessibility::Viewport {
+        width: config.viewport.0,
+        height: config.viewport.1,
+    };
+    let declined = |state, reason: String| {
+        accessibility::Scan::declined(state, reason, url, viewport, String::new())
+    };
+    let context_id = match prepared {
+        Some(Ok(context_id)) => context_id,
+        Some(Err(scan)) => return *scan,
+        None => match prepare_accessibility_world(
+            page,
+            main_frame,
+            config,
+            url,
+            deadline,
+            job_started,
+            Some(capture_completed),
+            cancel,
+        )
+        .await
+        {
+            Ok(context_id) => context_id,
+            Err(scan) => return *scan,
+        },
+    };
+    let ceiling = (deadline + accessibility::AUDIT_BUDGET)
+        .min(job_started + accessibility::MAX_AUDIT_JOB)
+        .min(capture_completed + accessibility::AUDIT_BUDGET);
+    if Instant::now() >= ceiling {
+        return declined(
+            accessibility::ExecutionState::TimedOut,
+            "The post-capture accessibility window expired before the audit could start".into(),
+        );
+    }
+    let preflight_script = ACCESSIBILITY_PREFLIGHT.replace(
+        "__LIMIT__",
+        &accessibility::MAX_PREFLIGHT_ELEMENTS.to_string(),
+    );
+    let preflight =
+        evaluate_in_world(page, context_id, preflight_script, ceiling, cancel, false).await;
+    let elements = match preflight {
+        WorldEval::Value(value) => {
+            let elements = value
+                .get("elements")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let limited = value
+                .get("limited")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if limited {
+                let mut scan = declined(
+                    accessibility::ExecutionState::Limited,
+                    format!(
+                        "The document has more than {} elements including open shadow roots; the audit was declined",
+                        accessibility::MAX_PREFLIGHT_ELEMENTS
+                    ),
+                );
+                scan.preflight_elements = Some(elements);
+                scan.coverage.preflight_elements = Some(elements);
+                scan.coverage.preflight_limited = true;
+                return scan;
+            }
+            elements
+        }
+        WorldEval::Cancelled => {
+            return declined(
+                accessibility::ExecutionState::Stopped,
+                "Stopped by the user during accessibility preflight".into(),
+            );
+        }
+        WorldEval::Deadline => {
+            return declined(
+                accessibility::ExecutionState::TimedOut,
+                "Accessibility preflight did not finish before the audit deadline".into(),
+            );
+        }
+        WorldEval::Failed(reason) => {
+            return declined(accessibility::ExecutionState::Failed, reason);
+        }
+    };
+    #[cfg(debug_assertions)]
+    let test_hook = match &config.audit_test_hook {
+        Some(AuditTestHook::StallInAudit { started, .. }) => {
+            if let Ok(mut slot) = started.lock() {
+                *slot = Some(Instant::now());
+            }
+            Some(accessibility_test_hook_script(
+                config.audit_test_hook.as_ref().expect("hook"),
+            ))
+        }
+        Some(hook) => Some(accessibility_test_hook_script(hook)),
+        None => None,
+    };
+    #[cfg(not(debug_assertions))]
+    let test_hook: Option<String> = None;
+    let started_scan = Instant::now();
+    let script = accessibility_audit_script(
+        &elements.to_string(),
+        viewport,
+        test_hook.as_deref().unwrap_or_default(),
+    );
+    let audited = evaluate_in_world(page, context_id, script, ceiling, cancel, true).await;
+    let value = match audited {
+        WorldEval::Value(value) => value,
+        WorldEval::Cancelled => {
+            return declined(
+                accessibility::ExecutionState::Stopped,
+                "Stopped by the user during the accessibility audit".into(),
+            );
+        }
+        WorldEval::Deadline => {
+            return declined(
+                accessibility::ExecutionState::TimedOut,
+                "The accessibility audit did not finish within its bounded window".into(),
+            );
+        }
+        WorldEval::Failed(reason) => {
+            return declined(accessibility::ExecutionState::Failed, reason);
+        }
+    };
+    let bytes = match serde_json::to_vec(&value) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return declined(
+                accessibility::ExecutionState::Failed,
+                format!("The accessibility result could not be serialized: {error}"),
+            );
+        }
+    };
+    match accessibility::decode_payload(&bytes) {
+        Ok(mut scan) => {
+            scan.requested_url = url.to_string();
+            scan.viewport = viewport;
+            scan.frame_id = main_frame.inner().clone();
+            scan.scanned_at = accessibility::now_unix();
+            scan.elapsed_ms = started_scan.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            scan.preflight_elements = Some(elements);
+            scan
+        }
+        Err(error) => declined(accessibility::ExecutionState::Failed, error.to_string()),
+    }
+}
+
+fn same_document_identity(left: &str, right: &str) -> bool {
+    let (Ok(mut left), Ok(mut right)) = (url::Url::parse(left), url::Url::parse(right)) else {
+        return left == right;
+    };
+    left.set_fragment(None);
+    right.set_fragment(None);
+    left == right
 }
 
 fn failure_capture(url: &str, reason: &str) -> Capture {

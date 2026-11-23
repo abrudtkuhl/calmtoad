@@ -2083,6 +2083,7 @@ mod tests {
             extraction_limit: String::new(),
             content: std::sync::Arc::new(crate::content::ContentEvidence::default()),
             structured: std::sync::Arc::new(crate::structured_data::PageReport::default()),
+            accessibility: std::sync::Arc::new(crate::accessibility::Report::not_requested()),
             indexability: assessment,
         };
         report.observe_page(&page);
