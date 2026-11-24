@@ -13,3 +13,4 @@ pub mod render;
 pub mod sitemap;
 pub mod structured_data;
 pub mod update;
+pub mod url_list;

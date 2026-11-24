@@ -27,6 +27,9 @@ use crate::links::{self, LinkCheckResult, LinkCheckState, LinkOccurrence};
 use crate::render::{self, BrowserRenderer, Capture, RenderMode, RenderState, SourceState};
 use crate::sitemap;
 use crate::structured_data::{self, StructuredBudget};
+use crate::url_list::{
+    ListCheck, Outcome as ListOutcome, Preview as ListPreview, Scope as ListScope, Seed as ListSeed,
+};
 
 /// A small, dependency-free hasher for the crawl's hot maps.
 ///
@@ -251,6 +254,9 @@ pub enum CrawlEvent {
     LinkCheckStarted(usize),
     /// One optional destination check finished.
     LinkCheck(String, LinkCheckResult),
+    /// One submitted URL-list row reached a final coverage state. The row identities come from
+    /// the caller's preview so duplicates and convergence stay distinguishable.
+    ListCheck(ListCheck),
 }
 
 /// The whole result of one crawl, including the sitemap report.
@@ -266,6 +272,8 @@ pub struct CrawlResult {
     pub setup_failure: Option<String>,
     /// The retained link-evidence tail hit the run cap.
     pub link_evidence_limited: bool,
+    /// Final per-submitted-row coverage for a URL-list run. Empty for an ordinary crawl.
+    pub list: Vec<ListCheck>,
 }
 
 /// How a crawl ended.
@@ -489,6 +497,82 @@ fn robots_for(
         cache.lock().unwrap().insert(origin, robots.clone());
     }
     robots
+}
+
+/// A URL-list run is strict about robots evidence: a policy that cannot be read is not
+/// permission. Redirect destinations are checked through the same per-origin cache.
+fn list_robots_policy(
+    origin: &str,
+    fetch: &(impl Fn(&str) -> Fetched + Sync),
+    policies: &mut HashMap<String, RobotsPolicy>,
+) -> RobotsPolicy {
+    if let Some(policy) = policies.get(origin) {
+        return policy.clone();
+    }
+    let fetched = fetch(&format!("{origin}/robots.txt"));
+    let policy = if fetched.status == 200 {
+        if fetched.body.is_empty() {
+            RobotsPolicy::Known(None)
+        } else {
+            RobotsPolicy::Known(Some(Robots::parse(&fetched.body, USER_AGENT)))
+        }
+    } else if (400..500).contains(&fetched.status) {
+        RobotsPolicy::Known(None)
+    } else if !fetched.error.is_empty() {
+        RobotsPolicy::Unavailable(fetched.error)
+    } else {
+        RobotsPolicy::Unavailable(format!("robots.txt returned HTTP {}", fetched.status))
+    };
+    policies.insert(origin.to_string(), policy.clone());
+    policy
+}
+
+fn list_origin(url: &Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+/// The scope permits both schemes on their default ports and, for a fixture seed, its explicit
+/// non-default port. Prefetch every possible in-scope origin so redirects and Browser navigation
+/// never find an allowed origin without a resolved robots policy.
+fn list_scope_origins(seed: &Url) -> Vec<Url> {
+    let mut origins: Vec<Url> = Vec::new();
+    for scheme in ["http", "https"] {
+        for port in [seed.port(), None] {
+            let mut url = seed.clone();
+            if url.set_scheme(scheme).is_err() {
+                continue;
+            }
+            url.set_path("/");
+            url.set_query(None);
+            url.set_fragment(None);
+            if url.set_port(port).is_err() {
+                continue;
+            }
+            let origin = list_origin(&url);
+            if !origins.iter().any(|seen| list_origin(seen) == origin) {
+                origins.push(url);
+            }
+        }
+    }
+    origins
+}
+
+fn list_policy_blocks(policy: &RobotsPolicy, url: &Url) -> Option<String> {
+    match policy {
+        RobotsPolicy::Known(Some(robots)) if !robots.allows(&request_path(url)) => {
+            Some("robots.txt disallows this URL".into())
+        }
+        RobotsPolicy::Unavailable(reason) => {
+            Some(format!("robots.txt could not be read: {reason}"))
+        }
+        _ => None,
+    }
+}
+
+fn list_policies_allow(policies: &HashMap<String, RobotsPolicy>, url: &Url) -> bool {
+    policies
+        .get(&list_origin(url))
+        .is_some_and(|policy| list_policy_blocks(policy, url).is_none())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1030,6 +1114,7 @@ pub fn crawl_site(seed: &str) -> Outcome {
         None,
         None,
         None,
+        None,
         &mut |_| {},
     );
     Outcome {
@@ -1057,6 +1142,7 @@ pub fn crawl_site_stream(
         Some(cancel),
         None,
         None,
+        None,
         &mut |event| {
             if let CrawlEvent::Page(page) = event {
                 on_page(&page);
@@ -1080,6 +1166,97 @@ pub fn crawl_site_with(
     cancel: Arc<AtomicBool>,
     mut on_event: impl FnMut(CrawlEvent),
 ) -> CrawlResult {
+    crawl_site_with_mode(seed, limits, options, None, cancel, &mut on_event)
+}
+
+/// Check an explicit, already normalized URL list through the ordinary crawl machinery.
+///
+/// This is the same engine as [`crawl_site_with`]: fetches, robots decisions, redirects,
+/// throttling, Browser capture, extraction and evidence are shared. List mode only changes
+/// scheduling (no discovered links or sitemaps) and adds per-submitted-row coverage.
+pub fn crawl_list_with(
+    seed: &str,
+    limits: Limits,
+    options: CrawlOptions,
+    seeds: Vec<ListSeed>,
+    cancel: Arc<AtomicBool>,
+    mut on_event: impl FnMut(CrawlEvent),
+) -> CrawlResult {
+    let result = crawl_site_with_mode(seed, limits, options, Some(&seeds), cancel, &mut on_event);
+    // Coverage is final only after redirects settle, so emit the complete set once.
+    for check in &result.list {
+        on_event(CrawlEvent::ListCheck(check.clone()));
+    }
+    result
+}
+
+/// The window entry point. The parsed preview is moved into the crawl thread so the UI does not
+/// build seeds or coverage rows for a large list.
+pub fn crawl_list_preview_with(
+    seed: &str,
+    limits: Limits,
+    options: CrawlOptions,
+    preview: Arc<ListPreview>,
+    cancel: Arc<AtomicBool>,
+    mut on_event: impl FnMut(CrawlEvent),
+) -> CrawlResult {
+    let seeds = preview.seeds();
+    crawl_list_with(seed, limits, options, seeds, cancel, &mut on_event)
+}
+
+/// Deterministic list-mode seam for integration tests. Production uses
+/// [`crawl_list_preview_with`].
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn crawl_list_with_options(
+    seed: &str,
+    limits: Limits,
+    options: CrawlOptions,
+    seeds: Vec<ListSeed>,
+    fetch: impl Fn(&str) -> Fetched + Sync,
+    cancel: Option<&AtomicBool>,
+    mut on_event: impl FnMut(CrawlEvent),
+) -> CrawlResult {
+    let result = crawl_engine(
+        seed,
+        limits,
+        fetch,
+        |_, _, _| sitemap::FetchedBytes::default(),
+        false,
+        options,
+        cancel,
+        None,
+        None,
+        Some(&seeds),
+        &mut on_event,
+    );
+    for check in &result.list {
+        on_event(CrawlEvent::ListCheck(check.clone()));
+    }
+    result
+}
+
+fn list_unchecked(seeds: &[ListSeed], reason: &str) -> Vec<ListCheck> {
+    seeds
+        .iter()
+        .map(|seed| ListCheck {
+            source_row: seed.source_row,
+            outcome: ListOutcome::Unchecked,
+            reason: reason.to_string(),
+            status: 0,
+            final_url: String::new(),
+        })
+        .collect()
+}
+
+fn crawl_site_with_mode(
+    seed: &str,
+    limits: Limits,
+    options: CrawlOptions,
+    list_seeds: Option<&[ListSeed]>,
+    cancel: Arc<AtomicBool>,
+    on_event: &mut dyn FnMut(CrawlEvent),
+) -> CrawlResult {
     let browser = match options.rendering {
         RenderMode::Html => None,
         RenderMode::Browser => {
@@ -1101,6 +1278,11 @@ pub fn crawl_site_with(
                             outcome: CrawlOutcome::Stopped,
                             setup_failure: None,
                             link_evidence_limited: false,
+                            list: list_seeds
+                                .map(|seeds| {
+                                    list_unchecked(seeds, "Stopped before the browser started")
+                                })
+                                .unwrap_or_default(),
                         };
                     }
                     return CrawlResult {
@@ -1110,6 +1292,9 @@ pub fn crawl_site_with(
                         outcome: CrawlOutcome::Failed,
                         setup_failure: Some(reason),
                         link_evidence_limited: false,
+                        list: list_seeds
+                            .map(|seeds| list_unchecked(seeds, "Browser could not start"))
+                            .unwrap_or_default(),
                     };
                 }
             }
@@ -1134,6 +1319,9 @@ pub fn crawl_site_with(
                             .unwrap_or("check the rule fields")
                     ),
                     outcome: CrawlOutcome::Failed,
+                    list: list_seeds
+                        .map(|seeds| list_unchecked(seeds, "Extraction rules are invalid"))
+                        .unwrap_or_default(),
                     ..CrawlResult::default()
                 };
             }
@@ -1149,7 +1337,8 @@ pub fn crawl_site_with(
         Some(&cancel),
         job,
         extraction,
-        &mut on_event,
+        list_seeds,
+        on_event,
     );
     drop(browser);
     result
@@ -1294,6 +1483,7 @@ pub fn crawl_with(seed: &str, limits: Limits, fetch: impl Fn(&str) -> Fetched + 
         None,
         None,
         None,
+        None,
         &mut |_| {},
     );
     Outcome {
@@ -1323,6 +1513,7 @@ pub fn crawl_with_options(
         false,
         options,
         cancel,
+        None,
         None,
         None,
         &mut on_event,
@@ -1817,65 +2008,188 @@ fn crawl_engine(
     cancel: Option<&AtomicBool>,
     browser: Option<BrowserJob<'_>>,
     compiled_extraction: Option<extract::CompiledRules>,
+    list_seeds: Option<&[ListSeed]>,
     on_event: &mut dyn FnMut(CrawlEvent),
 ) -> CrawlResult {
     let no_cancel = AtomicBool::new(false);
     let cancel = cancel.unwrap_or(&no_cancel);
     let cancelled = || cancel.load(Ordering::Relaxed);
     let wants_extraction = !options.extraction_rules.is_empty();
+    let list_mode = list_seeds.is_some();
+    let list_seeds = list_seeds.unwrap_or(&[]);
+    // List mode never performs the optional external/document check pass.
+    let check_links = options.check_links && !list_mode;
     let seed = match normalize_seed(seed) {
         Ok(seed) => seed,
         Err(message) => {
             return CrawlResult {
                 message,
                 outcome: CrawlOutcome::Failed,
+                list: list_unchecked(list_seeds, "The site scope is invalid"),
                 ..CrawlResult::default()
             };
         }
     };
     let host = host_of(&seed).unwrap_or_default();
+    let list_scope = list_mode
+        .then(|| ListScope::from_seed(&seed).ok())
+        .flatten();
 
     if limits.max_pages == 0 {
         return CrawlResult {
             pages: Vec::new(),
             message: format!("0 pages on {host}"),
+            list: list_seeds
+                .iter()
+                .map(|seed| ListCheck {
+                    source_row: seed.source_row,
+                    outcome: ListOutcome::Unchecked,
+                    reason: "Page limit is zero".into(),
+                    status: 0,
+                    final_url: String::new(),
+                })
+                .collect(),
             ..CrawlResult::default()
         };
     }
 
-    // robots.txt is fetched once per origin. A missing or unreadable file allows the crawl.
+    // robots.txt is fetched once per origin. A missing or unreadable file allows an ordinary
+    // crawl. List mode is stricter: an unavailable policy blocks the affected rows.
     let seed_url = Url::parse(&seed).ok();
-    let robots = seed_url
-        .as_ref()
-        .and_then(|seed_url| robots_for(seed_url, &fetch, cache_robots));
-    if let (Some(seed_url), Some(robots)) = (seed_url.as_ref(), robots.as_ref())
-        && !robots.allows(&request_path(seed_url))
-    {
-        return CrawlResult {
-            pages: Vec::new(),
-            message: format!("Blocked by robots.txt · {host}"),
-            outcome: CrawlOutcome::Blocked,
-            ..CrawlResult::default()
-        };
-    }
+    let robots = if list_mode {
+        None
+    } else {
+        let robots = seed_url
+            .as_ref()
+            .and_then(|seed_url| robots_for(seed_url, &fetch, cache_robots));
+        if let (Some(seed_url), Some(robots)) = (seed_url.as_ref(), robots.as_ref())
+            && !robots.allows(&request_path(seed_url))
+        {
+            return CrawlResult {
+                pages: Vec::new(),
+                message: format!("Blocked by robots.txt · {host}"),
+                outcome: CrawlOutcome::Blocked,
+                ..CrawlResult::default()
+            };
+        }
+        robots
+    };
 
     // Reserve a modest starting amount. The user can set a large page limit, so
     // allocating the full crawl budget before discovering any URLs is wasteful.
     let mut seen: FastSet<String> = fast_set(limits.max_pages.min(256).saturating_mul(4).max(16));
-    seen.insert(seed.clone());
     let mut pages: Vec<Page> = Vec::with_capacity(limits.max_pages.min(256));
     let mut page_index: FastMap<String, usize> = fast_map(limits.max_pages.min(256));
-    let mut committed = 1_usize;
+    let mut committed = 0_usize;
     let mut over_cap = false;
     let mut stopped_early = false;
     let mut link_evidence_total = 0_usize;
     let mut link_evidence_limited = false;
     let mut extraction_budget = extract::MAX_RUN_VALUE_BYTES;
     let mut optional_checks: FastSet<String> = fast_set(64);
+    let mut list_checks: Vec<ListCheck> = Vec::new();
+    // Destination URL -> one stop per redirecting source page. A destination can be shared by
+    // several submitted rows, so a single destination-level status would overwrite provenance.
+    let mut list_stops: HashMap<String, Vec<ListStop>> = HashMap::new();
+    let mut list_hops: HashMap<String, usize> = HashMap::new();
+    let mut list_policies: HashMap<String, RobotsPolicy> = HashMap::new();
+    let mut initial_queue: VecDeque<(String, u8)> = VecDeque::new();
 
+    if let (true, Some(scope), Some(seed_url)) = (list_mode, list_scope.as_ref(), seed_url.as_ref())
+    {
+        for origin in list_scope_origins(seed_url) {
+            let origin = list_origin(&origin);
+            list_robots_policy(&origin, &fetch, &mut list_policies);
+        }
+        for seed in list_seeds {
+            let source_row = seed.source_row;
+            // Every submitted row up to the page budget consumes its slot, including a row
+            // that robots blocks. The slot order is the source order, so the same input always
+            // leaves the same tail unchecked.
+            if committed >= limits.max_pages {
+                over_cap = true;
+                list_checks.push(ListCheck {
+                    source_row,
+                    outcome: ListOutcome::Unchecked,
+                    reason: "Page limit".into(),
+                    status: 0,
+                    final_url: seed.url.clone(),
+                });
+                continue;
+            }
+            committed += 1;
+            let Ok(url) = Url::parse(&seed.url) else {
+                list_checks.push(ListCheck {
+                    source_row,
+                    outcome: ListOutcome::Failed,
+                    reason: "The submitted URL is no longer readable".into(),
+                    status: 0,
+                    final_url: String::new(),
+                });
+                continue;
+            };
+            if !scope.allows(&url) {
+                list_checks.push(ListCheck {
+                    source_row,
+                    outcome: ListOutcome::Blocked,
+                    reason: format!(
+                        "The submitted URL is outside the site scope {}",
+                        scope.host()
+                    ),
+                    status: 0,
+                    final_url: seed.url.clone(),
+                });
+                continue;
+            }
+            let origin = list_origin(&url);
+            let policy = list_robots_policy(&origin, &fetch, &mut list_policies);
+            if let Some(reason) = list_policy_blocks(&policy, &url) {
+                list_checks.push(ListCheck {
+                    source_row,
+                    outcome: ListOutcome::Blocked,
+                    reason,
+                    status: 0,
+                    final_url: seed.url.clone(),
+                });
+                continue;
+            }
+            if !seen.insert(seed.url.clone()) {
+                // The preview already deduplicates. Treat any caller duplicate as unbounded
+                // input rather than fetching it twice.
+                list_checks.push(ListCheck {
+                    source_row,
+                    outcome: ListOutcome::Unchecked,
+                    reason: "Duplicate normalized URL in the submitted list".into(),
+                    status: 0,
+                    final_url: seed.url.clone(),
+                });
+                continue;
+            }
+            initial_queue.push_back((seed.url.clone(), 0));
+            list_hops.insert(seed.url.clone(), 0);
+        }
+    } else if !list_mode {
+        seen.insert(seed.clone());
+        initial_queue.push_back((seed, 0_u8));
+        committed = 1;
+    }
+
+    let crawl_delay = if list_mode {
+        list_policies
+            .values()
+            .filter_map(|policy| match policy {
+                RobotsPolicy::Known(Some(robots)) => robots.crawl_delay(),
+                _ => None,
+            })
+            .max()
+    } else {
+        robots.as_ref().and_then(Robots::crawl_delay)
+    };
+
+    let initial_jobs = initial_queue.len();
     let shared = Mutex::new(Work {
-        queue: VecDeque::from([(seed, 0_u8)]),
-        crawl_delay: robots.as_ref().and_then(Robots::crawl_delay),
+        queue: initial_queue,
+        crawl_delay,
         ..Work::default()
     });
     let wake = Condvar::new();
@@ -1888,21 +2202,37 @@ fn crawl_engine(
     };
     // A browser may only request documents that the crawl would itself schedule. This closure
     // is consulted before a navigation leaves the browser, so scripts cannot widen the crawl.
+    // List mode uses the explicit host/scheme/port scope and the same prefetched robots policy
+    // for every in-scope origin, including redirect destinations.
     let browser_allowed: Option<render::UrlFilter> = browser.as_ref().map(|_| {
-        let host = host.clone();
-        let robots = robots.clone();
-        let allowed = move |url: &str| {
-            let Ok(url) = Url::parse(url) else {
-                return false;
+        if let Some(scope) = list_scope.clone() {
+            let policies = list_policies.clone();
+            let allowed = move |url: &str| {
+                let Ok(url) = Url::parse(url) else {
+                    return false;
+                };
+                if !scope.allows(&url) {
+                    return false;
+                }
+                list_policies_allow(&policies, &url)
             };
-            same_host(&url, &host)
-                && robots
-                    .as_ref()
-                    .is_none_or(|robots| robots.allows(&request_path(&url)))
-        };
-        Arc::new(allowed) as render::UrlFilter
+            Arc::new(allowed) as render::UrlFilter
+        } else {
+            let host = host.clone();
+            let robots = robots.clone();
+            let allowed = move |url: &str| {
+                let Ok(url) = Url::parse(url) else {
+                    return false;
+                };
+                same_host(&url, &host)
+                    && robots
+                        .as_ref()
+                        .is_none_or(|robots| robots.allows(&request_path(&url)))
+            };
+            Arc::new(allowed) as render::UrlFilter
+        }
     });
-    let mut discovery_done = !options.sitemaps;
+    let mut discovery_done = !options.sitemaps || list_mode;
     let mut sitemap_report = sitemap::SitemapReport::default();
     sitemap_report.discovery_done = discovery_done;
 
@@ -2072,7 +2402,7 @@ fn crawl_engine(
             });
         }
 
-        if let (true, Some(seed_url)) = (options.sitemaps, seed_url.clone()) {
+        if let (true, false, Some(seed_url)) = (options.sitemaps, list_mode, seed_url.clone()) {
             let tx_sitemap = tx.clone();
             let shared_work = &shared;
             let wake_condvar = &wake;
@@ -2140,7 +2470,7 @@ fn crawl_engine(
             wake: &wake,
         };
 
-        let mut pending = 1_usize;
+        let mut pending = initial_jobs;
         while pending > 0 || !discovery_done {
             if cancelled() {
                 stopped_early = true;
@@ -2305,7 +2635,7 @@ fn crawl_engine(
                             let allowed = robots
                                 .as_ref()
                                 .is_none_or(|robots| robots.allows(&request_path(&next)));
-                            let optional_candidate = options.check_links
+                            let optional_candidate = check_links
                                 && ((same && asset && document) || (!same && !web_asset));
 
                             if scheduling && same && !asset {
@@ -2349,14 +2679,17 @@ fn crawl_engine(
                             } else if !same {
                                 occurrence.skip_reason = if web_asset {
                                     "External asset not checked".into()
-                                } else if options.check_links {
+                                } else if check_links {
                                     "Queued for optional check".into()
                                 } else {
                                     "External link; checking is off".into()
                                 };
                             } else if !scheduling {
-                                occurrence.skip_reason =
-                                    "Source evidence; rendered document supplied discovery".into();
+                                occurrence.skip_reason = if list_mode {
+                                    "Not scheduled in URL list mode".into()
+                                } else {
+                                    "Source evidence; rendered document supplied discovery".into()
+                                };
                             }
                             retain_occurrence(evidence, occurrence, limit);
                         }
@@ -2418,7 +2751,7 @@ fn crawl_engine(
                 discover_links(
                     &parsed.anchors,
                     &link_base,
-                    true,
+                    !list_mode,
                     stage,
                     &parsed.links[parsed.anchors.len()..],
                     &mut link_evidence,
@@ -2446,7 +2779,7 @@ fn crawl_engine(
                 indexability::merge_canonicals(&mut canonicals, source_canonicals);
                 // Without a rendered document the source is the only document that can supply
                 // discovered links. Those links are still not a completed content audit.
-                let source_schedules = parsed.is_none();
+                let source_schedules = !list_mode && parsed.is_none();
                 let source_tail: &[LinkRef] = if source_schedules {
                     &source.links[source.anchors.len()..]
                 } else {
@@ -2486,24 +2819,88 @@ fn crawl_engine(
                 .as_ref()
                 .map(|next| url_key(next.clone()))
                 .unwrap_or_default();
-            if let Some(next) = redirect
-                && same_host(&next, &host)
-                && robots
-                    .as_ref()
-                    .is_none_or(|robots| robots.allows(&request_path(&next)))
-                && seen.insert(redirect_to.clone())
-            {
-                if committed < limits.max_pages {
-                    committed += 1;
-                    new_jobs.push((redirect_to.clone(), depth));
-                } else {
-                    over_cap = true;
+            if let Some(next) = redirect {
+                if list_mode {
+                    let key = redirect_to.clone();
+                    let origin = list_origin(&next);
+                    let policy = match list_policies.get(&origin).cloned() {
+                        Some(policy) => policy,
+                        None => list_robots_policy(&origin, &fetch, &mut list_policies),
+                    };
+                    let reason = if let Some(scope) = list_scope.as_ref()
+                        && !scope.allows(&next)
+                    {
+                        Some(format!("Redirect left the site scope {}", scope.host()))
+                    } else {
+                        list_policy_blocks(&policy, &next)
+                    };
+                    if let Some(reason) = reason {
+                        push_list_stop(
+                            &mut list_stops,
+                            key,
+                            &url,
+                            ListCheck {
+                                source_row: 0,
+                                outcome: ListOutcome::Blocked,
+                                reason,
+                                status: fetched.status,
+                                final_url: next.to_string(),
+                            },
+                        );
+                    } else {
+                        let hops = list_hops.get(&url).copied().unwrap_or(0);
+                        if hops >= links::MAX_REDIRECT_HOPS {
+                            push_list_stop(
+                                &mut list_stops,
+                                key,
+                                &url,
+                                ListCheck {
+                                    source_row: 0,
+                                    outcome: ListOutcome::Unchecked,
+                                    reason: "Redirect hop limit".into(),
+                                    status: fetched.status,
+                                    final_url: next.to_string(),
+                                },
+                            );
+                        } else if committed >= limits.max_pages {
+                            over_cap = true;
+                            push_list_stop(
+                                &mut list_stops,
+                                key,
+                                &url,
+                                ListCheck {
+                                    source_row: 0,
+                                    outcome: ListOutcome::Unchecked,
+                                    reason: "Page limit".into(),
+                                    status: fetched.status,
+                                    final_url: next.to_string(),
+                                },
+                            );
+                        } else if seen.insert(key.clone()) {
+                            committed += 1;
+                            list_hops.insert(key.clone(), hops + 1);
+                            new_jobs.push((key, depth));
+                        }
+                    }
+                } else if same_host(&next, &host)
+                    && robots
+                        .as_ref()
+                        .is_none_or(|robots| robots.allows(&request_path(&next)))
+                    && seen.insert(redirect_to.clone())
+                {
+                    if committed < limits.max_pages {
+                        committed += 1;
+                        new_jobs.push((redirect_to.clone(), depth));
+                    } else {
+                        over_cap = true;
+                    }
                 }
             }
 
             // A script that moved the document to a new path or query is a destination, not a
             // fact about this URL. Admit it through the same scope, robots and budget path as a
-            // discovered link, at the same depth as a replacement navigation.
+            // discovered link, at the same depth as a replacement navigation. List mode keeps
+            // the evidence but never schedules a URL the person did not submit.
             let navigation = capture
                 .render
                 .as_ref()
@@ -2511,6 +2908,7 @@ fn crawl_engine(
                 .filter(|to| !to.is_empty())
                 .and_then(|to| Url::parse(to).ok());
             if let Some(next) = navigation
+                && !list_mode
                 && same_host(&next, &host)
                 && !looks_like_asset(&next)
                 && robots
@@ -2715,7 +3113,7 @@ fn crawl_engine(
     let mut checked: FastMap<String, LinkCheckResult> = fast_map(optional_checks.len());
     let mut check_limited = false;
     let mut check_stopped = false;
-    if options.check_links && !optional_checks.is_empty() && !cancelled() {
+    if check_links && !optional_checks.is_empty() && !cancelled() {
         let mut destinations: Vec<String> = optional_checks
             .iter()
             .filter(|key| !known_pages.contains_key(*key))
@@ -2767,35 +3165,98 @@ fn crawl_engine(
     }
     apply_link_checks(&mut pages, &known_pages, &checked);
 
-    let mut message = if stopped_early {
-        format!("Stopped · {} pages on {host}", pages.len())
+    let list = resolve_list_checks(
+        list_seeds,
+        &list_checks,
+        &pages,
+        &list_stops,
+        list_scope.as_ref(),
+        stopped_early,
+        over_cap,
+    );
+    let list_checked = list
+        .iter()
+        .filter(|check| check.outcome == ListOutcome::Checked)
+        .count();
+    let list_failed = list
+        .iter()
+        .filter(|check| check.outcome == ListOutcome::Failed)
+        .count();
+    let list_blocked = list
+        .iter()
+        .filter(|check| check.outcome == ListOutcome::Blocked)
+        .count();
+    let list_unchecked = list
+        .iter()
+        .filter(|check| check.outcome == ListOutcome::Unchecked)
+        .count();
+
+    let (message, outcome) = if list_mode {
+        let total = list.len();
+        let mut message = if stopped_early {
+            format!("Stopped · {list_checked} of {total} URLs checked on {host}")
+        } else {
+            format!("{list_checked} of {total} URLs checked on {host}")
+        };
+        if over_cap && !stopped_early {
+            message.push_str(&format!(
+                " · stopped at the {} page limit",
+                limits.max_pages
+            ));
+        }
+        if list_failed > 0 {
+            message.push_str(&format!(" · {list_failed} failed"));
+        }
+        if list_blocked > 0 {
+            message.push_str(&format!(" · {list_blocked} blocked"));
+        }
+        if list_unchecked > 0 {
+            message.push_str(&format!(" · {list_unchecked} unchecked"));
+        }
+        let outcome = if stopped_early {
+            CrawlOutcome::Stopped
+        } else if over_cap {
+            CrawlOutcome::Limited
+        } else if total > 0 && list_blocked == total {
+            CrawlOutcome::Blocked
+        } else if list_checked == 0 {
+            CrawlOutcome::Failed
+        } else {
+            CrawlOutcome::Completed
+        };
+        (message, outcome)
     } else {
-        format!("{} pages on {host}", pages.len())
+        let mut message = if stopped_early {
+            format!("Stopped · {} pages on {host}", pages.len())
+        } else {
+            format!("{} pages on {host}", pages.len())
+        };
+        let mut outcome = if stopped_early {
+            CrawlOutcome::Stopped
+        } else {
+            CrawlOutcome::Completed
+        };
+        if over_cap && !stopped_early {
+            message.push_str(&format!(
+                " · stopped at the {} page limit",
+                limits.max_pages
+            ));
+            outcome = CrawlOutcome::Limited;
+        }
+        if check_limited && !stopped_early {
+            message.push_str(" · link checks incomplete");
+        }
+        if !stopped_early && pages.iter().all(|page| page.status == 0) {
+            let why = pages
+                .first()
+                .map(|page| page.error.as_str())
+                .filter(|e| !e.is_empty())
+                .unwrap_or("no response");
+            message = format!("Crawl failed · {why}");
+            outcome = CrawlOutcome::Failed;
+        }
+        (message, outcome)
     };
-    let mut outcome = if stopped_early {
-        CrawlOutcome::Stopped
-    } else {
-        CrawlOutcome::Completed
-    };
-    if over_cap && !stopped_early {
-        message.push_str(&format!(
-            " · stopped at the {} page limit",
-            limits.max_pages
-        ));
-        outcome = CrawlOutcome::Limited;
-    }
-    if check_limited && !stopped_early {
-        message.push_str(" · link checks incomplete");
-    }
-    if !stopped_early && pages.iter().all(|page| page.status == 0) {
-        let why = pages
-            .first()
-            .map(|page| page.error.as_str())
-            .filter(|e| !e.is_empty())
-            .unwrap_or("no response");
-        message = format!("Crawl failed · {why}");
-        outcome = CrawlOutcome::Failed;
-    }
     sitemap_report.discovery_done = true;
     if stopped_early {
         sitemap_report.mark_not_checked("Stopped");
@@ -2811,7 +3272,157 @@ fn crawl_engine(
         outcome,
         setup_failure: None,
         link_evidence_limited,
+        list,
     }
+}
+
+#[derive(Clone, Debug)]
+struct ListStop {
+    /// The redirecting page that produced this stop (`ListStop::from`). Two submitted URLs can
+    /// converge on one destination with different redirect codes, so the stop belongs to a
+    /// source page, not only to the shared destination. Resolution matches this against the
+    /// page it just followed from before applying the stop to that source row.
+    from: String,
+    check: ListCheck,
+}
+
+fn push_list_stop(
+    stops: &mut HashMap<String, Vec<ListStop>>,
+    key: String,
+    from: &str,
+    check: ListCheck,
+) {
+    stops.entry(key).or_default().push(ListStop {
+        from: from.to_string(),
+        check,
+    });
+}
+
+fn resolve_list_checks(
+    seeds: &[ListSeed],
+    prechecks: &[ListCheck],
+    pages: &[Page],
+    stops: &HashMap<String, Vec<ListStop>>,
+    scope: Option<&ListScope>,
+    stopped: bool,
+    limited: bool,
+) -> Vec<ListCheck> {
+    if seeds.is_empty() {
+        return Vec::new();
+    }
+    let by_row: HashMap<u64, &ListCheck> = prechecks
+        .iter()
+        .map(|check| (check.source_row, check))
+        .collect();
+    let by_url: HashMap<&str, &Page> = pages.iter().map(|page| (page.url.as_str(), page)).collect();
+    let mut results = Vec::with_capacity(seeds.len());
+
+    for seed in seeds {
+        if let Some(precheck) = by_row.get(&seed.source_row) {
+            results.push((*precheck).clone());
+            continue;
+        }
+        let mut current = seed.url.clone();
+        let mut previous = String::new();
+        let mut visited = HashSet::new();
+        let mut hops = 0_usize;
+        let mut last_redirect_status = 0_u16;
+        let check = loop {
+            if !visited.insert(current.clone()) {
+                break ListCheck {
+                    source_row: seed.source_row,
+                    outcome: ListOutcome::Failed,
+                    reason: "Redirect loop".into(),
+                    status: last_redirect_status,
+                    final_url: current,
+                };
+            }
+            if !previous.is_empty()
+                && let Some(stop) = stops
+                    .get(&current)
+                    .and_then(|entries| entries.iter().find(|stop| stop.from == previous))
+            {
+                break ListCheck {
+                    source_row: seed.source_row,
+                    ..stop.check.clone()
+                };
+            }
+            let Some(page) = by_url.get(current.as_str()) else {
+                let (outcome, reason) = if stopped {
+                    (
+                        ListOutcome::Unchecked,
+                        "Stopped before this URL was checked",
+                    )
+                } else if limited {
+                    (ListOutcome::Unchecked, "Page limit")
+                } else if scope
+                    .is_some_and(|scope| Url::parse(&current).is_ok_and(|url| !scope.allows(&url)))
+                {
+                    (ListOutcome::Blocked, "Redirect left the site scope")
+                } else {
+                    (ListOutcome::Unchecked, "Not checked")
+                };
+                break ListCheck {
+                    source_row: seed.source_row,
+                    outcome,
+                    reason: reason.into(),
+                    status: last_redirect_status,
+                    final_url: current,
+                };
+            };
+            if page.status == 0 {
+                break ListCheck {
+                    source_row: seed.source_row,
+                    outcome: ListOutcome::Failed,
+                    reason: if page.error.is_empty() {
+                        "No response".into()
+                    } else {
+                        page.error.clone()
+                    },
+                    status: 0,
+                    final_url: current,
+                };
+            }
+            if !page.error.is_empty() {
+                break ListCheck {
+                    source_row: seed.source_row,
+                    outcome: ListOutcome::Failed,
+                    reason: page.error.clone(),
+                    status: page.status,
+                    final_url: current,
+                };
+            }
+            if (300..400).contains(&page.status) && !page.redirect_to.is_empty() {
+                if hops >= links::MAX_REDIRECT_HOPS {
+                    break ListCheck {
+                        source_row: seed.source_row,
+                        outcome: ListOutcome::Unchecked,
+                        reason: "Redirect hop limit".into(),
+                        status: page.status,
+                        final_url: page.redirect_to.clone(),
+                    };
+                }
+                last_redirect_status = page.status;
+                hops += 1;
+                previous = current.clone();
+                current = page.redirect_to.clone();
+                continue;
+            }
+            break ListCheck {
+                source_row: seed.source_row,
+                outcome: ListOutcome::Checked,
+                reason: if hops == 0 {
+                    format!("HTTP {}", page.status)
+                } else {
+                    format!("HTTP {} after {hops} redirect(s)", page.status)
+                },
+                status: page.status,
+                final_url: current,
+            };
+        };
+        results.push(check);
+    }
+    results
 }
 
 #[derive(Clone, Debug)]
@@ -4590,6 +5201,37 @@ mod tests {
     }
 
     #[test]
+    fn list_scope_origins_cover_default_and_explicit_ports() {
+        let seed = Url::parse("http://127.0.0.1:8123/").expect("seed");
+        let origins = list_scope_origins(&seed)
+            .iter()
+            .map(list_origin)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            origins,
+            vec![
+                "http://127.0.0.1:8123".to_string(),
+                "http://127.0.0.1".to_string(),
+                "https://127.0.0.1:8123".to_string(),
+                "https://127.0.0.1".to_string(),
+            ]
+        );
+
+        let seed = Url::parse("https://example.com/").expect("seed");
+        let origins = list_scope_origins(&seed)
+            .iter()
+            .map(list_origin)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            origins,
+            vec![
+                "http://example.com".to_string(),
+                "https://example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn robots_rules_honor_specificity_wildcards_and_crawl_delay() {
         let robots = Robots::parse(
             "User-agent: *\nDisallow: /private\nAllow: /private/ok\nDisallow: /*.pdf$\nCrawl-delay: 1.5\n",
@@ -4704,6 +5346,7 @@ mod tests {
             Some(&no_stop),
             None,
             None,
+            None,
             &mut |event| {
                 if let CrawlEvent::Page(page) = event {
                     all.borrow_mut().push(page.url.clone());
@@ -4734,6 +5377,7 @@ mod tests {
             false,
             CrawlOptions::default(),
             Some(&stop_after_one),
+            None,
             None,
             None,
             &mut |event| {

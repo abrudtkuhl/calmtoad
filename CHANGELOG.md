@@ -5,6 +5,22 @@ date are being prepared for release.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-24
+
+### Added
+
+- Check a hand-picked list of URLs by pasting them, loading a TXT file, or importing a CSV. Preview eligible, duplicate, invalid, and out-of-scope rows before starting.
+- Review one coverage row per submitted URL, open checked pages in the existing page details, and export the visible results to CSV.
+
+### Improved
+
+- URL-list crawls follow the same robots rules, redirects, throttling, cancellation, and Browser rendering as a regular crawl. They stay within the chosen site and do not add discovered links or sitemaps to the list.
+- Large list previews prepare coverage in the background, keeping the app responsive while preserving clear page-limit and redirect results for every submitted URL.
+
+### Fixed
+
+- Failed file imports keep the current draft and last valid preview. Redirects that converge on the same destination retain each source URL's own status.
+
 ## [0.10.0] - 2026-11-22
 
 ### Added

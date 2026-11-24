@@ -32,6 +32,9 @@ use calmtoad::render::{self, RenderMode, RenderState, SourceState};
 use calmtoad::sitemap::{FileState, SitemapFile, SitemapKind, SitemapReport, SitemapUrl, UrlState};
 use calmtoad::structured_data;
 use calmtoad::update;
+use calmtoad::url_list::{
+    self, InputFormat, ListCheck, Outcome as ListOutcome, Preview as ListPreview,
+};
 use rune::tooling::AppSpec;
 use rune::{
     Align, Color, Cx, El, FileDialogOptions, Icon, Key, KeyEvent, MenuItem, ScrollSpec, Shortcut,
@@ -63,6 +66,8 @@ enum Tab {
     Images,
     Links,
     Sitemaps,
+    /// Source-row coverage for a URL-list run. Hidden during ordinary site crawls.
+    Coverage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +217,8 @@ struct RunContext {
     accessibility: bool,
     started_utc: String,
     extraction_rules: Vec<ExtractionRule>,
+    /// Submitted input rows for a URL-list run; zero for an ordinary site crawl.
+    list_total: usize,
 }
 
 /// The workflow state of the current crawl.
@@ -682,6 +689,7 @@ enum CrawlEvent {
     SitemapDone,
     LinkCheckStarted(usize),
     LinkCheck(String, LinkCheckResult),
+    ListCheck(ListCheck),
     /// The controlled browser process failed to start. This is setup, not a page/domain
     /// failure, so the Browser strip can offer Retry, Choose browser…, and Use HTML.
     BrowserSetupFailed(String),
@@ -1008,6 +1016,331 @@ struct ExtractionPreviewResult {
     rules: Vec<ExtractionRule>,
 }
 
+/// Bounded URL-list parsing runs off the UI thread. A stale result is ignored by generation.
+struct ListPreviewJob {
+    rx: mpsc::Receiver<Result<ListPreview, String>>,
+    generation: u64,
+    scope_seed: String,
+    label: String,
+}
+
+enum ListSource {
+    Paste(String),
+    File(PathBuf, InputFormat),
+}
+
+/// The large per-run coverage table snapshot, built entirely on a worker.
+struct ListPrepared {
+    coverage: Vec<url_list::Entry>,
+    index: HashMap<u64, usize>,
+    search_index: Vec<String>,
+    row_keys: Vec<String>,
+    visible: Vec<usize>,
+    counts: ViewCounts,
+}
+
+struct ListPrepareJob {
+    rx: mpsc::Receiver<ListPrepared>,
+    generation: u64,
+}
+
+fn list_snapshot(
+    preview: &ListPreview,
+    query: &str,
+    filter: CheckFilter,
+    sort: &(String, SortDir),
+) -> ListPrepared {
+    let coverage = preview.coverage_rows();
+    let search_index = coverage.iter().map(list_search_text).collect::<Vec<_>>();
+    let row_keys = coverage
+        .iter()
+        .map(|entry| entry.source_row.to_string())
+        .collect::<Vec<_>>();
+    let index = coverage
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (entry.source_row, position))
+        .collect::<HashMap<_, _>>();
+    let needle = normalized_query(query);
+    let mut findings = 0;
+    let mut incomplete = 0;
+    let mut visible = Vec::new();
+    for (position, entry) in coverage.iter().enumerate() {
+        let is_incomplete = entry.outcome.is_incomplete();
+        let is_finding = entry.outcome.is_finding();
+        incomplete += usize::from(is_incomplete);
+        findings += usize::from(is_finding);
+        let keep = match filter {
+            CheckFilter::All => true,
+            CheckFilter::Findings => is_finding,
+            CheckFilter::Incomplete => is_incomplete,
+        };
+        if !keep {
+            continue;
+        }
+        if !needle.is_empty()
+            && !search_index
+                .get(position)
+                .is_some_and(|text| text.contains(&needle))
+        {
+            continue;
+        }
+        visible.push(position);
+    }
+    let counts = ViewCounts {
+        total: coverage.len(),
+        findings,
+        incomplete,
+    };
+    visible.sort_by(|left, right| {
+        sort.1.apply(compare_list_entries(
+            &coverage[*left],
+            &coverage[*right],
+            &sort.0,
+        ))
+    });
+    ListPrepared {
+        coverage,
+        index,
+        search_index,
+        row_keys,
+        visible,
+        counts,
+    }
+}
+
+fn start_list_prepare(state: &mut State, preview: Arc<ListPreview>) {
+    let generation = state.list_prepare_generation.wrapping_add(1);
+    state.list_prepare_generation = generation;
+    state.list_prepare_error = None;
+    let query = state.list_view.query.text.clone();
+    let filter = state.list_view.filter;
+    let sort = state.list_view.sort.clone();
+    let (tx, rx) = mpsc::channel();
+    let waker = state.waker.clone();
+    state.list_prepare = Some(ListPrepareJob { rx, generation });
+    std::thread::spawn(move || {
+        let prepared = list_snapshot(&preview, &query, filter, &sort);
+        let _ = tx.send(prepared);
+        if let Some(wake) = &waker {
+            wake();
+        }
+    });
+}
+
+fn install_list_prepared(state: &mut State, prepared: ListPrepared) {
+    state.list_coverage = prepared.coverage;
+    state.list_index = prepared.index;
+    state.list_search_index = prepared.search_index;
+    state.list_row_keys = prepared.row_keys;
+    state.list_visible = prepared.visible;
+    state.view_counts = prepared.counts;
+    state.list_prepare = None;
+    state.list_prepare_error = None;
+    let pending = std::mem::take(&mut state.list_pending_checks);
+    let had_pending = !pending.is_empty();
+    for check in pending {
+        apply_list_check_ready(state, &check);
+    }
+    if had_pending {
+        refresh_list_visible_forced(state);
+    } else if state.tab == Tab::Coverage {
+        sync_list_selection(state);
+    }
+}
+
+fn poll_list_prepare(state: &mut State) -> bool {
+    let Some(job) = state.list_prepare.take() else {
+        return false;
+    };
+    match job.rx.try_recv() {
+        Ok(prepared) => {
+            if job.generation != state.list_prepare_generation {
+                return false;
+            }
+            install_list_prepared(state, prepared);
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            state.list_prepare = Some(job);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            if job.generation == state.list_prepare_generation {
+                state.list_prepare_error =
+                    Some("Coverage preparation stopped without a result".into());
+            }
+            true
+        }
+    }
+}
+
+fn clear_list_prepare(state: &mut State) {
+    state.list_prepare = None;
+    state.list_prepare_generation = state.list_prepare_generation.wrapping_add(1);
+    state.list_prepare_error = None;
+    state.list_pending_checks.clear();
+}
+
+fn start_list_paste_preview(state: &mut State) {
+    if state.phase.active() {
+        return;
+    }
+    let scope_seed = state.url.text.trim().to_string();
+    if scope_seed.is_empty() {
+        state.list_preview_error = Some("Enter a site scope before previewing a list.".into());
+        return;
+    }
+    spawn_list_preview(
+        state,
+        scope_seed,
+        String::new(),
+        ListSource::Paste(state.list_input.text.clone()),
+    );
+}
+
+fn choose_list_file(state: &mut State, tx: &mut Tx) {
+    if state.phase.active() {
+        return;
+    }
+    let options = FileDialogOptions {
+        title: "Load URL list".into(),
+        ..Default::default()
+    }
+    .filter("URL lists", &["txt", "csv"])
+    .filter("Text files", &["txt"])
+    .filter("CSV files", &["csv"]);
+    tx.open_file(options, |state: &mut State, result, _tx| {
+        handle_list_file_choice(state, result)
+    });
+}
+
+/// The dialog result seam. Keeping this separate lets the regression exercise the same state
+/// mutation as the native file picker.
+fn handle_list_file_choice(
+    state: &mut State,
+    result: Result<Option<PathBuf>, rune::FileDialogError>,
+) {
+    match result {
+        Ok(Some(path)) => begin_list_file_preview(state, path),
+        Ok(None) => {}
+        Err(error) => {
+            state.list_preview_error = Some(format!("Could not open the file chooser: {error}"));
+        }
+    }
+}
+
+fn begin_list_file_preview(state: &mut State, path: PathBuf) {
+    if state.phase.active() {
+        return;
+    }
+    let format = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| extension.eq_ignore_ascii_case("csv"))
+        .map_or(InputFormat::Txt, |_| InputFormat::Csv);
+    let label = path.display().to_string();
+    // Stage the candidate only. The pasted draft and source label stay untouched until the
+    // worker successfully parses and replaces the prior preview.
+    let scope_seed = state.url.text.trim().to_string();
+    if scope_seed.is_empty() {
+        state.list_preview_error = Some("Enter a site scope before loading a URL list.".into());
+        return;
+    }
+    spawn_list_preview(state, scope_seed, label, ListSource::File(path, format));
+}
+
+fn spawn_list_preview(state: &mut State, scope_seed: String, label: String, source: ListSource) {
+    // A new request supersedes an older one. The old worker may still finish; its generation
+    // no longer matches and its result is dropped.
+    let generation = state.list_preview_generation.wrapping_add(1);
+    state.list_preview_generation = generation;
+    state.list_preview_error = None;
+    let (tx, rx) = mpsc::channel();
+    let waker = state.waker.clone();
+    let worker_scope = scope_seed.clone();
+    state.list_preview_job = Some(ListPreviewJob {
+        rx,
+        generation,
+        scope_seed,
+        label,
+    });
+    std::thread::spawn(move || {
+        let result = (|| -> Result<ListPreview, String> {
+            let scope = url_list::Scope::from_seed(&worker_scope)?;
+            match source {
+                ListSource::Paste(text) => {
+                    url_list::parse_paste(&text, &scope).map_err(|error| error.message())
+                }
+                ListSource::File(path, format) => {
+                    let bytes = url_list::read_file(&path).map_err(|error| error.message())?;
+                    match format {
+                        InputFormat::Csv => {
+                            url_list::parse_csv(&bytes, &scope).map_err(|error| error.message())
+                        }
+                        _ => url_list::parse_txt(&bytes, &scope).map_err(|error| error.message()),
+                    }
+                }
+            }
+        })();
+        let _ = tx.send(result);
+        if let Some(wake) = &waker {
+            wake();
+        }
+    });
+}
+
+fn poll_list_preview(state: &mut State) -> bool {
+    let Some(job) = state.list_preview_job.take() else {
+        return false;
+    };
+    match job.rx.try_recv() {
+        Ok(result) => {
+            if job.generation != state.list_preview_generation {
+                return false;
+            }
+            match result {
+                Ok(preview) => {
+                    state.list_preview = Some(Arc::new(preview));
+                    state.list_preview_scope = job.scope_seed;
+                    state.list_file_label = job.label;
+                    state.list_preview_dirty = false;
+                    state.list_preview_error = None;
+                    state.list_coverage.clear();
+                    state.list_index.clear();
+                    state.list_visible.clear();
+                    state.list_search_index.clear();
+                    state.list_row_keys.clear();
+                    state.view_counts = ViewCounts::default();
+                    clear_list_prepare(state);
+                    if !state.list_file_label.is_empty() {
+                        // The file became the draft; a failed import never reaches this path,
+                        // so the pasted text survives an error.
+                        state.list_input.replace_text("");
+                    }
+                    true
+                }
+                Err(error) => {
+                    // Keep the prior draft on failure; only the error changes.
+                    state.list_preview_error = Some(error);
+                    true
+                }
+            }
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            state.list_preview_job = Some(job);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            if job.generation == state.list_preview_generation {
+                state.list_preview_error =
+                    Some("The URL-list reader stopped without a result.".into());
+            }
+            true
+        }
+    }
+}
+
 struct InventorySnapshot {
     pages: Vec<Page>,
     audit: Audit,
@@ -1215,6 +1548,31 @@ struct State {
     extraction_preview_job: Option<ExtractionPreviewJob>,
     crawl_options_open: bool,
     inventory_scope_open: bool,
+    /// The next run audits an explicit URL list instead of discovering links.
+    list_mode: bool,
+    /// Pasted newline-separated URLs. File input is read without copying into this field.
+    list_input: TextEdit,
+    list_file_label: String,
+    list_preview: Option<Arc<ListPreview>>,
+    /// The scope seed the preview was parsed against; editing the seed makes it stale.
+    list_preview_scope: String,
+    list_preview_error: Option<String>,
+    list_preview_dirty: bool,
+    list_preview_job: Option<ListPreviewJob>,
+    list_preview_generation: u64,
+    /// Coverage rows, search text, row keys and the initial visible order are built off the UI
+    /// thread when a run starts.
+    list_prepare: Option<ListPrepareJob>,
+    list_prepare_generation: u64,
+    list_prepare_error: Option<String>,
+    /// One coverage row per parsed input row, kept across stop and completion.
+    list_coverage: Vec<url_list::Entry>,
+    list_index: HashMap<u64, usize>,
+    list_pending_checks: Vec<ListCheck>,
+    list_view: ViewState,
+    list_visible: Vec<usize>,
+    list_search_index: Vec<String>,
+    list_row_keys: Vec<String>,
     tab: Tab,
     /// One search/filter/sort/selection state per tab and per sitemap view.
     views: Vec<ViewState>,
@@ -1385,6 +1743,25 @@ fn init() -> State {
         extraction_preview_job: None,
         crawl_options_open: false,
         inventory_scope_open: false,
+        list_mode: false,
+        list_input: TextEdit::new(""),
+        list_file_label: String::new(),
+        list_preview: None,
+        list_preview_scope: String::new(),
+        list_preview_error: None,
+        list_preview_dirty: false,
+        list_preview_job: None,
+        list_preview_generation: 0,
+        list_prepare: None,
+        list_prepare_generation: 0,
+        list_prepare_error: None,
+        list_coverage: Vec::new(),
+        list_index: HashMap::new(),
+        list_pending_checks: Vec::new(),
+        list_view: ViewState::new("source"),
+        list_visible: Vec::new(),
+        list_search_index: Vec::new(),
+        list_row_keys: Vec::new(),
         tab: Tab::Overview,
         views: vec![
             ViewState::new("indexability"),
@@ -1398,6 +1775,7 @@ fn init() -> State {
             ViewState::new("issue"),
             ViewState::new("issue"),
             ViewState::new("issue"),
+            ViewState::new("source"),
         ],
         details_open: false,
         evidence_open: false,
@@ -1530,11 +1908,15 @@ fn view_slot(tab: Tab, sitemap_view: SitemapView) -> usize {
             SitemapView::Urls => 9,
             SitemapView::Files => 10,
         },
+        Tab::Coverage => 11,
     }
 }
 
 impl State {
     fn view(&self) -> &ViewState {
+        if self.tab == Tab::Coverage {
+            return &self.list_view;
+        }
         if self.tab == Tab::Links && self.links_view == LinksView::Evidence {
             return &self.link_view;
         }
@@ -1560,6 +1942,9 @@ impl State {
     }
 
     fn view_mut(&mut self) -> &mut ViewState {
+        if self.tab == Tab::Coverage {
+            return &mut self.list_view;
+        }
         if self.tab == Tab::Links && self.links_view == LinksView::Evidence {
             return &mut self.link_view;
         }
@@ -1624,6 +2009,8 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
     // soon as the immutable snapshot has been handed off.
     let crawl_changed = poll_crawl_when_inventory_snapshot_is_idle(state);
     let preview_changed = poll_extraction_preview(state);
+    let list_preview_changed = poll_list_preview(state);
+    let list_prepare_changed = poll_list_prepare(state);
     let inventory_changed = poll_inventory_prepare(state)
         | poll_inventory_export(state, tx)
         | poll_inventory_write(state);
@@ -1638,6 +2025,9 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
     if state.structured_refresh.is_some() || state.accessibility_refresh.is_some() {
         tx.wake_after(Duration::from_millis(1));
     }
+    if state.list_prepare.is_some() {
+        tx.wake_after(Duration::from_millis(1));
+    }
     if state.crawl_more {
         state.crawl_more = false;
         tx.wake_after(Duration::from_millis(1));
@@ -1648,6 +2038,8 @@ fn poll(state: &mut State, _t: f64, tx: &mut Tx) -> bool {
         || update_changed
         || crawl_changed
         || preview_changed
+        || list_preview_changed
+        || list_prepare_changed
         || inventory_changed
         || content_changed
         || structured_changed
@@ -2135,6 +2527,52 @@ fn poll_updates(state: &mut State, tx: &mut Tx) -> bool {
 const CRAWL_EVENTS_PER_POLL: usize = 512;
 const CRAWL_POLL_BUDGET: Duration = Duration::from_millis(8);
 
+fn list_search_text(entry: &url_list::Entry) -> String {
+    format!(
+        "{} {} {} {} {} {} {} {}",
+        entry.source_row,
+        entry.original,
+        entry.normalized,
+        entry.outcome.label(),
+        entry.reason,
+        entry.status,
+        entry.final_url,
+        entry
+            .duplicate_of
+            .map(|row| row.to_string())
+            .unwrap_or_default()
+    )
+    .to_lowercase()
+}
+
+fn apply_list_check_ready(state: &mut State, check: &ListCheck) -> bool {
+    let Some(index) = state.list_index.get(&check.source_row).copied() else {
+        return false;
+    };
+    let Some(entry) = state.list_coverage.get_mut(index) else {
+        return false;
+    };
+    entry.outcome = check.outcome;
+    entry.reason = check.reason.clone();
+    entry.status = check.status;
+    entry.final_url = check.final_url.clone();
+    let search = list_search_text(entry);
+    if let Some(slot) = state.list_search_index.get_mut(index) {
+        *slot = search;
+    }
+    true
+}
+
+fn apply_list_check(state: &mut State, check: &ListCheck) -> bool {
+    if state.list_prepare.is_some() || state.list_index.is_empty() {
+        // Coverage is still being built on its worker. Keep the typed result until the
+        // indexed snapshot installs, then apply it there.
+        state.list_pending_checks.push(check.clone());
+        return true;
+    }
+    apply_list_check_ready(state, check)
+}
+
 fn poll_crawl(state: &mut State) -> bool {
     let Some(job) = state.job.take() else {
         return false;
@@ -2207,6 +2645,11 @@ fn poll_crawl(state: &mut State) -> bool {
                     state.link_check_done, state.link_check_total
                 );
                 changed = true;
+            }
+            Ok(CrawlEvent::ListCheck(check)) => {
+                if apply_list_check(state, &check) {
+                    changed = true;
+                }
             }
             Ok(CrawlEvent::BrowserSetupFailed(detail)) => {
                 apply_browser_setup_failure(state, detail);
@@ -2453,6 +2896,11 @@ fn validate_start(state: &State) -> Result<(String, Limits), FieldErrors> {
             None
         }
     };
+    if state.list_mode
+        && let Err(message) = url_list::Scope::from_seed(&state.url.text)
+    {
+        errors.url = message;
+    }
     let max_pages = match state.pages_limit.text.trim().parse::<usize>() {
         Ok(pages) if pages > 0 => Some(pages),
         _ => {
@@ -2460,13 +2908,29 @@ fn validate_start(state: &State) -> Result<(String, Limits), FieldErrors> {
             None
         }
     };
-    let max_depth = match state.depth_limit.text.trim().parse::<u8>() {
-        Ok(depth) if depth <= 10 => Some(depth),
-        _ => {
-            errors.depth = "Enter a whole depth from 0 to 10.".into();
-            None
+    let max_depth = if state.list_mode {
+        // Depth is inapplicable: only the submitted rows are scheduled.
+        Some(MAX_DEPTH)
+    } else {
+        match state.depth_limit.text.trim().parse::<u8>() {
+            Ok(depth) if depth <= 10 => Some(depth),
+            _ => {
+                errors.depth = "Enter a whole depth from 0 to 10.".into();
+                None
+            }
         }
     };
+    if state.list_mode {
+        match list_preview_current(state) {
+            Some(preview) if preview.has_eligible() => {}
+            Some(_) => {
+                errors.setup = "No eligible URLs are in the preview.".into();
+            }
+            None => {
+                errors.setup = "Preview the URL list before starting.".into();
+            }
+        }
+    }
     if state.rendering == RenderMode::Browser && !state.browser.status.is_ready() {
         errors.setup = "Choose a usable Chrome or Chromium before starting.".into();
     }
@@ -2527,6 +2991,11 @@ fn start_crawl(state: &mut State) {
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_else(|| seed.clone());
+    let list_preview = if state.list_mode {
+        list_preview_current_arc(state)
+    } else {
+        None
+    };
     let extraction_rules = draft_rules(&state.extraction_drafts);
     if let Err(errors) = extract::CompiledRules::compile(&extraction_rules) {
         state.extraction_errors = errors;
@@ -2543,19 +3012,26 @@ fn start_crawl(state: &mut State) {
     state.extraction_rules = extraction_rules;
     state.field_errors.clear();
     state.run_outcome = None;
-    // A valid new crawl starts on Overview. Later streaming, completion and manual tab
-    // changes never pull the person back here.
-    state.tab = Tab::Overview;
+    // A valid new crawl starts on Overview. A URL-list run starts on its coverage table.
+    // Later streaming, completion and manual tab changes never pull the person back here.
+    state.tab = if state.list_mode {
+        Tab::Coverage
+    } else {
+        Tab::Overview
+    };
+    let run_sitemaps = state.use_sitemaps && !state.list_mode;
+    let run_check_links = state.check_links && !state.list_mode;
     state.run = Some(RunContext {
         seed: seed.clone(),
         host,
         limits,
         rendering: state.rendering,
-        sitemaps: state.use_sitemaps,
-        check_links: state.check_links,
+        sitemaps: run_sitemaps,
+        check_links: run_check_links,
         accessibility: state.accessibility_checked,
         started_utc: inventory::utc_now(),
         extraction_rules: state.extraction_rules.clone(),
+        list_total: list_preview.as_ref().map_or(0, |preview| preview.eligible),
     });
     state.max_pages = limits.max_pages;
     state.phase = RunPhase::Preparing;
@@ -2584,6 +3060,17 @@ fn start_crawl(state: &mut State) {
     state.view_counts = ViewCounts::default();
     state.overview = OverviewCounts::default();
     state.sitemap = SitemapReport::default();
+    state.list_coverage.clear();
+    state.list_index.clear();
+    state.list_pending_checks.clear();
+    state.list_visible.clear();
+    state.list_search_index.clear();
+    state.list_row_keys.clear();
+    state.list_view.query.replace_text("");
+    state.list_view.filter = CheckFilter::All;
+    state.list_view.sort = ("source".into(), SortDir::Ascending);
+    state.list_view.selected = None;
+    clear_list_prepare(state);
     Arc::make_mut(&mut state.link_checks).clear();
     state.link_check_search.clear();
     state.link_rows.clear();
@@ -2592,22 +3079,25 @@ fn start_crawl(state: &mut State) {
     state.link_visible.clear();
     state.link_check_total = 0;
     state.link_check_done = 0;
-    state.sitemap.discovery_done = !state.use_sitemaps;
-    state.sitemap_discovering = state.use_sitemaps;
+    state.sitemap.discovery_done = !run_sitemaps;
+    state.sitemap_discovering = run_sitemaps;
     state.sitemap_visible.clear();
     state.sitemap_file_visible.clear();
     state.table.clear_selection();
     reset_view_searches(state);
-    state.message = format!("Preparing {seed}…");
+    state.message = match &list_preview {
+        Some(preview) => format!("Preparing {} submitted URLs…", preview.eligible),
+        None => format!("Preparing {seed}…"),
+    };
 
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let waker = state.waker.clone();
     let options = crawl::CrawlOptions {
-        sitemaps: state.use_sitemaps,
+        sitemaps: run_sitemaps,
         rendering: state.rendering,
         browser_path: state.browser.path.clone(),
-        check_links: state.check_links,
+        check_links: run_check_links,
         extraction_rules: state.extraction_rules.clone(),
         structured_budget: Some(state.structured_budget.clone()),
         accessibility: state.accessibility_checked,
@@ -2618,10 +3108,13 @@ fn start_crawl(state: &mut State) {
         cancel: cancel.clone(),
         stopping: false,
     });
+    if let Some(preview) = list_preview.as_ref() {
+        start_list_prepare(state, preview.clone());
+    }
     std::thread::spawn(move || {
         let event_tx = tx.clone();
         let wake = waker.clone();
-        let outcome = crawl::crawl_site_with(&seed, limits, options, cancel.clone(), |event| {
+        let mut send_event = |event: crawl::CrawlEvent| {
             let event = match event {
                 crawl::CrawlEvent::Page(page) => CrawlEvent::Page(page),
                 crawl::CrawlEvent::SitemapFile(file) => CrawlEvent::SitemapFile(file),
@@ -2630,12 +3123,25 @@ fn start_crawl(state: &mut State) {
                 crawl::CrawlEvent::SitemapDone => CrawlEvent::SitemapDone,
                 crawl::CrawlEvent::LinkCheckStarted(total) => CrawlEvent::LinkCheckStarted(total),
                 crawl::CrawlEvent::LinkCheck(key, result) => CrawlEvent::LinkCheck(key, result),
+                crawl::CrawlEvent::ListCheck(check) => CrawlEvent::ListCheck(check),
             };
             let _ = event_tx.send(event);
             if let Some(wake) = &wake {
                 wake();
             }
-        });
+        };
+        let outcome = if let Some(preview) = list_preview {
+            crawl::crawl_list_preview_with(
+                &seed,
+                limits,
+                options,
+                preview,
+                cancel.clone(),
+                &mut send_event,
+            )
+        } else {
+            crawl::crawl_site_with(&seed, limits, options, cancel.clone(), &mut send_event)
+        };
         if let Some(detail) = outcome.setup_failure {
             let _ = tx.send(CrawlEvent::BrowserSetupFailed(detail));
         }
@@ -2769,7 +3275,7 @@ fn page_has_finding(tab: Tab, page: &Page, audit: &Audit) -> bool {
         Tab::Images => content_issue(page, audit, ContentCheck::Images),
         Tab::Response => !(200..=299).contains(&page.status),
         Tab::Links => audit.has_broken_links(page),
-        Tab::Sitemaps => false,
+        Tab::Sitemaps | Tab::Coverage => false,
     }
 }
 
@@ -2854,6 +3360,9 @@ fn sitemap_file_has_finding(file: &SitemapFile) -> bool {
 }
 
 fn visible_id_ref(state: &State, row: usize) -> Option<&str> {
+    if state.tab == Tab::Coverage {
+        return list_visible_id_ref(state, row);
+    }
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         let row = *state.content_visible.get(row)?;
         return state.content_row_keys.get(row).map(String::as_str);
@@ -2916,6 +3425,10 @@ fn visible_id(state: &State, row: usize) -> Option<String> {
 /// selection was filtered out and clearing it when nothing is visible.
 fn sync_selection(state: &mut State) {
     if state.tab == Tab::Overview {
+        return;
+    }
+    if state.tab == Tab::Coverage {
+        sync_list_selection(state);
         return;
     }
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
@@ -3035,7 +3548,122 @@ fn refresh_visible_forced(state: &mut State) {
     refresh_visible_inner(state, true);
 }
 
+fn list_outcome_rank(outcome: ListOutcome) -> u8 {
+    match outcome {
+        ListOutcome::Failed => 0,
+        ListOutcome::Blocked => 1,
+        ListOutcome::Invalid => 2,
+        ListOutcome::OutOfScope => 3,
+        ListOutcome::Unchecked => 4,
+        ListOutcome::Checked => 5,
+        ListOutcome::Duplicate => 6,
+        ListOutcome::Eligible => 7,
+    }
+}
+
+fn compare_list_entries(
+    left: &url_list::Entry,
+    right: &url_list::Entry,
+    column: &str,
+) -> std::cmp::Ordering {
+    match column {
+        "original" => left.original.cmp(&right.original),
+        "normalized" => left.normalized.cmp(&right.normalized),
+        "outcome" => list_outcome_rank(left.outcome).cmp(&list_outcome_rank(right.outcome)),
+        "reason" => left.reason.cmp(&right.reason),
+        "status" => left.status.cmp(&right.status),
+        "final" => left.final_url.cmp(&right.final_url),
+        "duplicate" => left.duplicate_of.cmp(&right.duplicate_of),
+        _ => left.source_row.cmp(&right.source_row),
+    }
+}
+
+fn refresh_list_visible_inner(state: &mut State, force: bool) {
+    let filter = state.list_view.filter;
+    let needle = normalized_query(&state.list_view.query.text);
+    let mut findings = 0;
+    let mut incomplete = 0;
+    let mut matching = Vec::new();
+    for (index, entry) in state.list_coverage.iter().enumerate() {
+        let is_incomplete = entry.outcome.is_incomplete();
+        let is_finding = entry.outcome.is_finding();
+        incomplete += usize::from(is_incomplete);
+        findings += usize::from(is_finding);
+        let keep = match filter {
+            CheckFilter::All => true,
+            CheckFilter::Findings => is_finding,
+            CheckFilter::Incomplete => is_incomplete,
+        };
+        if !keep {
+            continue;
+        }
+        if !needle.is_empty()
+            && !state
+                .list_search_index
+                .get(index)
+                .is_some_and(|text| text.contains(&needle))
+        {
+            continue;
+        }
+        matching.push(index);
+    }
+    state.view_counts = ViewCounts {
+        total: state.list_coverage.len(),
+        findings,
+        incomplete,
+    };
+    state.list_visible = matching;
+    if force || !state.phase.active() {
+        let (column, dir) = state.list_view.sort.clone();
+        state.list_visible.sort_by(|left, right| {
+            dir.apply(compare_list_entries(
+                &state.list_coverage[*left],
+                &state.list_coverage[*right],
+                &column,
+            ))
+        });
+    }
+    sync_list_selection(state);
+}
+
+fn refresh_list_visible_forced(state: &mut State) {
+    refresh_list_visible_inner(state, true);
+}
+
+fn sync_list_selection(state: &mut State) {
+    let count = state.list_visible.len();
+    let chosen = state
+        .list_view
+        .selected
+        .clone()
+        .filter(|id| (0..count).any(|row| list_visible_id_ref(state, row) == Some(id.as_str())))
+        .or_else(|| list_visible_id(state, 0));
+    match chosen {
+        Some(id) => {
+            state.list_view.selected = Some(id.clone());
+            state.table.select(id);
+        }
+        None => {
+            state.list_view.selected = None;
+            state.table.clear_selection();
+        }
+    }
+}
+
+fn list_visible_id_ref(state: &State, row: usize) -> Option<&str> {
+    let index = *state.list_visible.get(row)?;
+    state.list_row_keys.get(index).map(String::as_str)
+}
+
+fn list_visible_id(state: &State, row: usize) -> Option<String> {
+    list_visible_id_ref(state, row).map(str::to_string)
+}
+
 fn refresh_visible_inner(state: &mut State, force: bool) {
+    if state.tab == Tab::Coverage {
+        refresh_list_visible_inner(state, force);
+        return;
+    }
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         refresh_content_visible_inner(state, force);
         return;
@@ -5105,6 +5733,7 @@ fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
         accessibility: state.accessibility_checked,
         started_utc: inventory::utc_now(),
         extraction_rules: state.extraction_rules.clone(),
+        list_total: 0,
     });
     state.run_outcome = Some(message.clone());
     state.pages = pages;
@@ -5210,7 +5839,17 @@ fn set_sitemap_sort(state: &mut State, column: &str, dir: SortDir) {
     sort_sitemap(state);
 }
 
+fn set_list_sort(state: &mut State, column: &str, dir: SortDir) {
+    state.list_view.sort = (column.to_string(), dir);
+    state.table.set_sort(column, dir);
+    refresh_list_visible_forced(state);
+}
+
 fn sort_pages(state: &mut State) {
+    if state.tab == Tab::Coverage {
+        refresh_list_visible_forced(state);
+        return;
+    }
     if matches!(state.tab, Tab::Overview | Tab::Sitemaps)
         || (state.tab == Tab::Links && state.links_view == LinksView::Evidence)
     {
@@ -5313,6 +5952,9 @@ fn link_occurrence_at(state: &State, row: usize) -> Option<&LinkOccurrence> {
 }
 
 fn visible_len(state: &State) -> usize {
+    if state.tab == Tab::Coverage {
+        return state.list_visible.len();
+    }
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         return state.content_visible.len();
     }
@@ -5485,7 +6127,7 @@ fn issue_for(tab: Tab, page: &Page, audit: &Audit) -> String {
         Tab::Canonical => canonical_issue(page),
         Tab::Images => image_issue(page),
         Tab::Links => links_issue(page, audit),
-        Tab::Sitemaps => String::new(),
+        Tab::Sitemaps | Tab::Coverage => String::new(),
     }
 }
 
@@ -5501,6 +6143,7 @@ fn tab_key(tab: Tab) -> &'static str {
         Tab::Images => "tab-images",
         Tab::Links => "tab-links",
         Tab::Sitemaps => "tab-sitemaps",
+        Tab::Coverage => "tab-coverage",
     }
 }
 
@@ -5541,6 +6184,7 @@ fn tab_help(tab: Tab, counts: &Counts, sitemap: &SitemapReport) -> String {
             sitemap.urls.len(),
             sitemap.files.len()
         ),
+        Tab::Coverage => "Source-row outcomes for the submitted URL list".into(),
     }
 }
 
@@ -5556,6 +6200,7 @@ fn tab_short(tab: Tab) -> &'static str {
         Tab::Images => "Images",
         Tab::Links => "Links",
         Tab::Sitemaps => "Sitemaps",
+        Tab::Coverage => "Coverage",
     }
 }
 
@@ -5571,6 +6216,7 @@ fn tab_title(tab: Tab) -> &'static str {
         Tab::Images => "Image alt text",
         Tab::Links => "Internal links",
         Tab::Sitemaps => "Sitemaps",
+        Tab::Coverage => "URL list coverage",
     }
 }
 
@@ -5603,6 +6249,9 @@ fn active_title(state: &State) -> &'static str {
 }
 
 fn search_scope_label(state: &State) -> &'static str {
+    if state.tab == Tab::Coverage {
+        return "source row, original value, normalized URL, outcome, reason, HTTP status, final URL and duplicate row";
+    }
     if structured_view_active(state) {
         return "URL, literal type or @id, JSON Pointer path, diagnostic text, script ID and declared type";
     }
@@ -5628,7 +6277,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         app = app.child(progress_line(&k, state));
     }
     app = app.child(command_bar(&k, state));
-    if state.crawl_options_open {
+    if state.crawl_options_open && !state.list_mode {
         app = app.child(crawl_options_note(&k, state));
     }
     if state.extraction_editor_open {
@@ -5646,7 +6295,10 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             app = app.child(inventory_scope_bar(&k, state));
         }
     } else {
-        if !state.pages.is_empty() || state.tab == Tab::Sitemaps {
+        if state.tab == Tab::Coverage {
+            app = app.child(coverage_summary(&k, state));
+        }
+        if !state.pages.is_empty() || state.tab == Tab::Sitemaps || state.tab == Tab::Coverage {
             app = app.child(section_header(&k, state));
         }
         if state.inventory_scope_open {
@@ -5732,6 +6384,8 @@ fn focus_search_state(state: &mut State) -> bool {
                 SitemapView::Urls => !state.sitemap.urls.is_empty(),
                 SitemapView::Files => !state.sitemap.files.is_empty(),
             }
+        } else if state.tab == Tab::Coverage {
+            !state.list_coverage.is_empty()
         } else {
             !state.pages.is_empty()
         };
@@ -5757,15 +6411,25 @@ fn run_details_panel(k: &Kit, state: &State) -> El {
     let mut lines: Vec<String> = Vec::new();
     if let Some(run) = &state.run {
         lines.push(format!("Seed {}", run.seed));
-        lines.push(format!(
-            "{} pages · depth {} · {} · Sitemaps {} · Link checks {} · Accessibility {}",
-            run.limits.max_pages,
-            run.limits.max_depth,
-            run.rendering.label(),
-            if run.sitemaps { "on" } else { "off" },
-            if run.check_links { "on" } else { "off" },
-            if run.accessibility { "on" } else { "off" }
-        ));
+        if run.list_total > 0 {
+            lines.push(format!(
+                "URL list · {} submitted rows · {} page limit · {} · Accessibility {}",
+                run.list_total,
+                run.limits.max_pages,
+                run.rendering.label(),
+                if run.accessibility { "on" } else { "off" }
+            ));
+        } else {
+            lines.push(format!(
+                "{} pages · depth {} · {} · Sitemaps {} · Link checks {} · Accessibility {}",
+                run.limits.max_pages,
+                run.limits.max_depth,
+                run.rendering.label(),
+                if run.sitemaps { "on" } else { "off" },
+                if run.check_links { "on" } else { "off" },
+                if run.accessibility { "on" } else { "off" }
+            ));
+        }
         if !run.extraction_rules.is_empty() {
             lines.push(format!(
                 "Custom extraction: {} rules · {}",
@@ -5799,6 +6463,10 @@ fn run_details_panel(k: &Kit, state: &State) -> El {
         }
     ));
     lines.push(sitemap_coverage_line(state));
+    if state.run.as_ref().is_some_and(|run| run.list_total > 0) {
+        lines.pop();
+        lines.push("Sitemaps and optional link checks are off in URL list mode".into());
+    }
     if state.link_check_total > 0 {
         lines.push(format!(
             "Link checks {} of {} destinations",
@@ -5849,8 +6517,10 @@ fn topbar(k: &Kit, state: &State, counts: &Counts, inset: f32) -> El {
             Tab::Images,
             Tab::Links,
             Tab::Sitemaps,
+            Tab::Coverage,
         ]
         .into_iter()
+        .filter(|tab| *tab != Tab::Coverage || state.list_mode)
         .map(|tab| tab_button(k, state, tab, counts)),
     );
     let bar = row()
@@ -6054,7 +6724,7 @@ fn failed(state: &State) -> bool {
 }
 
 fn command_bar(k: &Kit, state: &State) -> El {
-    let bar = row()
+    let mut bar = row()
         .w_full()
         .h(40.0)
         .radius(k.radius.lg)
@@ -6062,17 +6732,23 @@ fn command_bar(k: &Kit, state: &State) -> El {
         .border(1.0, k.c.border_base)
         .clip_rounded(k.radius.lg)
         .focus_within_ring(1.0, 0.0, k.c.border_strong)
+        .child(mode_picker(k, state))
+        .child(vrule(k))
         .child(url_field(k, state))
         .child(vrule(k))
-        .child(pages_field(k, state))
-        .child(vrule(k))
-        .child(depth_field(k, state))
-        .child(vrule(k))
-        .child(rendering_picker(k, state))
-        .child(vrule(k))
-        .child(sitemaps_toggle(k, state))
-        .child(crawl_button(k, state));
+        .child(pages_field(k, state));
+    if !state.list_mode {
+        bar = bar.child(vrule(k)).child(depth_field(k, state));
+    }
+    bar = bar.child(vrule(k)).child(rendering_picker(k, state));
+    if !state.list_mode {
+        bar = bar.child(vrule(k)).child(sitemaps_toggle(k, state));
+    }
+    bar = bar.child(crawl_button(k, state));
     let mut block = col().w_full().px(GUTTER).pt(12.0).pb(8.0).child(bar);
+    if state.list_mode {
+        block = block.child(list_panel(k, state));
+    }
     if state.field_errors.any() {
         block = block.child(
             text(state.field_errors.summary())
@@ -6088,16 +6764,244 @@ fn command_bar(k: &Kit, state: &State) -> El {
     block
 }
 
+fn mode_picker(k: &Kit, state: &State) -> El {
+    let disabled = state.phase.active();
+    let switch = |list_mode: bool| {
+        move |state: &mut State| {
+            if state.list_mode == list_mode {
+                return;
+            }
+            state.list_mode = list_mode;
+            state.field_errors.clear();
+            if !list_mode && state.tab == Tab::Coverage {
+                state.tab = Tab::Overview;
+            }
+            state.message = if list_mode {
+                "Paste URLs or load a TXT/CSV list, then preview it.".into()
+            } else {
+                "Site crawl mode. Enter a site URL to begin.".into()
+            };
+        }
+    };
+    row()
+        .h_full()
+        .px(4.0)
+        .gap(1.0)
+        .center_y()
+        .child(
+            Button::new("Site")
+                .variant(if state.list_mode {
+                    ButtonVariant::Ghost
+                } else {
+                    ButtonVariant::Neutral
+                })
+                .control_size(ControlSize::Small)
+                .disabled(disabled)
+                .help("Follow links from the site URL")
+                .on_press(switch(false))
+                .build(k)
+                .key("mode-site"),
+        )
+        .child(
+            Button::new("URL list")
+                .variant(if state.list_mode {
+                    ButtonVariant::Neutral
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .control_size(ControlSize::Small)
+                .disabled(disabled)
+                .help("Check exactly the URLs in a submitted list")
+                .on_press(switch(true))
+                .build(k)
+                .key("mode-list"),
+        )
+}
+
+fn list_can_start(state: &State) -> bool {
+    list_preview_current(state).is_some_and(ListPreview::has_eligible)
+}
+
+fn list_preview_current(state: &State) -> Option<&ListPreview> {
+    let preview = state.list_preview.as_deref()?;
+    (state.list_preview_job.is_none()
+        && !state.list_preview_dirty
+        && state.list_preview_scope == state.url.text.trim())
+    .then_some(preview)
+}
+
+fn list_preview_current_arc(state: &State) -> Option<Arc<ListPreview>> {
+    let preview = state.list_preview.as_ref()?;
+    (state.list_preview_job.is_none()
+        && !state.list_preview_dirty
+        && state.list_preview_scope == state.url.text.trim())
+    .then(|| preview.clone())
+}
+
+fn list_panel(k: &Kit, state: &State) -> El {
+    let disabled = state.phase.active();
+    let mut actions = row()
+        .gap(6.0)
+        .center_y()
+        .child(
+            Button::new("Load TXT or CSV…")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .disabled(disabled)
+                .on_press_tx(choose_list_file)
+                .build(k)
+                .key("list-load"),
+        )
+        .child(
+            Button::new("Preview list")
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .disabled(disabled)
+                .on_press(start_list_paste_preview)
+                .build(k)
+                .key("list-preview"),
+        )
+        .child(
+            Button::new("Clear")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .disabled(disabled)
+                .on_press(|state: &mut State| {
+                    state.list_input.replace_text("");
+                    state.list_file_label.clear();
+                    state.list_preview = None;
+                    state.list_preview_error = None;
+                    state.list_preview_dirty = false;
+                    state.list_preview_generation = state.list_preview_generation.wrapping_add(1);
+                    state.list_preview_job = None;
+                    state.list_coverage.clear();
+                    state.list_index.clear();
+                    state.list_visible.clear();
+                    state.list_search_index.clear();
+                    state.list_row_keys.clear();
+                    state.view_counts = ViewCounts::default();
+                    clear_list_prepare(state);
+                })
+                .build(k)
+                .key("list-clear"),
+        );
+    let source = if state.list_file_label.is_empty() {
+        "Pasted list".to_string()
+    } else {
+        state.list_file_label.clone()
+    };
+    actions = actions.child(
+        text(source)
+            .font(k.ty.text_xsmall)
+            .color(k.c.text_muted)
+            .grow(1.0)
+            .min_w(0.0)
+            .truncate(),
+    );
+
+    let mut body = col().w_full().gap(6.0).pt(6.0).child(actions).child(
+        rune_kit::TextArea::new(&state.list_input)
+            .label("URLs, one per line")
+            .placeholder("https://example.com/page\nhttps://example.com/another?x=1")
+            .width(None)
+            .rows(3)
+            .max_height(104.0)
+            .disabled(disabled)
+            .on_edit(|state: &mut State| &mut state.list_input)
+            .on_change(|state: &mut State, _| {
+                state.field_errors.clear();
+                state.list_file_label.clear();
+                state.list_preview_dirty = true;
+                state.list_preview_generation = state.list_preview_generation.wrapping_add(1);
+                state.list_preview_job = None;
+            })
+            .build(k)
+            .key("list-input"),
+    );
+
+    let summary = if state.list_preview_job.is_some() {
+        text("Reading and validating the list…")
+            .font(k.ty.text_xsmall)
+            .color(k.c.text_muted)
+    } else if let Some(preview) = state.list_preview.as_ref() {
+        let current =
+            !state.list_preview_dirty && state.list_preview_scope == state.url.text.trim();
+        let mut copy = format!(
+            "{} records · {} eligible · {} duplicate · {} invalid · {} out of scope",
+            preview.total(),
+            preview.eligible,
+            preview.duplicate,
+            preview.invalid,
+            preview.out_of_scope
+        );
+        if !current {
+            copy.push_str(" · preview is out of date");
+        }
+        text(copy)
+            .font(k.ty.text_xsmall)
+            .color(if current && preview.has_eligible() {
+                k.c.text_muted
+            } else {
+                k.c.warning.fg
+            })
+            .wrap()
+            .w_full()
+            .key("list-summary")
+    } else {
+        text("Paste URLs or load a TXT/CSV file, then choose Preview list.")
+            .font(k.ty.text_xsmall)
+            .color(k.c.text_muted)
+            .w_full()
+    };
+    body = body.child(summary);
+    if !list_can_start(state) && !disabled && state.list_preview_job.is_none() {
+        body = body.child(
+            text(if state.list_preview.is_some() {
+                "No eligible URLs are ready. Refresh the preview after editing, or check the error above."
+            } else {
+                "Start is available after a preview has at least one eligible URL."
+            })
+            .font(k.ty.text_xsmall)
+            .color(k.c.text_muted)
+            .wrap()
+            .w_full()
+            .key("list-start-hint"),
+        );
+    }
+    if let Some(error) = &state.list_preview_error {
+        body = body.child(
+            text(error.clone())
+                .font(k.ty.text_small)
+                .color(k.c.danger.fg)
+                .wrap()
+                .w_full()
+                .key("list-error")
+                .live_region(rune::LiveRegion::Assertive),
+        );
+    }
+    body
+}
+
 fn url_field(k: &Kit, state: &State) -> El {
     rune_kit::TextInput::new(&state.url)
         .plain()
         .height(38.0)
         .text_style(TextStyle::new(12.5, 400.0).lh(18.0))
         .placeholder("https://example.com")
-        .label("Site URL")
+        .label(if state.list_mode {
+            "Site scope"
+        } else {
+            "Site URL"
+        })
         .width(None)
         .on_edit(|state: &mut State| &mut state.url)
-        .on_change(|state: &mut State, _| state.field_errors.clear())
+        .on_change(|state: &mut State, _| {
+            state.field_errors.clear();
+            // A changed scope invalidates a preview parsed against the old host/ports.
+            state.list_preview_dirty = true;
+            state.list_preview_generation = state.list_preview_generation.wrapping_add(1);
+            state.list_preview_job = None;
+        })
         .on_submit(|state: &mut State, _| start_crawl(state))
         .invalid(!state.field_errors.url.is_empty())
         .disabled(state.phase.active())
@@ -6998,21 +7902,31 @@ fn crawl_button(k: &Kit, state: &State) -> El {
             .h_full()
             .key("crawl")
     } else {
-        let blocked = state.rendering == RenderMode::Browser && !state.browser.status.is_ready();
-        Button::new("Crawl")
-            .variant(ButtonVariant::Submit)
-            .disabled(blocked)
-            .control_size(ControlSize::ExtraLarge)
-            .label_with(move |_, ink| {
-                text("CRAWL")
-                    .font(font)
-                    .color(ink)
-                    .text_case(TextCase::Uppercase)
-            })
-            .on_press(start_crawl)
-            .build(k)
-            .h_full()
-            .key("crawl")
+        let blocked = (state.rendering == RenderMode::Browser && !state.browser.status.is_ready())
+            || (state.list_mode && !list_can_start(state));
+        let label = if state.list_mode {
+            "CHECK LIST"
+        } else {
+            "CRAWL"
+        };
+        Button::new(if state.list_mode {
+            "Check list"
+        } else {
+            "Crawl"
+        })
+        .variant(ButtonVariant::Submit)
+        .disabled(blocked)
+        .control_size(ControlSize::ExtraLarge)
+        .label_with(move |_, ink| {
+            text(label)
+                .font(font)
+                .color(ink)
+                .text_case(TextCase::Uppercase)
+        })
+        .on_press(start_crawl)
+        .build(k)
+        .h_full()
+        .key("crawl")
     }
 }
 
@@ -7057,7 +7971,27 @@ fn tab_button(k: &Kit, state: &State, tab: Tab, counts: &Counts) -> El {
 }
 
 fn progress_line(k: &Kit, state: &State) -> El {
-    let fraction = (state.pages.len() as f32 / state.max_pages.max(1) as f32).clamp(0.0, 1.0);
+    let fraction = if state.list_mode && !state.list_coverage.is_empty() {
+        let finished = state
+            .list_coverage
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.outcome,
+                    ListOutcome::Checked
+                        | ListOutcome::Failed
+                        | ListOutcome::Blocked
+                        | ListOutcome::Duplicate
+                        | ListOutcome::Invalid
+                        | ListOutcome::OutOfScope
+                )
+            })
+            .count();
+        finished as f32 / state.list_coverage.len() as f32
+    } else {
+        state.pages.len() as f32 / state.max_pages.max(1) as f32
+    }
+    .clamp(0.0, 1.0);
     row()
         .w_full()
         .h(2.0)
@@ -8581,7 +9515,11 @@ fn accessibility_section_header(k: &Kit, state: &State) -> El {
         .children(search_field(k, state))
         .child(check_filter(k, state))
         .child(export_button(k, state, shown))
-        .child(copy_urls_button(k, state, shown))
+        .children(if state.tab == Tab::Coverage {
+            Vec::new()
+        } else {
+            vec![copy_urls_button(k, state, shown)]
+        })
         .child(details_toggle(k, state))
 }
 
@@ -8808,7 +9746,9 @@ fn section_header(k: &Kit, state: &State) -> El {
     let total = state.view_counts.total;
     let shown = visible_len(state);
     let query_active = !state.view().query.text.trim().is_empty();
-    let noun = if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
+    let noun = if state.tab == Tab::Coverage {
+        "input rows"
+    } else if state.tab == Tab::Links && state.links_view == LinksView::Evidence {
         "link occurrences"
     } else {
         "URLs"
@@ -8850,7 +9790,7 @@ fn section_header(k: &Kit, state: &State) -> El {
                     active_title(state),
                     state.view().filter.help(),
                     if query_active {
-                        "Search matches URL, title, meta description, H1, canonical, content type and finding text"
+                        search_scope_label(state)
                     } else {
                         "No search query"
                     }
@@ -8924,6 +9864,7 @@ fn run_view_noun(state: &State) -> &'static str {
     }
     match state.tab {
         Tab::Links if state.links_view == LinksView::Evidence => "link occurrences",
+        Tab::Coverage => "input rows",
         Tab::Sitemaps => match state.sitemap_view {
             SitemapView::Urls => "URLs",
             SitemapView::Files => "files",
@@ -8975,6 +9916,8 @@ fn search_field(k: &Kit, state: &State) -> Option<El> {
                 SitemapView::Urls => !state.sitemap.urls.is_empty(),
                 SitemapView::Files => !state.sitemap.files.is_empty(),
             }
+        } else if state.tab == Tab::Coverage {
+            !state.list_coverage.is_empty()
         } else {
             !state.pages.is_empty()
         };
@@ -11195,6 +12138,28 @@ fn export_csv(state: &mut State, tx: &mut Tx) {
         save_csv(state, tx, headers, rows, title, slug, scope);
         return;
     }
+    if state.tab == Tab::Coverage {
+        let rows = state
+            .list_visible
+            .iter()
+            .filter_map(|index| state.list_coverage.get(*index))
+            .map(url_list::csv_row)
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return;
+        }
+        let scope = export_scope(state, rows.len(), "URL list coverage");
+        save_csv(
+            state,
+            tx,
+            url_list::CSV_HEADERS,
+            rows,
+            "URL list coverage",
+            "url-list-coverage",
+            scope,
+        );
+        return;
+    }
     if state.visible.is_empty() {
         return;
     }
@@ -11426,6 +12391,7 @@ fn tab_slug(tab: Tab) -> &'static str {
         Tab::Images => "images",
         Tab::Links => "links",
         Tab::Sitemaps => "sitemaps",
+        Tab::Coverage => "url-list-coverage",
     }
 }
 
@@ -11494,6 +12460,7 @@ fn export_headers(tab: Tab) -> &'static [&'static str] {
         Tab::Images => &["ADDRESS", "IMAGES", "NO ALT", "ISSUE"],
         Tab::Links => &["ADDRESS", "INBOUND", "OUTBOUND", "ISSUE"],
         Tab::Sitemaps => sitemap_export_headers(SitemapView::Urls),
+        Tab::Coverage => url_list::CSV_HEADERS,
     }
 }
 
@@ -11660,7 +12627,7 @@ fn export_row(tab: Tab, page: &Page, audit: &Audit) -> Vec<String> {
             row.push(count(page.links.len()));
             row.push(issue());
         }
-        Tab::Sitemaps => {}
+        Tab::Sitemaps | Tab::Coverage => {}
     }
     row
 }
@@ -11685,6 +12652,8 @@ fn results(k: &Kit, state: &State) -> El {
                 SitemapView::Urls => !state.sitemap.urls.is_empty(),
                 SitemapView::Files => !state.sitemap.files.is_empty(),
             }
+        } else if state.tab == Tab::Coverage {
+            !state.list_coverage.is_empty()
         } else {
             !state.pages.is_empty()
         };
@@ -11800,6 +12769,38 @@ fn filtered_empty(k: &Kit, state: &State) -> El {
 }
 
 fn empty(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Coverage {
+        return col()
+            .w_full()
+            .h_full()
+            .center()
+            .gap(8.0)
+            .child(
+                text("No URL list coverage")
+                    .font(TextStyle::new(13.0, 500.0).mono().tracking(1.2))
+                    .color(k.c.text_base)
+                    .text_case(TextCase::Uppercase)
+                    .key("empty-title"),
+            )
+            .child(
+                text(if state.list_prepare.is_some() {
+                    "Preparing the coverage table from the submitted rows."
+                } else if let Some(error) = &state.list_prepare_error {
+                    error.as_str()
+                } else if state.phase.active() {
+                    "The submitted rows appear as their checks finish."
+                } else {
+                    "Switch to URL list, paste or load a list, preview it, and start the check."
+                })
+                .font(k.ty.text_small)
+                .color(k.c.text_muted)
+                .w_full()
+                .px(32.0)
+                .wrap()
+                .align(Align::Center)
+                .key("empty-copy"),
+            );
+    }
     let (title, copy) = if state.tab == Tab::Internal
         && state.internal_view == InternalView::DuplicateContent
     {
@@ -12095,6 +13096,9 @@ fn sitemap_empty(state: &State) -> (String, String) {
 }
 
 fn table(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Coverage {
+        return coverage_table(k, state);
+    }
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         return content_table(k, state);
     }
@@ -12302,6 +13306,7 @@ fn table(k: &Kit, state: &State) -> El {
                     .sortable(),
             ),
         Tab::Sitemaps => table,
+        Tab::Coverage => table,
     };
     table
         .cell(move |state: &State, row, column| {
@@ -13462,6 +14467,203 @@ fn cell_link_occurrence(k: &Kit, state: &State, occurrence: &LinkOccurrence, col
     }
 }
 
+fn list_entry_at(state: &State, row: usize) -> Option<&url_list::Entry> {
+    state
+        .list_visible
+        .get(row)
+        .and_then(|index| state.list_coverage.get(*index))
+}
+
+fn selected_list_entry(state: &State) -> Option<&url_list::Entry> {
+    let source_row = state.list_view.selected.as_deref()?.parse::<u64>().ok()?;
+    state
+        .list_coverage
+        .iter()
+        .find(|entry| entry.source_row == source_row)
+}
+
+fn coverage_table(k: &Kit, state: &State) -> El {
+    let kit = k.clone();
+    Table::new(
+        |state: &State| &state.table,
+        |state: &mut State| &mut state.table,
+        |state: &State| state.list_visible.len(),
+        |state: &State, row| Cow::Borrowed(list_visible_id_ref(state, row).unwrap_or("")),
+    )
+    .name("URL list coverage")
+    .style(table_style(k))
+    .zebra(false)
+    .column(
+        TableColumn::new("source", "ROW")
+            .width(88.0)
+            .align(Align::End)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("original", "ORIGINAL VALUE")
+            .flex(1.5)
+            .min(150.0)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("normalized", "NORMALIZED URL")
+            .flex(1.5)
+            .min(150.0)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("outcome", "OUTCOME")
+            .width(126.0)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("status", "HTTP")
+            .width(76.0)
+            .align(Align::End)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("final", "FINAL URL")
+            .flex(1.4)
+            .min(140.0)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("duplicate", "DUP OF")
+            .width(82.0)
+            .align(Align::End)
+            .sortable(),
+    )
+    .column(
+        TableColumn::new("reason", "REASON")
+            .flex(1.4)
+            .min(140.0)
+            .sortable(),
+    )
+    .on_sort(|state: &mut State, column, dir, _| set_list_sort(state, column, dir))
+    .on_select(|state: &mut State, id, _tx| {
+        state.list_view.selected = Some(id.to_string());
+        state.details_open = true;
+    })
+    .cell(move |state: &State, row, column| {
+        let Some(entry) = list_entry_at(state, row) else {
+            return Cell::text("");
+        };
+        cell_list_entry(&kit, entry, column)
+    })
+    .build(state, k)
+}
+
+fn cell_list_entry(k: &Kit, entry: &url_list::Entry, column: &str) -> Cell {
+    match column {
+        "source" => Cell::text(entry.source_row.to_string()).mono(),
+        "original" => Cell::text(entry.original.clone()),
+        "normalized" => Cell::text(entry.normalized.clone()),
+        "outcome" => {
+            let color = if entry.outcome.is_finding() {
+                k.c.danger.fg
+            } else if entry.outcome.is_incomplete() {
+                k.c.warning.fg
+            } else if matches!(
+                entry.outcome,
+                ListOutcome::Duplicate | ListOutcome::Invalid | ListOutcome::OutOfScope
+            ) {
+                k.c.text_faint
+            } else {
+                k.c.text_muted
+            };
+            Cell::text(entry.outcome.label()).color(color)
+        }
+        "status" => {
+            if entry.status == 0 {
+                Cell::text("—").mono().muted()
+            } else {
+                status_cell(k, entry.status)
+            }
+        }
+        "final" => Cell::text(entry.final_url.clone()),
+        "duplicate" => entry.duplicate_of.map_or_else(
+            || Cell::text("—").mono().muted(),
+            |row| Cell::text(row.to_string()).mono(),
+        ),
+        "reason" => {
+            if entry.reason.is_empty() {
+                Cell::text("").muted()
+            } else {
+                Cell::text(entry.reason.clone())
+            }
+        }
+        _ => Cell::text(""),
+    }
+}
+
+fn coverage_summary(k: &Kit, state: &State) -> El {
+    if state.list_prepare.is_some() {
+        return row()
+            .key("coverage-summary")
+            .w_full()
+            .px(GUTTER)
+            .py(6.0)
+            .center_y()
+            .child(
+                text(format!(
+                    "Preparing coverage for {} submitted rows…",
+                    state.run.as_ref().map_or(0, |run| run.list_total)
+                ))
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_muted)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+            );
+    }
+    let mut checked = 0;
+    let mut failed = 0;
+    let mut blocked = 0;
+    let mut unchecked = 0;
+    let mut duplicate = 0;
+    let mut invalid = 0;
+    let mut out_of_scope = 0;
+    for entry in &state.list_coverage {
+        match entry.outcome {
+            ListOutcome::Checked => checked += 1,
+            ListOutcome::Failed => failed += 1,
+            ListOutcome::Blocked => blocked += 1,
+            ListOutcome::Unchecked => unchecked += 1,
+            ListOutcome::Duplicate => duplicate += 1,
+            ListOutcome::Invalid => invalid += 1,
+            ListOutcome::OutOfScope => out_of_scope += 1,
+            ListOutcome::Eligible => unchecked += 1,
+        }
+    }
+    let mut facts =
+        format!("{checked} checked · {failed} failed · {blocked} blocked · {unchecked} unchecked");
+    if duplicate + invalid + out_of_scope > 0 {
+        facts.push_str(&format!(
+            " · {duplicate} duplicate · {invalid} invalid · {out_of_scope} out of scope"
+        ));
+    }
+    row()
+        .key("coverage-summary")
+        .w_full()
+        .px(GUTTER)
+        .py(6.0)
+        .gap(8.0)
+        .center_y()
+        .child(
+            text(facts)
+                .font(k.ty.text_xsmall)
+                .color(if failed + blocked + unchecked > 0 {
+                    k.c.warning.fg
+                } else {
+                    k.c.text_muted
+                })
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        )
+}
+
 fn sitemap_table(k: &Kit, state: &State) -> El {
     let kit = k.clone();
     match state.sitemap_view {
@@ -14252,7 +15454,102 @@ fn accessibility_detail(k: &Kit, state: &State) -> El {
     )
 }
 
+fn coverage_detail(k: &Kit, state: &State) -> El {
+    let panel = col()
+        .key("coverage-detail")
+        .w(320.0)
+        .h_full()
+        .gap(10.0)
+        .px(14.0)
+        .py(12.0)
+        .border_sides([0.0, 0.0, 0.0, 1.0], k.c.border_weak);
+    let Some(entry) = selected_list_entry(state) else {
+        return panel.child(micro(k, "Input row")).child(
+            text("Select a coverage row to inspect its submitted value and final check.")
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        );
+    };
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("Source row {}", entry.source_row));
+    if !entry.original.is_empty() {
+        lines.push(format!("Original: {}", entry.original));
+    }
+    if !entry.normalized.is_empty() {
+        lines.push(format!("Normalized: {}", entry.normalized));
+    }
+    lines.push(format!("Outcome: {}", entry.outcome.label()));
+    if !entry.reason.is_empty() {
+        lines.push(format!("Reason: {}", entry.reason));
+    }
+    if entry.status != 0 {
+        lines.push(format!("HTTP status: {}", entry.status));
+    }
+    if !entry.final_url.is_empty() {
+        lines.push(format!("Final URL: {}", entry.final_url));
+    }
+    if let Some(row) = entry.duplicate_of {
+        lines.push(format!("Duplicate of source row {row}"));
+    }
+    let final_url = entry.final_url.clone();
+    let has_page = !final_url.is_empty() && page_by_url(state, &final_url).is_some();
+    let mut actions = row().gap(6.0);
+    if has_page {
+        actions = actions.child(
+            Button::new("Open page diagnostics")
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .on_press(move |state: &mut State| {
+                    let url = final_url.clone();
+                    state.tab = Tab::Internal;
+                    state.internal_view = InternalView::Urls;
+                    state.view_mut().query.replace_text("");
+                    state.view_mut().filter = CheckFilter::All;
+                    state.view_mut().selected = Some(url.clone());
+                    let (column, dir) = state.view().sort.clone();
+                    state.table.set_sort(column, dir);
+                    refresh_visible_forced(state);
+                    sync_selection(state);
+                    state.details_open = true;
+                })
+                .build(k)
+                .key("coverage-open-page"),
+        );
+    }
+    actions = actions.child(
+        IconButton::new(k.glyph.close)
+            .variant(IconButtonVariant::GhostMuted)
+            .label("Close coverage details")
+            .help("Close coverage details")
+            .on_press(|state: &mut State| state.details_open = false)
+            .build(k)
+            .key("coverage-close"),
+    );
+    panel
+        .child(
+            row()
+                .w_full()
+                .gap(6.0)
+                .center_y()
+                .child(micro(k, "Coverage row"))
+                .child(el().grow(1.0))
+                .child(actions),
+        )
+        .child(
+            text(lines.join("\n"))
+                .font(k.ty.text_small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        )
+}
+
 fn detail(k: &Kit, state: &State) -> El {
+    if state.tab == Tab::Coverage {
+        return coverage_detail(k, state);
+    }
     if state.tab == Tab::Internal && state.internal_view == InternalView::DuplicateContent {
         return content_detail(k, state);
     }
@@ -14546,7 +15843,7 @@ fn primary_issue(tab: Tab, page: &Page, audit: &Audit) -> String {
         Tab::Images => "No missing image alt text".into(),
         Tab::Links => "No broken link observed in this crawl".into(),
         Tab::Overview | Tab::Internal => page.indexability.label.text().to_string(),
-        Tab::Sitemaps => "No issue".into(),
+        Tab::Sitemaps | Tab::Coverage => "No issue".into(),
     }
 }
 
@@ -14773,7 +16070,7 @@ fn inspector_lead(k: &Kit, state: &State, page: &Page) -> El {
         Tab::Links => {
             lead = lead.child(links_lead(k, state, page));
         }
-        Tab::Sitemaps => {}
+        Tab::Sitemaps | Tab::Coverage => {}
     }
     lead
 }
@@ -16760,6 +18057,100 @@ fn scene_images(state: &mut State) {
     load_sample(state);
     switch_tab(state, Tab::Images);
 }
+fn scene_url_list(state: &mut State) {
+    let input = "https://example.com/products/widget\n\
+        https://example.com/products/widget#details\n\
+        https://example.com/blog/post?utm=1\n\
+        https://cdn.example.com/asset\n\
+        ftp://example.com/legacy\n\
+        https://example.com/docs";
+    let scope = url_list::Scope::from_seed("https://example.com/").expect("scene scope");
+    let preview = Arc::new(url_list::parse_paste(input, &scope).expect("scene list"));
+    let mut prepared = list_snapshot(
+        preview.as_ref(),
+        "",
+        CheckFilter::All,
+        &("source".to_string(), SortDir::Ascending),
+    );
+    for entry in &mut prepared.coverage {
+        if entry.outcome != ListOutcome::Unchecked {
+            continue;
+        }
+        match entry.normalized.as_str() {
+            "https://example.com/products/widget" => {
+                entry.outcome = ListOutcome::Checked;
+                entry.reason = "HTTP 200".into();
+                entry.status = 200;
+                entry.final_url = "https://example.com/products/widget".into();
+            }
+            "https://example.com/blog/post?utm=1" => {
+                entry.outcome = ListOutcome::Blocked;
+                entry.reason = "robots.txt disallows this URL".into();
+            }
+            "https://example.com/docs" => {
+                entry.outcome = ListOutcome::Failed;
+                entry.reason = "Connection reset by peer".into();
+            }
+            _ => {}
+        }
+    }
+    prepared.search_index = prepared
+        .coverage
+        .iter()
+        .map(list_search_text)
+        .collect::<Vec<_>>();
+    prepared.counts = ViewCounts {
+        total: prepared.coverage.len(),
+        findings: prepared
+            .coverage
+            .iter()
+            .filter(|entry| entry.outcome.is_finding())
+            .count(),
+        incomplete: prepared
+            .coverage
+            .iter()
+            .filter(|entry| entry.outcome.is_incomplete())
+            .count(),
+    };
+    state.url.replace_text("https://example.com/");
+    state.pages_limit.replace_text("50");
+    state.list_mode = true;
+    state.list_input.replace_text(input);
+    state.list_file_label.clear();
+    state.list_preview_scope = "https://example.com/".into();
+    state.list_preview_dirty = false;
+    state.list_preview_error = None;
+    state.list_preview = Some(preview.clone());
+    state.list_view.query.replace_text("");
+    state.list_view.filter = CheckFilter::All;
+    state.list_view.sort = ("source".into(), SortDir::Ascending);
+    state.list_view.selected = None;
+    install_list_prepared(state, prepared);
+    state.run = Some(RunContext {
+        seed: "https://example.com/".into(),
+        host: "example.com".into(),
+        limits: Limits {
+            max_pages: 50,
+            max_depth: MAX_DEPTH,
+        },
+        rendering: RenderMode::Html,
+        sitemaps: false,
+        check_links: false,
+        accessibility: false,
+        started_utc: inventory::utc_now(),
+        extraction_rules: Vec::new(),
+        list_total: preview.eligible,
+    });
+    state.phase = RunPhase::Completed;
+    state.message = "1 of 3 URLs checked on example.com · 1 failed · 1 blocked".into();
+    state.run_outcome = Some(state.message.clone());
+    state.max_pages = 50;
+    state.tab = Tab::Coverage;
+    state.details_open = false;
+    state.table.set_sort("source", SortDir::Ascending);
+    refresh_list_visible_forced(state);
+}
+
 fn scene_links(state: &mut State) {
     load_sample(state);
     switch_tab(state, Tab::Links);
@@ -17372,6 +18763,7 @@ fn scene_failed(state: &mut State) {
         accessibility: false,
         started_utc: inventory::utc_now(),
         extraction_rules: Vec::new(),
+        list_total: 0,
     });
     state.message = "Crawl failed · no response".into();
 }
@@ -17725,6 +19117,7 @@ fn main() {
             ("canonical", scene_canonical),
             ("images", scene_images),
             ("links", scene_links),
+            ("url-list", scene_url_list),
             ("link-evidence", scene_link_evidence),
             ("link-evidence-detail", scene_link_evidence_detail),
             ("inventory-scope", scene_inventory_scope),
@@ -17990,6 +19383,7 @@ mod tests {
             accessibility: false,
             started_utc: inventory::utc_now(),
             extraction_rules: Vec::new(),
+            list_total: 0,
         });
         let (tx, rx) = mpsc::channel();
         state.job = Some(CrawlJob {
@@ -18993,6 +20387,7 @@ mod tests {
                     mode: extract::MatchMode::First,
                 })
                 .collect(),
+            list_total: 0,
         });
         switch_tab(&mut state, Tab::Internal);
         state.view_mut().query.replace_text("group-0/");
@@ -23929,5 +25324,397 @@ mod tests {
             let (x, _) = narrow.find(key).unwrap_or_else(|| panic!("{key} missing"));
             assert!(x < 880.0, "{key} sits outside the 880px window at x={x}");
         }
+    }
+
+    fn list_test_entry(
+        source_row: u64,
+        original: &str,
+        outcome: ListOutcome,
+        reason: &str,
+    ) -> url_list::Entry {
+        url_list::Entry {
+            source_row,
+            original: original.into(),
+            normalized: original.into(),
+            outcome,
+            reason: reason.into(),
+            status: if outcome == ListOutcome::Checked {
+                200
+            } else {
+                0
+            },
+            final_url: if outcome == ListOutcome::Checked {
+                original.into()
+            } else {
+                String::new()
+            },
+            duplicate_of: None,
+        }
+    }
+
+    fn wait_for_list_preview(state: &mut State) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.list_preview_job.is_some() && Instant::now() < deadline {
+            let _ = poll_list_preview(state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            state.list_preview_job.is_none(),
+            "list preview did not finish"
+        );
+    }
+
+    #[test]
+    fn list_preview_parses_off_thread_and_keeps_a_prior_draft_on_file_error() {
+        let mut state = init();
+        state.list_mode = true;
+        state.url.replace_text("https://example.com/");
+        state
+            .list_input
+            .replace_text("https://example.com/a\nhttps://cdn.example.com/out\n");
+        start_list_paste_preview(&mut state);
+        wait_for_list_preview(&mut state);
+        let preview = state.list_preview.as_ref().expect("preview");
+        assert_eq!(preview.eligible, 1);
+        assert_eq!(preview.out_of_scope, 1);
+        assert!(list_can_start(&state));
+        assert!(validate_start(&state).is_ok());
+
+        let path =
+            std::env::temp_dir().join(format!("calmtoad-list-preview-{}.csv", std::process::id()));
+        std::fs::write(&path, "Name,Address\npage,https://example.com/a\n").expect("write fixture");
+        handle_list_file_choice(&mut state, Ok(Some(path.clone())));
+        wait_for_list_preview(&mut state);
+        let _ = std::fs::remove_file(path);
+        assert!(
+            state
+                .list_preview_error
+                .as_deref()
+                .is_some_and(|error| error.contains("named URL")),
+            "{:?}",
+            state.list_preview_error
+        );
+        assert_eq!(
+            state.list_preview.as_ref().map(|preview| preview.eligible),
+            Some(1),
+            "the prior draft is retained"
+        );
+        assert!(
+            state.list_input.text.contains("https://example.com/a"),
+            "a failed import must not clear the pasted draft"
+        );
+        assert!(list_can_start(&state));
+        assert!(validate_start(&state).is_ok());
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("list-error").is_some());
+        assert!(rt.find("list-summary").is_some());
+        assert!(rt.find("setup-error").is_none());
+        assert!(rt.state.list_input.text.contains("https://example.com/a"));
+    }
+
+    #[test]
+    fn choose_list_file_preserves_pasted_draft_across_a_failed_dialog_import() {
+        let mut state = init();
+        state.list_mode = true;
+        state.url.replace_text("https://example.com/");
+        state
+            .list_input
+            .replace_text("https://example.com/a\nhttps://cdn.example.com/out\n");
+        start_list_paste_preview(&mut state);
+        wait_for_list_preview(&mut state);
+        assert_eq!(
+            state.list_preview.as_ref().map(|preview| preview.eligible),
+            Some(1)
+        );
+        let prior_label = state.list_file_label.clone();
+        let prior_total = state.list_preview.as_ref().map(|preview| preview.total());
+
+        let bad =
+            std::env::temp_dir().join(format!("calmtoad-choose-bad-{}.csv", std::process::id()));
+        std::fs::write(&bad, "Name,Address\npage,https://example.com/a\n").expect("bad fixture");
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        click_key(&mut rt, "list-load");
+        let (kind, _) = rt.file_dialog().expect("URL-list picker opened");
+        assert_eq!(kind, rune::file_dialog::FileDialogKind::Open);
+        rt.resolve_file_dialog(Some(bad.clone()))
+            .expect("resolve URL-list picker");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            rt.frame(0.016);
+            let _ = poll_list_preview(&mut rt.state);
+            if rt.state.list_preview_job.is_none() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "list preview did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_file(bad);
+        assert!(
+            rt.state
+                .list_preview_error
+                .as_deref()
+                .is_some_and(|error| error.contains("named URL")),
+            "{:?}",
+            rt.state.list_preview_error
+        );
+        assert_eq!(
+            rt.state.list_input.text,
+            "https://example.com/a\nhttps://cdn.example.com/out\n"
+        );
+        assert_eq!(rt.state.list_file_label, prior_label);
+        assert_eq!(
+            rt.state
+                .list_preview
+                .as_ref()
+                .map(|preview| preview.total()),
+            prior_total
+        );
+        assert!(list_can_start(&rt.state));
+        let mut fresh = test_runtime(rt.state);
+        fresh.frame(0.016);
+        assert!(fresh.find("list-error").is_some());
+    }
+
+    #[test]
+    fn failed_file_import_keeps_prior_file_draft_and_source_label() {
+        let mut state = init();
+        state.list_mode = true;
+        state.url.replace_text("https://example.com/");
+        let dir = std::env::temp_dir();
+        let good = dir.join(format!("calmtoad-good-list-{}.csv", std::process::id()));
+        let bad = dir.join(format!("calmtoad-bad-list-{}.csv", std::process::id()));
+        std::fs::write(&good, "URL\nhttps://example.com/a\n").expect("good fixture");
+        handle_list_file_choice(&mut state, Ok(Some(good.clone())));
+        wait_for_list_preview(&mut state);
+        assert!(state.list_preview_error.is_none());
+        let prior_label = state.list_file_label.clone();
+        assert!(prior_label.contains("calmtoad-good-list-"));
+        let prior_total = state.list_preview.as_ref().map(|preview| preview.total());
+
+        std::fs::write(&bad, "Name,Address\npage,https://example.com/a\n").expect("bad fixture");
+        handle_list_file_choice(&mut state, Ok(Some(bad.clone())));
+        wait_for_list_preview(&mut state);
+        let _ = std::fs::remove_file(good);
+        let _ = std::fs::remove_file(bad);
+        assert!(state.list_preview_error.is_some());
+        assert_eq!(state.list_file_label, prior_label);
+        assert_eq!(
+            state.list_preview.as_ref().map(|preview| preview.total()),
+            prior_total
+        );
+        assert!(list_can_start(&state));
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("list-error").is_some());
+        assert_eq!(rt.state.list_file_label, prior_label);
+        assert!(list_can_start(&rt.state));
+    }
+
+    fn wait_for_list_prepare(state: &mut State) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.list_prepare.is_some() && Instant::now() < deadline {
+            let _ = poll_list_prepare(state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            state.list_prepare.is_none(),
+            "coverage preparation did not finish"
+        );
+    }
+
+    #[test]
+    fn list_prepare_builds_indexed_coverage_off_thread_and_applies_pending_checks() {
+        let mut state = init();
+        state.list_mode = true;
+        state.url.replace_text("https://example.com/");
+        state.list_view.sort = ("source".into(), SortDir::Descending);
+        let scope = url_list::Scope::from_seed("https://example.com/").expect("scope");
+        let preview = Arc::new(
+            url_list::parse_paste(
+                "https://example.com/a\nhttps://example.com/b\nhttps://cdn.example.com/c\n",
+                &scope,
+            )
+            .expect("preview"),
+        );
+        state.list_preview = Some(preview.clone());
+        state.list_preview_scope = "https://example.com/".into();
+        state.list_preview_dirty = false;
+        start_list_prepare(&mut state, preview);
+        let first_row = 1_u64;
+        state.list_pending_checks.push(ListCheck {
+            source_row: first_row,
+            outcome: ListOutcome::Checked,
+            reason: "HTTP 200".into(),
+            status: 200,
+            final_url: "https://example.com/a".into(),
+        });
+        wait_for_list_prepare(&mut state);
+        assert_eq!(state.list_coverage.len(), 3);
+        assert_eq!(state.list_index.get(&first_row), Some(&0));
+        assert_eq!(state.list_search_index.len(), 3);
+        assert_eq!(state.list_row_keys.len(), 3);
+        assert_eq!(state.list_visible, vec![2, 1, 0]);
+        assert_eq!(state.list_coverage[0].outcome, ListOutcome::Checked);
+        assert!(state.list_pending_checks.is_empty());
+        assert!(apply_list_check(
+            &mut state,
+            &ListCheck {
+                source_row: 2,
+                outcome: ListOutcome::Failed,
+                reason: "timeout".into(),
+                status: 0,
+                final_url: String::new(),
+            }
+        ));
+        assert_eq!(state.list_coverage[1].outcome, ListOutcome::Failed);
+    }
+
+    #[test]
+    fn list_prepare_50k_rows_builds_complete_indexed_state() {
+        let mut state = init();
+        state.list_mode = true;
+        state.url.replace_text("https://example.com/");
+        let scope = url_list::Scope::from_seed("https://example.com/").expect("scope");
+        let mut text = String::with_capacity(2 * 1024 * 1024);
+        for index in 0..50_000 {
+            text.push_str(&format!("https://example.com/page-{index}\n"));
+        }
+        let preview = Arc::new(url_list::parse_paste(&text, &scope).expect("50k preview"));
+        assert_eq!(preview.total(), 50_000);
+        state.list_preview = Some(preview.clone());
+        state.list_preview_scope = "https://example.com/".into();
+        state.list_preview_dirty = false;
+        start_list_prepare(&mut state, preview);
+        wait_for_list_prepare(&mut state);
+        assert_eq!(state.list_coverage.len(), 50_000);
+        assert_eq!(state.list_index.len(), 50_000);
+        assert_eq!(state.list_search_index.len(), 50_000);
+        assert_eq!(state.list_row_keys.len(), 50_000);
+        assert_eq!(state.list_visible.len(), 50_000);
+        assert_eq!(state.list_row_keys.first().map(String::as_str), Some("1"));
+        assert_eq!(
+            state.list_row_keys.last().map(String::as_str),
+            Some("50000")
+        );
+        let last = ListCheck {
+            source_row: 50_000,
+            outcome: ListOutcome::Checked,
+            reason: "HTTP 200".into(),
+            status: 200,
+            final_url: "https://example.com/page-49999".into(),
+        };
+        assert!(apply_list_check(&mut state, &last));
+        assert_eq!(
+            state.list_coverage.last().map(|entry| entry.outcome),
+            Some(ListOutcome::Checked)
+        );
+    }
+
+    #[test]
+    fn coverage_table_filters_sorts_and_exports_visible_rows() {
+        let mut state = init();
+        state.list_mode = true;
+        state.tab = Tab::Coverage;
+        state.list_coverage = vec![
+            list_test_entry(
+                1,
+                "https://example.com/beta",
+                ListOutcome::Checked,
+                "HTTP 200",
+            ),
+            list_test_entry(
+                2,
+                "https://example.com/alpha",
+                ListOutcome::Failed,
+                "=SUM(A1:A2)",
+            ),
+            list_test_entry(
+                3,
+                "https://example.com/gamma",
+                ListOutcome::Blocked,
+                "robots.txt disallows this URL",
+            ),
+        ];
+        state.list_search_index = state.list_coverage.iter().map(list_search_text).collect();
+        state.list_row_keys = state
+            .list_coverage
+            .iter()
+            .map(|entry| entry.source_row.to_string())
+            .collect();
+        state.list_view.filter = CheckFilter::Findings;
+        refresh_list_visible_forced(&mut state);
+        assert_eq!(state.list_visible, vec![1, 2]);
+
+        state.list_view.filter = CheckFilter::All;
+        state.list_view.sort = ("source".into(), SortDir::Descending);
+        refresh_list_visible_forced(&mut state);
+        assert_eq!(state.list_visible, vec![2, 1, 0]);
+
+        state.list_view.query.replace_text("beta");
+        refresh_list_visible_forced(&mut state);
+        assert_eq!(state.list_visible, vec![0]);
+        let rows = state
+            .list_visible
+            .iter()
+            .map(|index| url_list::csv_row(&state.list_coverage[*index]))
+            .collect::<Vec<_>>();
+        let csv = calmtoad::export::to_csv(url_list::CSV_HEADERS, &rows);
+        assert!(csv.starts_with("\"SOURCE ROW\",\"ORIGINAL VALUE\""));
+        assert!(csv.contains("\"https://example.com/beta\""));
+        assert!(!csv.contains("alpha"));
+
+        // The exported rows are owned copies; starting a later run cannot mutate them.
+        let frozen = rows.clone();
+        state.list_coverage.clear();
+        assert_eq!(frozen[0][1], "https://example.com/beta");
+    }
+
+    #[test]
+    fn url_list_scene_renders_coverage_input_and_export_controls() {
+        let mut state = init();
+        scene_url_list(&mut state);
+        assert!(state.list_mode);
+        assert_eq!(state.tab, Tab::Coverage);
+        assert_eq!(visible_len(&state), state.list_coverage.len());
+        assert!(
+            state
+                .list_coverage
+                .iter()
+                .any(|entry| entry.outcome == ListOutcome::Checked)
+        );
+        assert!(
+            state
+                .list_coverage
+                .iter()
+                .any(|entry| entry.outcome == ListOutcome::Blocked)
+        );
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        for key in [
+            "list-input",
+            "list-preview",
+            "list-load",
+            "coverage-summary",
+            "tab-coverage",
+            "export-csv",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} missing");
+        }
+    }
+
+    #[test]
+    fn list_mode_renders_input_and_preview_actions_offline() {
+        let mut state = init();
+        state.list_mode = true;
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("mode-list").is_some());
+        assert!(rt.find("list-input").is_some());
+        assert!(rt.find("list-preview").is_some());
+        assert!(rt.find("list-load").is_some());
+        assert!(rt.find("crawl").is_some());
+        assert!(rt.find("depth-limit").is_none());
     }
 }
