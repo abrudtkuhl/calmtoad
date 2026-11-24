@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use calmtoad::crawl::{
-    CrawlOptions, CrawlOutcome, Limits, auditable, crawl_site_with, title_issue,
+    CrawlOptions, CrawlOutcome, Limits, auditable, crawl_list_with, crawl_site_with, title_issue,
 };
 use calmtoad::extract::{ExtractionOutput, ExtractionRule, ExtractionState, MatchMode};
 use calmtoad::indexability::{CaptureInfo, EvidenceStage, FindingCode, Label};
@@ -26,6 +26,7 @@ use calmtoad::render::{
     discover_browser, kill_owned_browsers,
 };
 use calmtoad::structured_data::{CaptureCompleteness, SyntaxOutcome};
+use calmtoad::url_list::{Outcome as ListOutcome, Seed as ListSeed};
 
 const STRUCTURED: &str = r##"<!doctype html><html><head><title>Structured rendered fixture title</title>
 <meta name="description" content="A structured rendered description comfortably long enough for the meta check.">
@@ -379,6 +380,19 @@ fn serve(
             &[("Location", "/plain")],
             "",
         ),
+        "/redirect-outside" => {
+            let location = format!(
+                "http://localhost:{}/destination",
+                stream.local_addr().unwrap().port()
+            );
+            write_response(
+                &mut stream,
+                302,
+                "text/html; charset=utf-8",
+                &[("Location", &location)],
+                "",
+            );
+        }
         "/meta-refresh" => write_response(
             &mut stream,
             200,
@@ -1814,6 +1828,159 @@ fn browser_mode_cancel_is_prompt_and_leaves_no_browser_behind() {
         );
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn browser_list_mode_follows_a_redirect_through_the_owned_browser() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(info) = discover_browser(None).ok() else {
+        skip_or_fail("no browser installed for the URL-list redirect test");
+        return;
+    };
+    let fixture = Fixture::start();
+    let base = fixture.base();
+    let seed = format!("{base}/redirect");
+    let result = crawl_list_with(
+        &format!("{base}/"),
+        Limits {
+            max_pages: 4,
+            max_depth: 0,
+        },
+        CrawlOptions {
+            sitemaps: false,
+            rendering: RenderMode::Browser,
+            browser_path: Some(info.path.clone()),
+            ..CrawlOptions::default()
+        },
+        vec![ListSeed {
+            source_row: 1,
+            original: seed.clone(),
+            url: seed,
+        }],
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
+    assert_eq!(result.list.len(), 1, "{}", result.message);
+    assert_eq!(result.list[0].outcome, ListOutcome::Checked);
+    assert_eq!(result.list[0].status, 200);
+    assert_eq!(result.list[0].final_url, format!("{base}/plain"));
+    assert_eq!(fixture.hits("/redirect"), 1);
+    assert_eq!(fixture.hits("/plain"), 1);
+}
+
+#[test]
+fn browser_list_mode_rejects_out_of_scope_top_level_navigation_before_requesting_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(info) = discover_browser(None).ok() else {
+        skip_or_fail("no browser installed for the URL-list scope test");
+        return;
+    };
+    let fixture = Fixture::start();
+    let base = fixture.base();
+    let url = format!("{base}/outside");
+    let result = crawl_list_with(
+        &format!("{base}/"),
+        Limits {
+            max_pages: 4,
+            max_depth: 0,
+        },
+        CrawlOptions {
+            sitemaps: false,
+            rendering: RenderMode::Browser,
+            browser_path: Some(info.path.clone()),
+            ..CrawlOptions::default()
+        },
+        vec![ListSeed {
+            source_row: 1,
+            original: url.clone(),
+            url: url.clone(),
+        }],
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
+    assert_eq!(result.list.len(), 1, "{}", result.message);
+    assert_eq!(result.list[0].outcome, ListOutcome::Checked);
+    assert_eq!(fixture.hits("/outside"), 1);
+    assert_eq!(
+        fixture.hits("/destination"),
+        0,
+        "the out-of-scope top-level navigation was never requested"
+    );
+    let page = result
+        .pages
+        .iter()
+        .find(|page| page.url == url)
+        .expect("submitted document");
+    let render = page
+        .indexability
+        .capture
+        .render
+        .as_ref()
+        .expect("browser capture");
+    assert_eq!(render.state, RenderState::Blocked, "{}", render.reason);
+    assert!(
+        render.navigation_to.contains("localhost"),
+        "{}",
+        render.navigation_to
+    );
+}
+
+#[test]
+fn browser_list_mode_does_not_request_an_out_of_scope_redirect_destination() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(info) = discover_browser(None).ok() else {
+        skip_or_fail("no browser installed for the URL-list redirect scope test");
+        return;
+    };
+    let fixture = Fixture::start();
+    let base = fixture.base();
+    let url = format!("{base}/redirect-outside");
+    let result = crawl_list_with(
+        &format!("{base}/"),
+        Limits {
+            max_pages: 4,
+            max_depth: 0,
+        },
+        CrawlOptions {
+            sitemaps: false,
+            rendering: RenderMode::Browser,
+            browser_path: Some(info.path.clone()),
+            ..CrawlOptions::default()
+        },
+        vec![ListSeed {
+            source_row: 1,
+            original: url.clone(),
+            url: url.clone(),
+        }],
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
+    assert_eq!(result.list.len(), 1, "{}", result.message);
+    let row = &result.list[0];
+    assert_eq!(row.outcome, ListOutcome::Blocked);
+    assert_eq!(row.status, 302);
+    assert_eq!(
+        row.final_url,
+        format!("http://localhost:{}/destination", fixture.addr.port())
+    );
+    assert_eq!(fixture.hits("/redirect-outside"), 1);
+    assert_eq!(
+        fixture.hits("/destination"),
+        0,
+        "the out-of-scope redirect destination was never requested"
+    );
+    let page = result
+        .pages
+        .iter()
+        .find(|page| page.url == url)
+        .expect("submitted redirect document");
+    let render = page
+        .indexability
+        .capture
+        .render
+        .as_ref()
+        .expect("browser capture");
+    assert_eq!(render.state, RenderState::Redirected, "{}", render.reason);
 }
 
 #[test]
