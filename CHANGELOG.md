@@ -5,6 +5,12 @@ date are being prepared for release.
 
 ## [Unreleased]
 
+## [0.12.0]
+
+### Improved
+
+- **Read the crawl as a dashboard.** Overview leads with the site title and one run-facts line, then ranks up to three findings by deterministic impact; a homepage 5xx ranks above title and meta findings. Each finding names the actual subtype, explains why it matters, shows a truthful affected/eligible count, and opens the exact view and evidence row, applying the subtype query where the table supports one. Coverage lists only what was not reached or not run, with **Adjust page limit** setting the next limit without starting a crawl. **All checks** keeps all seven core families visible with Findings, Clean, Partial or Not run and a nested optional-checks group, while **Open URL table** and one **Export** menu stay together. Counts remain per check and are never summed into a unique-page claim. Starting a crawl collapses an idle Custom Extraction editor and keeps its drafts.
+
 ## [0.11.0] - 2026-11-24
 
 ### Added
