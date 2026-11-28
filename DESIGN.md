@@ -158,10 +158,18 @@ A two-ground system: carbon black or warm off-white, with a narrow neutral ladde
 - **Title** (500, 13px/17, 1.2px tracking, uppercase): Empty-state titles only. The screen has no marketing headline.
 - **Brand** (500, 12px, 3px tracking, uppercase): The wordmark only.
 
+### Overview dashboard scale
+The Overview is the one dashboard surface, so it gets one fixed, slightly stronger scale. It is not a fluid scale and no other view may add sizes.
+- **Site title** (600, 23px/29): the host only.
+- **Section** (600, 13.5px/19): Review, Coverage and All checks.
+- **Finding** (500, 13px/18): a ranked finding or coverage label.
+- **Body** (400, 12.5px/18): why a finding matters and empty-state copy.
+- **Meta / mono** (400, 11.5px/16, tabular): counts, denominators, statuses, URLs and reasons.
+
 ### Named Rules
 **The Two-Voice Rule.** If it is a measurement or an instrument label, it is mono. If it is a word from the crawled page, it is sans. Do not set a URL in mono for style, and do not set a count in sans for warmth.
 
-**The Quiet Scale Rule.** The type scale stays inside 10–13px. Hierarchy comes from case, tracking, color, and spacing, not from size jumps.
+**The Quiet Scale Rule.** Table views stay inside 10–13px. The Overview uses only its fixed dashboard scale above. Hierarchy elsewhere comes from case, tracking, color, and spacing, not from size jumps.
 
 ## Layout
 
@@ -175,6 +183,8 @@ The window is one column, top to bottom, with no outer container and no page mar
 6. **Status footer** — 30px: the crawl outcome and elapsed time, update status and version. Preserve the actual stopped/limit/error reason; truncate long text with the complete message available on hover. Do not replace coverage information with a generic completion message.
 
 Tables never sit inside a padded card. Header and cell text begin on the same 20px gutter as the section header, so every region shares one left edge. Columns use flex for content and fixed widths for counts and statuses; numeric columns are right-aligned. Row height is 30px, header height 32px. At 880×560 the layout holds: results and details scroll independently rather than reflowing into cards.
+
+Overview is the one exception to the full-bleed table: it is a single 820px readable column aligned to the same 20px gutter. It scrolls as one composition; it never becomes cards, split panes or a grid of KPI tiles.
 
 ### Named Rules
 **The Nameless Header Rule.** The header begins with the first tab after the traffic-light inset. No logo, wordmark, or product name sits in the window, so the name can change without touching the layout.
@@ -254,13 +264,19 @@ Internal's menu opens Accessibility with **Pages** and **Rules**. Pages is one r
 
 ### Custom extraction
 
-**Custom extraction…** opens a compact scrolling rule editor under the command bar: name, selector, Text/Attribute and First/All, with an attribute field when needed, errors beside the rule, and a one-page **Test on URL** preview with Stop. It is a disclosure, not a new tab or modal. A completed preview names the mode actually captured and the rule definitions actually used; editing drafts afterward marks the old preview stale rather than changing its labels. The Internal inspector shows a **Custom extraction** disclosure with retained rule values, stage and state. Values are monospaced measurements only where numeric; extracted page text remains sans.
+**Custom extraction…** opens a compact scrolling rule editor under the command bar: name, selector, Text/Attribute and First/All, with an attribute field when needed, errors beside the rule, and a one-page **Test on URL** preview with Stop. It is a disclosure, not a new tab or modal. Once a crawl starts, an idle editor collapses and its drafts remain for the next run. A completed preview names the mode actually captured and the rule definitions actually used; editing drafts afterward marks the old preview stale rather than changing its labels. The Internal inspector shows a **Custom extraction** disclosure with retained rule values, stage and state. Values are monospaced measurements only where numeric; extracted page text remains sans.
 
 ### Overview
 
-The default view is a compact summary, not a URL table. A site/run line names the host, captured URL count, actual capture mode and live or terminal outcome. Below it, a plain list shows only nonzero finding groups — response/fetch, indexing and canonical review, titles, descriptions, headings, image alt and broken links — each with an explicit affected-URL count and a **Show** action that opens the matching table with Findings selected and any hidden query cleared. A visible note says counts are per check and may overlap; they are never summed into a unique-page claim.
+The default view is the crawl dashboard, not a URL table. One 820px readable column sits on the 20px gutter. The host is the one large title; one mono facts line carries the captured page count, actual capture mode and elapsed time. The seed URL, page cap and terminal warning are not repeated in the body; the footer keeps the run outcome. **Open URL table** and one **Export** menu sit together under the facts line. No inline keyboard tip appears in the composition; Cmd/Ctrl+F remains a menu shortcut that moves to Internal search.
 
-Coverage is separate: incomplete checks, incomplete sitemap URL checks, sitemap file findings, partial sitemap discovery, and stopped/limited/failed states stay visible. Each count uses the same existing filter its Show action opens; guessed absent sitemap roots stay informational. **No findings in completed checks** is never presented as an all-clear when coverage is missing. With no run, Overview invites a URL and Crawl. **Open URL table** and **Export CSV** keep the table and its export obvious; Cmd/Ctrl+F moves to Internal search. Overview uses cached count facts and does not rescan the dataset per frame.
+**Review** is the focal section. It ranks up to three findings with deterministic priority: homepage 4xx/5xx/fetch first, then other server/fetch/client failures, sitemap file errors, indexing blocks and accessibility violations; title and meta-description findings and lower-confidence advisories fill the remaining slots. Ties break by affected count, then kind, then title, never by page order. Each item names the actual subtype, says why it matters, and gives a truthful affected count with its eligible population (“11 of 40 pages”) or a count and unit when no denominator exists. Clicking the item opens the exact view and filter, applies the subtype query where the view supports it, selects the first matching row (the seed for the homepage) and opens its evidence. With no confirmed finding, Review says so and still points to coverage when a check did not finish; it never claims an all-clear the crawl did not earn.
+
+**Coverage** is separate and lists what was not reached or not run, and why: sitemap URLs not reached (page limit or stopped), blocked and skipped sitemap URLs, checked sitemap URLs with incomplete evidence, pages whose capture or read did not finish, partial sitemap discovery, unfinished or bounded content comparison, and link destinations left unchecked. Observed findings — sitemap file errors, link findings, structured-data findings, accessibility violations and duplicate-content pairs — stay in Review or All checks; they are not coverage gaps. A page-limit gap offers **Adjust page limit**, which sets the Pages field to cover the known gap and focuses it without starting a crawl. A completed run with no gaps says every captured page finished its checks and that this covers this crawl only.
+
+**All checks** is a compact disclosure, open by default, with the seven core families: response and fetch, indexing and canonical, titles, meta descriptions, H1, image alt, and broken links. Every family is shown even at zero, with Findings, Clean, Partial or Not run, an affected/eligible count and the dominant subtype; the collapsed header still summarizes the counts. **Optional checks** is a nested disclosure that preserves sitemap URLs and files, JSON-LD, accessibility, same-text and similar content, and link checks, including their not-run and partial states. Counts are per check and may overlap; they are never summed into a unique-page claim.
+
+Overview caches all of this in the existing throttled count refresh; it never rescans pages per frame. With no run it invites a URL and Crawl.
 
 Sitemaps carries URLs and Files views in the section header rather than as extra tabs. The URLs view lists each address, its state, status, source file, and issue; the Files view lists each document, its origin (robots.txt, index, or guessed), state, status, URL count, and issue. Both use the same table geometry, sorting, selection, per-view search and All/Findings/Incomplete filter, and CSV export as the other tabs.
 
@@ -308,14 +324,18 @@ A 2px full-width track in hairline weak with an ink fill for pages found against
 - **Do** use mono for anything the tool counts, names, or measures, and sans for anything the crawled page says.
 - **Do** let healthy rows stay muted; reserve green, amber, and red for state that changes a decision.
 - **Do** express grouping with a 1px hairline and spacing before considering a fill.
-- **Do** keep one filled action on screen: CRAWL at rest, STOP while crawling.
+- **Do** keep one filled action on screen: CRAWL at rest, STOP while crawling. An open disclosure may take the active-tab neutral wash as a state, not a second action.
 - **Do** keep row and header heights fixed at 30px and 32px so the table reads as a ledger.
+- **Do** keep Overview to one readable column with Review as the focal section; use spacing and a single hairline-bounded composition before any fill.
+- **Do** use the fixed Overview dashboard scale for its title, sections, findings and metadata; table views keep the quiet 10–13px scale.
 - **Do** use an em dash in faint ink for missing values instead of inventing a zero or a blank cell.
 - **Do** derive the light theme from the same seed so the window follows macOS without becoming a different product.
 
 ### Don't:
 - **Don't** add cards, shadows, glows, gradients, or floating panels.
-- **Don't** use a display face, an oversized heading, or a fluid type scale.
+- **Don't** use a display face, an oversized heading, or a fluid type scale. Only the fixed Overview site title may exceed the quiet table scale.
+- **Don't** turn Overview into a grid of KPI tiles or add decorative scores.
+- **Don't** repeat the host, page cap or terminal warning in the Overview body; the footer owns the run outcome.
 - **Don't** use pills, large radii, or rounded containers.
 - **Don't** fill a second button, tint a whole row for status, or use green/amber/red as decoration.
 - **Don't** wrap a table in padding or center it inside a max-width container.

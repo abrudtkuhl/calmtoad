@@ -4212,6 +4212,129 @@ fn is_html(content_type: &str, body: &str) -> bool {
         || head.contains("<body")
 }
 
+/// The stable subtype behind a title or meta issue, without formatting its row text.
+///
+/// The overview ranks subtypes, so it needs the same decision the table makes without
+/// allocating a String per page on every cached refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FieldIssueKind {
+    Missing,
+    TooLong,
+    TooShort,
+    Duplicate,
+    DuplicateTooLong,
+    DuplicateTooShort,
+}
+
+impl FieldIssueKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "Missing",
+            Self::TooLong => "Too long",
+            Self::TooShort => "Too short",
+            Self::Duplicate => "Duplicate",
+            Self::DuplicateTooLong => "Duplicate, too long",
+            Self::DuplicateTooShort => "Duplicate, too short",
+        }
+    }
+
+    /// The subtype as a ranked finding: a duplicate that is also short is still a duplicate.
+    pub fn duplicate_or_length(self) -> Self {
+        match self {
+            Self::DuplicateTooLong => Self::Duplicate,
+            Self::DuplicateTooShort => Self::Duplicate,
+            other => other,
+        }
+    }
+}
+
+/// The stable subtype behind an H1 issue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum H1IssueKind {
+    Missing,
+    Multiple,
+    Duplicate,
+}
+
+impl H1IssueKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "Missing",
+            Self::Multiple => "Multiple",
+            Self::Duplicate => "Duplicate",
+        }
+    }
+}
+
+fn field_issue_kind(
+    page: &Page,
+    value: &str,
+    min: usize,
+    max: usize,
+    duplicate: bool,
+) -> Option<FieldIssueKind> {
+    if !auditable(page) {
+        return None;
+    }
+    let length = text_len(value);
+    if length == 0 {
+        return Some(FieldIssueKind::Missing);
+    }
+    let length_issue = if length > max {
+        Some(FieldIssueKind::TooLong)
+    } else if length < min {
+        Some(FieldIssueKind::TooShort)
+    } else {
+        None
+    };
+    match (duplicate, length_issue) {
+        (true, None) => Some(FieldIssueKind::Duplicate),
+        (true, Some(FieldIssueKind::TooLong)) => Some(FieldIssueKind::DuplicateTooLong),
+        (true, Some(FieldIssueKind::TooShort)) => Some(FieldIssueKind::DuplicateTooShort),
+        (false, Some(kind)) => Some(kind),
+        _ => None,
+    }
+}
+
+/// Title subtype for Overview ranking; writes only into `buffer`.
+pub fn title_issue_kind(page: &Page, audit: &Audit, buffer: &mut String) -> Option<FieldIssueKind> {
+    if !auditable(page) {
+        return None;
+    }
+    let duplicate =
+        !audit.title_dups.is_empty() && audit.title_dups.contains(norm_into(&page.title, buffer));
+    field_issue_kind(page, &page.title, TITLE_MIN, TITLE_MAX, duplicate)
+}
+
+/// Meta-description subtype for Overview ranking; writes only into `buffer`.
+pub fn meta_issue_kind(page: &Page, audit: &Audit, buffer: &mut String) -> Option<FieldIssueKind> {
+    if !auditable(page) {
+        return None;
+    }
+    let duplicate = !audit.meta_dups.is_empty()
+        && audit
+            .meta_dups
+            .contains(norm_into(&page.meta_description, buffer));
+    field_issue_kind(page, &page.meta_description, META_MIN, META_MAX, duplicate)
+}
+
+/// H1 subtype for Overview ranking; writes only into `buffer`.
+pub fn h1_issue_kind(page: &Page, audit: &Audit, buffer: &mut String) -> Option<H1IssueKind> {
+    if !auditable(page) {
+        return None;
+    }
+    if page.h1s.is_empty() {
+        return Some(H1IssueKind::Missing);
+    }
+    if page.h1s.len() > 1 {
+        return Some(H1IssueKind::Multiple);
+    }
+    if !audit.h1_dups.is_empty() && audit.h1_dups.contains(norm_into(&page.h1s[0], buffer)) {
+        return Some(H1IssueKind::Duplicate);
+    }
+    None
+}
+
 fn field_issue(page: &Page, value: &str, min: usize, max: usize, duplicate: bool) -> String {
     if !auditable(page) {
         return String::new();

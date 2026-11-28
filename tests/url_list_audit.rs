@@ -4,12 +4,24 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 use calmtoad::crawl::{CrawlOptions, Fetched, Limits, crawl_list_with, crawl_list_with_options};
 use calmtoad::render::RenderMode;
 use calmtoad::url_list::{Outcome, Seed};
+
+// These tests each run a short-lived loopback HTTP server on an ephemeral port. Running many
+// such fixtures simultaneously can make ureq's shared connection pool observe a server that is
+// already being torn down, so keep the fixture scenarios serial while leaving each crawl's own
+// request workers concurrent.
+static URL_LIST_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn url_list_test_guard() -> MutexGuard<'static, ()> {
+    URL_LIST_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Clone)]
 struct Route {
@@ -197,6 +209,7 @@ fn blocked_count(checks: &[calmtoad::url_list::ListCheck]) -> usize {
 
 #[test]
 fn list_mode_fetches_only_submitted_rows_and_keeps_link_evidence() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert("/robots.txt", Route::robots("User-agent: *\nAllow: /\n"));
     routes.insert(
@@ -264,6 +277,7 @@ fn list_mode_fetches_only_submitted_rows_and_keeps_link_evidence() {
 
 #[test]
 fn allowed_redirect_to_a_default_port_default_origin_has_its_robots_policy_resolved() {
+    let _guard = url_list_test_guard();
     let requested = Arc::new(Mutex::new(Vec::new()));
     let seen = requested.clone();
     let fetch = move |url: &str| {
@@ -333,6 +347,7 @@ fn allowed_redirect_to_a_default_port_default_origin_has_its_robots_policy_resol
 
 #[test]
 fn redirect_chain_cap_reports_the_last_known_redirect_status() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert("/robots.txt", Route::robots("User-agent: *\nAllow: /\n"));
     routes.insert("/a", Route::redirect("/b"));
@@ -365,6 +380,7 @@ fn redirect_chain_cap_reports_the_last_known_redirect_status() {
 
 #[test]
 fn redirect_hop_limit_reports_unchecked_coverage_with_the_last_redirect_status() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert("/robots.txt", Route::robots("User-agent: *\nAllow: /\n"));
     for index in 1_u16..7 {
@@ -400,6 +416,7 @@ fn redirect_hop_limit_reports_unchecked_coverage_with_the_last_redirect_status()
 
 #[test]
 fn convergent_redirects_keep_each_sources_status_when_the_destination_is_over_cap() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert("/robots.txt", Route::robots("User-agent: *\nAllow: /\n"));
     routes.insert("/a", Route::redirect_status(301, "/final"));
@@ -442,6 +459,7 @@ fn convergent_redirects_keep_each_sources_status_when_the_destination_is_over_ca
 
 #[test]
 fn convergent_redirects_keep_each_sources_status_when_the_destination_is_blocked() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert(
         "/robots.txt",
@@ -485,6 +503,7 @@ fn convergent_redirects_keep_each_sources_status_when_the_destination_is_blocked
 
 #[test]
 fn redirects_stay_in_scope_and_convergence_keeps_per_row_provenance() {
+    let _guard = url_list_test_guard();
     let outside_listener = TcpListener::bind("127.0.0.1:0").expect("outside listener");
     outside_listener
         .set_nonblocking(true)
@@ -547,6 +566,7 @@ fn redirects_stay_in_scope_and_convergence_keeps_per_row_provenance() {
 
 #[test]
 fn robots_blocks_rows_before_any_fetch_and_unavailable_policy_is_not_permission() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert(
         "/robots.txt",
@@ -602,6 +622,7 @@ fn robots_blocks_rows_before_any_fetch_and_unavailable_policy_is_not_permission(
 
 #[test]
 fn robots_blocked_rows_consume_their_page_slot() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert(
         "/robots.txt",
@@ -636,6 +657,7 @@ fn robots_blocked_rows_consume_their_page_slot() {
 
 #[test]
 fn blocked_row_in_the_middle_keeps_later_source_rows_out_of_the_budget() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert(
         "/robots.txt",
@@ -676,6 +698,7 @@ fn blocked_row_in_the_middle_keeps_later_source_rows_out_of_the_budget() {
 
 #[test]
 fn redirect_network_work_shares_the_page_budget_and_keeps_its_http_status() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert("/robots.txt", Route::robots("User-agent: *\nAllow: /\n"));
     routes.insert("/a", Route::redirect("/final"));
@@ -706,6 +729,7 @@ fn redirect_network_work_shares_the_page_budget_and_keeps_its_http_status() {
 
 #[test]
 fn page_limit_is_deterministic_and_marks_the_tail_unchecked() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert("/robots.txt", Route::robots("User-agent: *\nAllow: /\n"));
     for path in ["/1", "/2", "/3", "/4"] {
@@ -738,6 +762,7 @@ fn page_limit_is_deterministic_and_marks_the_tail_unchecked() {
 
 #[test]
 fn stop_before_start_leaves_every_submitted_row_unchecked() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert("/robots.txt", Route::robots("User-agent: *\nAllow: /\n"));
     routes.insert(
@@ -764,6 +789,7 @@ fn stop_before_start_leaves_every_submitted_row_unchecked() {
 
 #[test]
 fn stop_after_a_completed_row_keeps_it_and_marks_the_rest_unchecked() {
+    let _guard = url_list_test_guard();
     let mut routes = HashMap::new();
     routes.insert("/robots.txt", Route::robots("User-agent: *\nAllow: /\n"));
     routes.insert(
@@ -807,6 +833,7 @@ fn stop_after_a_completed_row_keeps_it_and_marks_the_rest_unchecked() {
 
 #[test]
 fn browser_setup_failure_reports_each_submitted_row_unchecked() {
+    let _guard = url_list_test_guard();
     let fixture = Fixture::start(HashMap::new());
     let options = CrawlOptions {
         rendering: RenderMode::Browser,

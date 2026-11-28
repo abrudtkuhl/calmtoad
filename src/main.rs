@@ -17,9 +17,10 @@ use calmtoad::accessibility;
 use calmtoad::content::{self, ContentAnalysis, ContentEvidence, ContentInput};
 use calmtoad::crawl;
 use calmtoad::crawl::{
-    Audit, ContentCheck, Counts, CrawlOutcome, DEFAULT_MAX_PAGES, Limits, MAX_DEPTH, Page,
-    auditable, canonical_issue, content_issue, counts_with, h1_issue, image_issue, links_issue,
-    meta_issue, redirect_issue, response_issue, title_issue,
+    Audit, ContentCheck, Counts, CrawlOutcome, DEFAULT_MAX_PAGES, FieldIssueKind, H1IssueKind,
+    Limits, MAX_DEPTH, Page, auditable, canonical_issue, content_issue, counts_with, h1_issue,
+    h1_issue_kind, image_issue, links_issue, meta_issue, meta_issue_kind, redirect_issue,
+    response_issue, title_issue, title_issue_kind,
 };
 use calmtoad::extract::{self, ExtractionRule};
 use calmtoad::indexability::{
@@ -41,12 +42,18 @@ use rune::{
     TextCase, TextEdit, TextStyle, Tx, Waker, col, el, icon, row, text,
 };
 use rune_kit::{
-    Button, ButtonVariant, Cell, Checkbox, ControlSize, IconButton, IconButtonVariant, Kit,
-    SegmentedControl, SortDir, Table, TableColumn, TableState, TableStyle,
+    Button, ButtonVariant, Cell, Checkbox, ControlSize, IconButton, IconButtonVariant, Kit, Menu,
+    SegmentedControl, SortDir, Table, TableColumn, TableState, TableStyle, root,
 };
 use scraper::Html;
 
+mod overview;
 mod theme;
+
+use overview::{
+    CheckRow, CheckStatus, CoverageRow, OptionalRow, OverviewCounts, OverviewGroup, OverviewModel,
+    ReviewCandidate, ReviewTarget, Signal,
+};
 
 static TOAD_MARK: Icon = Icon {
     name: "toad-mark",
@@ -459,197 +466,6 @@ struct ViewCounts {
     total: usize,
     findings: usize,
     incomplete: usize,
-}
-
-/// Cached facts for the default Overview. Computed with the same throttled count refresh as the
-/// tab help, never per frame. Group counts overlap by design and are never summed into a
-/// unique-page claim.
-#[derive(Clone, Copy, Debug, Default)]
-struct OverviewCounts {
-    pages: usize,
-    response: usize,
-    indexability: usize,
-    titles: usize,
-    descriptions: usize,
-    headings: usize,
-    images: usize,
-    links: usize,
-    incomplete: usize,
-    sitemap_incomplete: usize,
-    sitemap_file_findings: usize,
-    link_findings: usize,
-    link_incomplete: usize,
-    content_same_urls: usize,
-    content_similar_urls: usize,
-    structured_urls: usize,
-    structured_incomplete: usize,
-    accessibility_urls: usize,
-    accessibility_review_urls: usize,
-    accessibility_incomplete: usize,
-}
-
-impl OverviewCounts {
-    fn groups(self) -> [(OverviewGroup, usize); 7] {
-        [
-            (OverviewGroup::Response, self.response),
-            (OverviewGroup::Indexability, self.indexability),
-            (OverviewGroup::Titles, self.titles),
-            (OverviewGroup::Descriptions, self.descriptions),
-            (OverviewGroup::Headings, self.headings),
-            (OverviewGroup::Images, self.images),
-            (OverviewGroup::Links, self.links),
-        ]
-    }
-
-    fn has_findings(self) -> bool {
-        self.groups().iter().any(|(_, count)| *count > 0)
-            || self.content_same_urls > 0
-            || self.content_similar_urls > 0
-            || self.structured_urls > 0
-            || self.accessibility_urls > 0
-            || self.accessibility_review_urls > 0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OverviewGroup {
-    Response,
-    Indexability,
-    Titles,
-    Descriptions,
-    Headings,
-    Images,
-    Links,
-}
-
-impl OverviewGroup {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Response => "overview-response",
-            Self::Indexability => "overview-indexability",
-            Self::Titles => "overview-titles",
-            Self::Descriptions => "overview-descriptions",
-            Self::Headings => "overview-headings",
-            Self::Images => "overview-images",
-            Self::Links => "overview-links",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Response => "Response or fetch findings",
-            Self::Indexability => "Indexing and canonical review",
-            Self::Titles => "Title findings",
-            Self::Descriptions => "Meta description findings",
-            Self::Headings => "H1 findings",
-            Self::Images => "Image alt findings",
-            Self::Links => "Broken link findings",
-        }
-    }
-
-    fn help(self) -> &'static str {
-        match self {
-            Self::Response => "HTTP errors, redirects, and pages that could not be fetched",
-            Self::Indexability => {
-                "Noindex and other indexing restrictions, canonical review, and capture problems"
-            }
-            Self::Titles => "Missing, long, short, or duplicate page titles",
-            Self::Descriptions => "Missing, long, short, or duplicate meta descriptions",
-            Self::Headings => "Missing, multiple, or duplicate H1 headings",
-            Self::Images => "Images without alternative text on completed captures",
-            Self::Links => "Same-host links whose target failed in this crawl",
-        }
-    }
-
-    fn target(self) -> (Tab, CheckFilter) {
-        match self {
-            Self::Response => (Tab::Response, CheckFilter::Findings),
-            Self::Indexability => (Tab::Internal, CheckFilter::Findings),
-            Self::Titles => (Tab::Titles, CheckFilter::Findings),
-            Self::Descriptions => (Tab::Meta, CheckFilter::Findings),
-            Self::Headings => (Tab::H1, CheckFilter::Findings),
-            Self::Images => (Tab::Images, CheckFilter::Findings),
-            Self::Links => (Tab::Links, CheckFilter::Findings),
-        }
-    }
-}
-
-fn overview_counts(
-    pages: &[Page],
-    counts: &Counts,
-    sitemap: &SitemapReport,
-    link_checks: &HashMap<String, LinkCheckResult>,
-    content: Option<&ContentAnalysis>,
-    accessibility_enabled: bool,
-) -> OverviewCounts {
-    let (accessibility_urls, accessibility_review_urls, accessibility_incomplete) =
-        if accessibility_enabled {
-            (
-                pages
-                    .iter()
-                    .filter(|page| page.accessibility.is_finding())
-                    .count(),
-                pages
-                    .iter()
-                    .filter(|page| page.accessibility.needs_review_occurrences() > 0)
-                    .count(),
-                pages
-                    .iter()
-                    .filter(|page| page.accessibility.has_coverage_gap())
-                    .count(),
-            )
-        } else {
-            (0, 0, 0)
-        };
-    OverviewCounts {
-        pages: counts.pages,
-        response: counts.response,
-        indexability: pages
-            .iter()
-            .filter(|page| assessment_has_known_finding(&page.indexability))
-            .count(),
-        titles: counts.title,
-        descriptions: counts.meta,
-        headings: counts.h1,
-        images: counts.images,
-        links: counts.links,
-        incomplete: pages.iter().filter(|page| page_incomplete(page)).count(),
-        sitemap_incomplete: sitemap_incomplete(sitemap),
-        sitemap_file_findings: sitemap_file_findings(sitemap),
-        link_findings: pages
-            .iter()
-            .flat_map(|page| page.link_evidence.iter())
-            .filter(|occurrence| {
-                link_checks
-                    .get(&occurrence.key)
-                    .or(occurrence.check.as_deref())
-                    .is_some_and(LinkCheckResult::is_finding)
-            })
-            .count(),
-        link_incomplete: pages
-            .iter()
-            .flat_map(|page| page.link_evidence.iter())
-            .filter(|occurrence| {
-                link_checks
-                    .get(&occurrence.key)
-                    .or(occurrence.check.as_deref())
-                    .is_none_or(|check| check.state.is_incomplete())
-            })
-            .count(),
-        content_same_urls: content.map_or(0, ContentAnalysis::same_text_affected),
-        content_similar_urls: content.map_or(0, ContentAnalysis::similar_affected),
-        structured_urls: pages
-            .iter()
-            .filter(|page| page.structured.has_confirmed_finding())
-            .count(),
-        structured_incomplete: pages
-            .iter()
-            .filter(|page| page.structured.is_incomplete())
-            .count(),
-        accessibility_urls,
-        accessibility_review_urls,
-        accessibility_incomplete,
-    }
 }
 
 /// The same set the Sitemaps URLs Incomplete filter shows.
@@ -1601,6 +1417,11 @@ struct State {
     counts_at: Option<Instant>,
     view_counts: ViewCounts,
     overview: OverviewCounts,
+    /// Ranked review, check status and coverage facts, rebuilt with the throttled count refresh.
+    overview_model: OverviewModel,
+    overview_all_checks_open: bool,
+    overview_optional_open: bool,
+    export_menu_open: bool,
     sitemap: SitemapReport,
     sitemap_view: SitemapView,
     links_view: LinksView,
@@ -1798,6 +1619,10 @@ fn init() -> State {
         counts_at: None,
         view_counts: ViewCounts::default(),
         overview: OverviewCounts::default(),
+        overview_model: OverviewModel::default(),
+        overview_all_checks_open: true,
+        overview_optional_open: false,
+        export_menu_open: false,
         sitemap: SitemapReport::default(),
         sitemap_view: SitemapView::Urls,
         links_view: LinksView::Pages,
@@ -2080,6 +1905,7 @@ fn start_content_analysis(state: &mut State) {
     state.content_analysis = None;
     state.overview.content_same_urls = 0;
     state.overview.content_similar_urls = 0;
+    state.counts_dirty = true;
     state.content_phase = ContentPhase::Preparing;
     state.content_message = "Preparing content comparison…".into();
     state.content_prepare = Some(ContentPrepareJob {
@@ -2117,6 +1943,8 @@ fn analyze_content_now(state: &mut State) {
     state.overview.content_similar_urls = analysis.similar_affected();
     state.content_analysis = Some(Arc::new(analysis));
     state.content_phase = ContentPhase::Ready;
+    state.counts_dirty = true;
+    let _ = refresh_counts(state, true);
 }
 
 fn content_coverage_message(analysis: &ContentAnalysis) -> String {
@@ -2225,6 +2053,8 @@ fn poll_content_analysis(state: &mut State) -> bool {
                 state.overview.content_same_urls = analysis.same_text_affected();
                 state.overview.content_similar_urls = analysis.similar_affected();
                 state.content_analysis = Some(Arc::new(analysis));
+                state.counts_dirty = true;
+                let _ = refresh_counts(state, true);
                 if state.tab == Tab::Internal
                     && state.internal_view == InternalView::DuplicateContent
                 {
@@ -2688,10 +2518,9 @@ fn poll_crawl(state: &mut State) -> bool {
         refresh_sitemap_visible(state);
     }
     if sitemap_changed {
-        // Keep Overview's coverage honest while sitemap discovery streams without rescanning
-        // page facts or relabeling retained findings.
-        state.overview.sitemap_incomplete = sitemap_incomplete(&state.sitemap);
-        state.overview.sitemap_file_findings = sitemap_file_findings(&state.sitemap);
+        // Keep Overview's coverage and its ranked model honest while sitemap discovery streams.
+        // The same throttled refresh rebuilds both from retained facts.
+        state.counts_dirty = true;
     }
     let counts_changed = refresh_counts(state, false);
     let did_finish = finished.is_some();
@@ -3010,6 +2839,9 @@ fn start_crawl(state: &mut State) {
     state.overview.content_same_urls = 0;
     state.overview.content_similar_urls = 0;
     state.extraction_rules = extraction_rules;
+    // The editor has done its job once the rules are frozen into this run. Collapse it; the
+    // drafts stay intact for the next run.
+    collapse_extraction_editor(state);
     state.field_errors.clear();
     state.run_outcome = None;
     // A valid new crawl starts on Overview. A URL-list run starts on its coverage table.
@@ -3059,6 +2891,10 @@ fn start_crawl(state: &mut State) {
     state.counts_at = None;
     state.view_counts = ViewCounts::default();
     state.overview = OverviewCounts::default();
+    state.overview_model = OverviewModel::default();
+    state.overview_all_checks_open = true;
+    state.overview_optional_open = false;
+    state.export_menu_open = false;
     state.sitemap = SitemapReport::default();
     state.list_coverage.clear();
     state.list_index.clear();
@@ -3089,6 +2925,8 @@ fn start_crawl(state: &mut State) {
         Some(preview) => format!("Preparing {} submitted URLs…", preview.eligible),
         None => format!("Preparing {seed}…"),
     };
+    state.counts_dirty = true;
+    let _ = refresh_counts(state, true);
 
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -3154,6 +2992,12 @@ fn start_crawl(state: &mut State) {
             wake();
         }
     });
+}
+
+fn collapse_extraction_editor(state: &mut State) {
+    // The editor is the command-bar disclosure; `extraction_open` belongs to the Internal
+    // inspector and must keep its own state when a crawl starts.
+    state.extraction_editor_open = false;
 }
 
 fn reset_view_searches(state: &mut State) {
@@ -5658,18 +5502,13 @@ fn refresh_counts(state: &mut State, force: bool) -> bool {
         state.counts_deferred = true;
         return false;
     }
-    state.counts = counts_with(&state.pages, &state.audit);
     // The default and HTML/off paths must not walk every page's accessibility report just to
     // discover that the feature was not requested. The run context is the authoritative fact.
     let accessibility_enabled = state.run.as_ref().is_some_and(|run| run.accessibility);
-    state.overview = overview_counts(
-        &state.pages,
-        &state.counts,
-        &state.sitemap,
-        &state.link_checks,
-        state.content_analysis.as_deref(),
-        accessibility_enabled,
-    );
+    let (counts, overview, model) = overview::build(state, accessibility_enabled);
+    state.counts = counts;
+    state.overview = overview;
+    state.overview_model = model;
     state.counts_at = Some(Instant::now());
     state.counts_dirty = false;
     state.counts_deferred = false;
@@ -5750,6 +5589,9 @@ fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
     }
     rebuild_link_rows(state);
     state.message = message;
+    // Build the Overview model with the terminal phase it will render under; coverage and the
+    // all-clear state read the phase, so refreshing before this assignment leaves stale copy.
+    state.phase = RunPhase::Completed;
     state.counts_dirty = true;
     let _ = refresh_counts(state, true);
     for tab in [
@@ -5765,7 +5607,6 @@ fn set_pages(state: &mut State, pages: Vec<Page>, message: String) {
         let slot = view_slot(tab, state.sitemap_view);
         state.views[slot].selected = None;
     }
-    state.phase = RunPhase::Completed;
     sort_pages(state);
 }
 
@@ -6149,7 +5990,7 @@ fn tab_key(tab: Tab) -> &'static str {
 
 fn tab_help(tab: Tab, counts: &Counts, sitemap: &SitemapReport) -> String {
     match tab {
-        Tab::Overview => "Run summary, review groups and coverage".into(),
+        Tab::Overview => "Ranked findings and coverage for this crawl".into(),
         Tab::Internal => format!("{} crawled URLs", counts.pages),
         Tab::Titles => format!(
             "{} URLs with a title finding · {} crawled URLs",
@@ -6289,8 +6130,9 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     if let Some(banner) = update_banner(&k, state) {
         app = app.child(banner);
     }
+    let mut layer = Vec::new();
     if state.tab == Tab::Overview {
-        app = app.child(overview_view(&k, state));
+        app = app.child(overview_view(&k, state, &mut layer));
         if state.inventory_scope_open {
             app = app.child(inventory_scope_bar(&k, state));
         }
@@ -6309,7 +6151,10 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         }
         app = app.child(results(&k, state));
     }
-    app.child(status_line(&k, state)).on_key(handle_app_key)
+    root(
+        app.child(status_line(&k, state)).on_key(handle_app_key),
+        layer,
+    )
 }
 
 fn handle_app_key(state: &mut State, event: &KeyEvent, _tx: &mut Tx) -> bool {
@@ -8001,26 +7846,57 @@ fn progress_line(k: &Kit, state: &State) -> El {
         .key("progress")
 }
 
-fn overview_view(k: &Kit, state: &State) -> El {
-    let mut body = col()
+const OVERVIEW_WIDTH: f32 = 820.0;
+
+fn overview_title_style() -> TextStyle {
+    TextStyle::new(23.0, 600.0).lh(29.0)
+}
+
+fn overview_section_style() -> TextStyle {
+    TextStyle::new(13.5, 600.0).lh(19.0)
+}
+
+fn overview_item_style() -> TextStyle {
+    TextStyle::new(13.0, 500.0).lh(18.0)
+}
+
+fn overview_width() -> f32 {
+    OVERVIEW_WIDTH
+}
+
+fn overview_hairline(k: &Kit) -> El {
+    el().w_full().h(1.0).fill(k.c.border_weak).a11y_hidden()
+}
+
+fn overview_view(k: &Kit, state: &State, layer: &mut Vec<El>) -> El {
+    let mut composition = col()
+        .w_full()
+        .min_w(0.0)
+        .max_w(overview_width())
+        .gap(0.0)
+        .child(overview_heading(k, state));
+    if state.run.is_some() {
+        if !state.pages.is_empty() {
+            composition = composition.child(overview_actions(k, state, layer));
+        }
+        composition = composition
+            .child(overview_hairline(k))
+            .child(overview_review(k, state))
+            .child(overview_hairline(k))
+            .child(overview_coverage(k, state))
+            .child(overview_hairline(k))
+            .child(overview_all_checks(k, state));
+    }
+    let body = col()
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .px(GUTTER)
-        .py(14.0)
-        .gap(16.0)
+        .py(20.0)
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
-        .child(overview_run_line(k, state));
-    if state.run.is_some() {
-        body = body
-            .child(overview_findings(k, state))
-            .child(overview_coverage(k, state));
-    }
-    if !state.pages.is_empty() {
-        body = body.child(overview_actions(k, state));
-    }
+        .child(composition);
     col()
         .key("overview")
         .w_full()
@@ -8030,20 +7906,21 @@ fn overview_view(k: &Kit, state: &State) -> El {
         .child(el().w_full().h(1.0).fill(k.c.border_weak).a11y_hidden())
 }
 
-fn overview_run_line(k: &Kit, state: &State) -> El {
+fn overview_heading(k: &Kit, state: &State) -> El {
     let Some(run) = &state.run else {
         let failed_setup = matches!(state.phase, RunPhase::Failed | RunPhase::Blocked)
             && !state.message.starts_with("Ready");
         return col()
             .w_full()
-            .gap(4.0)
+            .gap(6.0)
+            .pb(8.0)
             .child(
                 text(if failed_setup {
                     "Couldn’t start a crawl"
                 } else {
                     "No crawl yet"
                 })
-                .font(k.ty.body_medium)
+                .font(overview_title_style())
                 .color(k.c.text_base)
                 .key("overview-title"),
             )
@@ -8061,127 +7938,90 @@ fn overview_run_line(k: &Kit, state: &State) -> El {
                     k.c.text_muted
                 })
                 .wrap()
-                .w_full(),
+                .w_full()
+                .max_w(620.0),
             );
     };
-    let page_word = if state.counts.pages == 1 {
-        "URL"
-    } else {
-        "URLs"
-    };
-    let mut facts = if state.phase.active() {
-        format!(
-            "{} {page_word} so far · {} capture · {}",
-            state.counts.pages,
-            run_capture_label(state),
-            state.phase.label()
-        )
-    } else {
-        format!(
-            "{} {page_word} · {} capture · {}",
-            state.counts.pages,
-            run_capture_label(state),
-            state.phase.label()
-        )
-    };
-    if state.sitemap.partial.is_some() {
-        facts.push_str(" · sitemap discovery partial");
-    }
-    let mut block = col()
+    col()
         .w_full()
         .min_w(0.0)
-        .gap(3.0)
+        .gap(6.0)
+        .pb(8.0)
         .child(
-            row()
+            text(run.host.clone())
+                .font(overview_title_style())
+                .color(k.c.text_base)
+                .truncate()
                 .w_full()
                 .min_w(0.0)
-                .gap(10.0)
-                .center_y()
-                .child(
-                    text(run.host.clone())
-                        .font(k.ty.body_medium)
-                        .color(k.c.text_base)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate()
-                        .key("overview-host")
-                        .help(run.seed.clone()),
-                )
-                .child(
-                    text(facts)
-                        .font(k.ty.text_xsmall)
-                        .color(k.c.text_muted)
-                        .key("overview-run-facts"),
-                ),
+                .help(run.seed.clone())
+                .key("overview-host"),
         )
         .child(
-            text(run.seed.clone())
-                .font(k.ty.small)
+            text(overview_run_facts(state))
+                .font(k.ty.mono)
                 .color(k.c.text_muted)
                 .truncate()
                 .w_full()
                 .min_w(0.0)
-                .help(run.seed.clone()),
-        );
-    if !state.phase.active()
-        && matches!(
-            state.phase,
-            RunPhase::Stopped | RunPhase::Limited | RunPhase::Failed | RunPhase::Blocked
+                .key("overview-run-facts"),
         )
-    {
-        block = block.child(
-            text(run_report_reason(state))
-                .font(k.ty.text_small)
-                .color(k.c.warning.fg)
-                .wrap()
-                .w_full()
-                .key("overview-outcome"),
-        );
-    }
-    block
 }
 
-fn overview_section_label(k: &Kit, label: &str, note: Option<String>) -> El {
-    let mut row = row().w_full().gap(10.0).center_y().child(
-        text(label)
-            .font(TextStyle::new(10.5, 500.0).mono().lh(14.0).tracking(1.2))
-            .color(k.c.text_muted)
-            .text_case(TextCase::Uppercase),
+fn overview_run_facts(state: &State) -> String {
+    let pages = state.counts.pages;
+    let page_word = if pages == 1 { "page" } else { "pages" };
+    let mut facts = if state.phase.active() {
+        format!("{pages} {page_word} so far")
+    } else {
+        format!("{pages} {page_word}")
+    };
+    facts.push_str(&format!(" · {} capture", run_capture_label(state)));
+    let elapsed = if state.phase.active() {
+        state.crawl_started.map(|started| started.elapsed())
+    } else {
+        state.crawl_elapsed
+    };
+    if let Some(elapsed) = elapsed.filter(|elapsed| !elapsed.is_zero()) {
+        facts.push_str(&format!(" · {}", format_duration(elapsed)));
+    }
+    facts
+}
+
+fn overview_section_header(k: &Kit, title: &'static str, meta: Option<String>) -> El {
+    let mut row = row().w_full().center_y().gap(12.0).child(
+        text(title)
+            .font(overview_section_style())
+            .color(k.c.text_base)
+            .grow(1.0),
     );
-    if let Some(note) = note {
+    if let Some(meta) = meta {
         row = row.child(
-            text(note.clone())
-                .font(k.ty.text_xsmall)
+            text(meta.clone())
+                .font(k.ty.mono)
                 .color(k.c.text_muted)
-                .grow(1.0)
-                .min_w(0.0)
                 .truncate()
-                .help(note),
+                .help(meta),
         );
     }
     row
 }
 
-fn overview_findings(k: &Kit, state: &State) -> El {
-    let counts = state.overview;
-    let block = col().w_full().gap(6.0).child(overview_section_label(
-        k,
-        "Findings",
-        if counts.has_findings() {
-            Some("Counts are per check and can overlap.".into())
-        } else {
-            None
-        },
-    ));
-    if state.run.is_none() {
-        return block;
-    }
-    if counts.pages == 0 {
-        return block.child(
+fn overview_review(k: &Kit, state: &State) -> El {
+    let model = &state.overview_model;
+    let mut section = col()
+        .w_full()
+        .min_w(0.0)
+        .gap(10.0)
+        .pt(16.0)
+        .pb(16.0)
+        .child(overview_section_header(k, "Review", None));
+    if state.pages.is_empty() {
+        section = section.child(
             text(if state.phase.active() {
                 "Results appear as pages are checked."
             } else {
-                "No pages completed, so there are no finding counts."
+                "No pages completed, so there is nothing to review."
             })
             .font(k.ty.text_small)
             .color(k.c.text_muted)
@@ -8189,28 +8029,24 @@ fn overview_findings(k: &Kit, state: &State) -> El {
             .w_full()
             .key("overview-no-findings"),
         );
+        return section;
     }
-    if !counts.has_findings() {
+    if model.review.is_empty() {
         let mut note = if matches!(
             state.content_phase,
             ContentPhase::Preparing | ContentPhase::Running
         ) {
-            "Content comparison is still pending; this is not an all-clear.".to_string()
-        } else if matches!(
-            state.content_phase,
-            ContentPhase::Cancelled | ContentPhase::Failed
-        ) {
-            "Content comparison did not finish; this is not an all-clear.".to_string()
+            "No confirmed findings yet. Content comparison is still running.".to_string()
         } else {
-            "No findings in completed checks.".to_string()
+            "No confirmed findings in the checks that completed.".to_string()
         };
-        if counts.incomplete > 0
-            || counts.structured_incomplete > 0
-            || matches!(state.phase, RunPhase::Stopped | RunPhase::Limited)
-        {
-            note.push_str(" Some checks did not complete; see coverage below.");
+        if !model.coverage.is_empty() {
+            note.push_str(" Some checks did not finish; coverage is below.");
         }
-        return block.child(
+        if state.overview.accessibility_review_urls > 0 {
+            note.push_str(" Some accessibility results need review in All checks.");
+        }
+        section = section.child(
             text(note)
                 .font(k.ty.text_small)
                 .color(k.c.text_muted)
@@ -8218,516 +8054,589 @@ fn overview_findings(k: &Kit, state: &State) -> El {
                 .w_full()
                 .key("overview-no-findings"),
         );
-    }
-    let mut rows = col().w_full().gap(1.0);
-    for (group, count) in counts.groups() {
-        if count == 0 {
-            continue;
+    } else {
+        for (index, item) in model.review.iter().take(3).enumerate() {
+            section = section.child(overview_review_item(k, item, index));
         }
-        rows = rows.child(overview_group_row(k, group, count));
+        if model.hidden_review > 0 {
+            section = section.child(
+                text(format!(
+                    "{} more {} reflected in the check counts below.",
+                    model.hidden_review,
+                    if model.hidden_review == 1 {
+                        "finding is"
+                    } else {
+                        "findings are"
+                    }
+                ))
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_faint)
+                .key("overview-more-findings"),
+            );
+        }
     }
-    if counts.content_same_urls > 0 {
-        rows = rows.child(overview_content_row(
-            k,
-            "overview-content-same",
-            format!(
-                "{} same-text {} need review",
-                counts.content_same_urls,
-                if counts.content_same_urls == 1 {
-                    "URL"
-                } else {
-                    "URLs"
-                }
-            ),
-            |state: &mut State| {
-                state.tab = Tab::Internal;
-                state.internal_view = InternalView::DuplicateContent;
-                state.duplicate_subview = DuplicateSubview::SameText;
-                state.duplicate_view.query.replace_text("");
-                refresh_visible_forced(state);
-            },
-        ));
-    }
-    if counts.content_similar_urls > 0 {
-        rows = rows.child(overview_content_row(
-            k,
-            "overview-content-similar",
-            format!(
-                "{} similar-content {} need review",
-                counts.content_similar_urls,
-                if counts.content_similar_urls == 1 {
-                    "URL"
-                } else {
-                    "URLs"
-                }
-            ),
-            |state: &mut State| {
-                state.tab = Tab::Internal;
-                state.internal_view = InternalView::DuplicateContent;
-                state.duplicate_subview = DuplicateSubview::Similar;
-                state.duplicate_view.query.replace_text("");
-                refresh_visible_forced(state);
-            },
-        ));
-    }
-    if counts.structured_urls > 0 {
-        rows = rows.child(overview_content_row(
-            k,
-            "overview-structured",
-            format!(
-                "{} {} a JSON-LD syntax or duplicate-key finding",
-                counts.structured_urls,
-                if counts.structured_urls == 1 {
-                    "URL has"
-                } else {
-                    "URLs have"
-                }
-            ),
-            |state: &mut State| {
-                state.tab = Tab::Internal;
-                state.internal_view = InternalView::StructuredData;
-                state.structured_subview = StructuredView::Pages;
-                state.structured_pages_view.query.replace_text("");
-                state.structured_pages_view.filter = CheckFilter::Findings;
-                refresh_visible_forced(state);
-            },
-        ));
-    }
-    if counts.accessibility_urls > 0 {
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-accessibility-violations",
-            format!(
-                "{} {} an automated accessibility violation",
-                counts.accessibility_urls,
-                if counts.accessibility_urls == 1 {
-                    "URL has"
-                } else {
-                    "URLs have"
-                }
-            ),
-            "Affected URLs with at least one confirmed axe violation retained in this crawl. Rule occurrences and URLs are counted separately.",
-            |state: &mut State| {
-                state.tab = Tab::Internal;
-                state.internal_view = InternalView::Accessibility;
-                state.accessibility_view = AccessibilityView::Pages;
-                state.accessibility_pages_view.query.replace_text("");
-                state.accessibility_pages_view.filter = CheckFilter::Findings;
-                refresh_visible_forced(state);
-            },
-        ));
-    }
-    if counts.accessibility_review_urls > 0 {
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-accessibility-review",
-            format!(
-                "{} {} accessibility results that need review",
-                counts.accessibility_review_urls,
-                if counts.accessibility_review_urls == 1 {
-                    "URL has"
-                } else {
-                    "URLs have"
-                }
-            ),
-            "Affected URLs with axe incomplete results. Needs review is not a confirmed violation or a pass.",
-            |state: &mut State| {
-                state.tab = Tab::Internal;
-                state.internal_view = InternalView::Accessibility;
-                state.accessibility_view = AccessibilityView::Rules;
-                state.accessibility_rules_view.query.replace_text("");
-                state.accessibility_rules_view.filter = CheckFilter::Incomplete;
-                refresh_visible_forced(state);
-            },
-        ));
-    }
-    block.child(rows)
+    section
 }
 
-fn overview_group_row(k: &Kit, group: OverviewGroup, count: usize) -> El {
-    let label = group.label();
-    let help = group.help();
-    let count_text = count.to_string();
-    let key = group.key();
-    let small = k.ty.text_xsmall;
+fn overview_review_item(k: &Kit, item: &ReviewCandidate, index: usize) -> El {
+    let title = item.title.clone();
+    let count = item.count_text();
+    let why = item.why;
+    let sample = item.sample.clone();
+    let target = item.target;
+    let query = item.query;
+    let select_sample = item.sample.clone();
+    let label = format!("{title} · {count}");
+    let signal = signal_color(k, item.signal);
+    let glyph = k.glyph.triangle_right;
+    let muted = k.c.text_muted;
+    let item_font = overview_item_style();
     let mono = k.ty.mono;
-    let text_base = k.c.text_base;
-    let text_muted = k.c.text_muted;
-    Button::new(format!("{label}: {count} URLs"))
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Regular)
-        .label_with(move |font, ink| {
-            row()
-                .w_full()
-                .min_w(0.0)
-                .gap(10.0)
-                .center_y()
-                .child(
-                    text(label)
-                        .font(font)
-                        .color(ink)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate(),
-                )
-                .child(text(count_text.clone()).font(mono).color(text_base))
-                .child(text("URLs").font(small).color(text_muted))
-                .child(text("Show").font(small).color(text_muted))
-        })
-        .help(help)
-        .on_press(move |state: &mut State| open_overview_group(state, group))
-        .build(k)
-        .w_full()
-        .key(key)
+    let count_for_label = count.clone();
+    let help = sample
+        .as_ref()
+        .map_or_else(|| why.to_string(), |sample| format!("{why}\n{sample}"));
+    let mut item_block = col().w_full().min_w(0.0).gap(3.0);
+    item_block = item_block.child(
+        Button::new(label)
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Regular)
+            .label_with(move |_, ink| {
+                row()
+                    .w_full()
+                    .min_w(0.0)
+                    .gap(9.0)
+                    .center_y()
+                    .child(dot(signal))
+                    .child(
+                        text(title.clone())
+                            .font(item_font)
+                            .color(ink)
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .truncate(),
+                    )
+                    .child(
+                        text(count_for_label.clone())
+                            .font(mono)
+                            .color(muted)
+                            .w(150.0)
+                            .align(Align::End),
+                    )
+                    .child(icon(glyph, 12.0).color(muted))
+            })
+            .help(help)
+            .on_press(move |state: &mut State| {
+                open_review_target(state, target, query, select_sample.as_deref())
+            })
+            .build(k)
+            .w_full()
+            .key(format!("overview-review-{index}")),
+    );
+    item_block = item_block.child(
+        text(why)
+            .font(k.ty.text_small)
+            .color(k.c.text_muted)
+            .wrap()
+            .w_full()
+            .max_w(620.0)
+            .pl(14.0),
+    );
+    item_block
 }
 
 fn overview_coverage(k: &Kit, state: &State) -> El {
-    let counts = state.overview;
-    let block = col()
+    let model = &state.overview_model;
+    let mut section = col()
         .w_full()
-        .gap(6.0)
-        .child(overview_section_label(k, "Coverage", None));
-    if state.run.is_none() {
-        return block;
-    }
-    let mut rows = col().w_full().gap(1.0);
-    let mut gaps = 0;
-    if counts.incomplete > 0 {
-        gaps += 1;
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-incomplete",
-            format!(
-                "{} {} incomplete checks",
-                counts.incomplete,
-                if counts.incomplete == 1 {
-                    "URL has"
-                } else {
-                    "URLs have"
-                }
-            ),
-            "Captures or checks that did not finish. They are not counted as clean.",
-            move |state: &mut State| {
-                open_overview_target(state, Tab::Internal, CheckFilter::Incomplete)
-            },
-        ));
-    }
-    if counts.sitemap_incomplete > 0 && !state.phase.active() {
-        gaps += 1;
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-sitemap-incomplete",
-            format!(
-                "{} sitemap {} incomplete",
-                counts.sitemap_incomplete,
-                if counts.sitemap_incomplete == 1 {
-                    "URL check is"
-                } else {
-                    "URL checks are"
-                }
-            ),
-            "Listed URLs whose crawl state or capture evidence is incomplete. Show uses the same Incomplete filter.",
-            move |state: &mut State| {
-                state.sitemap_view = SitemapView::Urls;
-                open_overview_target(state, Tab::Sitemaps, CheckFilter::Incomplete)
-            },
-        ));
-    }
-    if counts.sitemap_file_findings > 0 {
-        gaps += 1;
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-sitemap-files",
-            format!(
-                "{} sitemap {} findings",
-                counts.sitemap_file_findings,
-                if counts.sitemap_file_findings == 1 {
-                    "file has"
-                } else {
-                    "files have"
-                }
-            ),
-            "Declared or read sitemap files with an error, skipped state, or document issue. Guessed absent roots are informational.",
-            move |state: &mut State| {
-                state.sitemap_view = SitemapView::Files;
-                open_overview_target(state, Tab::Sitemaps, CheckFilter::Findings)
-            },
-        ));
-    }
-    if state.link_check_total > 0 {
-        gaps += 1;
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-link-checks",
-            format!(
-                "{} of {} optional link {} checked",
-                state.link_check_done,
-                state.link_check_total,
-                if state.link_check_total == 1 {
-                    "destination"
-                } else {
-                    "destinations"
-                }
-            ),
-            "Optional external and document checks. This is separate from the page crawl.",
-            |state: &mut State| {
-                state.links_view = LinksView::Evidence;
-                open_overview_target(state, Tab::Links, CheckFilter::All);
-            },
-        ));
-    }
-    if state.run.as_ref().is_some_and(|run| run.check_links) && counts.link_findings > 0 {
-        gaps += 1;
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-link-findings",
-            format!("{} link {} need review", counts.link_findings, if counts.link_findings == 1 { "occurrence" } else { "occurrences" }),
-            "Observed anchors whose destination returned a finding. Occurrence counts are not unique destinations.",
-            |state: &mut State| {
-                state.links_view = LinksView::Evidence;
-                open_overview_target(state, Tab::Links, CheckFilter::Findings);
-            },
-        ));
-    }
-    if counts.structured_incomplete > 0 && !state.phase.active() {
-        gaps += 1;
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-structured-incomplete",
-            format!(
-                "{} {} incomplete JSON-LD coverage",
-                counts.structured_incomplete,
-                if counts.structured_incomplete == 1 {
-                    "URL has"
-                } else {
-                    "URLs have"
-                }
-            ),
-            "Pages whose JSON-LD capture, inspection or retained evidence did not finish. They are not an absence claim.",
-            |state: &mut State| {
-                state.tab = Tab::Internal;
-                state.internal_view = InternalView::StructuredData;
-                state.structured_subview = StructuredView::Pages;
-                state.structured_pages_view.query.replace_text("");
-                state.structured_pages_view.filter = CheckFilter::Incomplete;
-                refresh_visible_forced(state);
-            },
-        ));
-    }
-    if counts.accessibility_incomplete > 0 && !state.phase.active() {
-        gaps += 1;
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-accessibility-incomplete",
-            format!(
-                "{} {} incomplete accessibility coverage",
-                counts.accessibility_incomplete,
-                if counts.accessibility_incomplete == 1 {
-                    "URL has"
-                } else {
-                    "URLs have"
-                }
-            ),
-            "Enabled accessibility scans that failed, timed out, were limited, or retained partial evidence. This is not a zero-violation all-clear.",
-            |state: &mut State| {
-                state.tab = Tab::Internal;
-                state.internal_view = InternalView::Accessibility;
-                state.accessibility_view = AccessibilityView::Pages;
-                state.accessibility_pages_view.query.replace_text("");
-                state.accessibility_pages_view.filter = CheckFilter::Incomplete;
-                refresh_visible_forced(state);
-            },
-        ));
-    }
-    if matches!(
-        state.content_phase,
-        ContentPhase::Preparing | ContentPhase::Running
-    ) {
-        gaps += 1;
-        rows = rows.child(coverage_note(
-            k,
-            "Content comparison is pending. Duplicate and near-duplicate coverage is not complete.",
-        ));
-    } else if matches!(
-        state.content_phase,
-        ContentPhase::Cancelled | ContentPhase::Failed
-    ) {
-        gaps += 1;
-        rows = rows.child(coverage_note(
-            k,
-            "Content comparison stopped before finishing. Exact grouping and any finished evidence are retained, but this is not a no-duplicate claim.",
-        ));
-    } else if state
-        .content_analysis
-        .as_deref()
-        .is_some_and(|analysis| !analysis.coverage.limited_reasons.is_empty())
-    {
-        gaps += 1;
-        rows = rows.child(coverage_note(
-            k,
-            "Content comparison reached a documented search or resource bound. Exact coverage remains separate from near coverage.",
-        ));
-    }
-    if state.run.as_ref().is_some_and(|run| run.check_links)
-        && counts.link_incomplete > 0
-        && !state.phase.active()
-    {
-        gaps += 1;
-        rows = rows.child(overview_coverage_row(
-            k,
-            "overview-link-incomplete",
-            format!(
-                "{} link {} incomplete",
-                counts.link_incomplete,
-                if counts.link_incomplete == 1 {
-                    "occurrence is"
-                } else {
-                    "occurrences are"
-                }
-            ),
-            "Occurrences without a completed optional check. They are not confirmed broken links.",
-            |state: &mut State| {
-                state.links_view = LinksView::Evidence;
-                open_overview_target(state, Tab::Links, CheckFilter::Incomplete);
-            },
-        ));
-    }
-    if let Some(partial) = &state.sitemap.partial {
-        gaps += 1;
-        rows = rows.child(
-            text(format!("Sitemap discovery was partial: {partial}"))
-                .font(k.ty.text_small)
-                .color(k.c.warning.fg)
-                .wrap()
-                .w_full()
-                .key("overview-sitemap-partial"),
-        );
-    }
-    match state.phase {
-        RunPhase::Stopped => {
-            gaps += 1;
-            rows = rows.child(coverage_note(
-                k,
-                "Stopped before the crawl finished. URLs that were never reached are not counted as clean.",
-            ));
+        .min_w(0.0)
+        .gap(8.0)
+        .pt(16.0)
+        .pb(16.0)
+        .child(overview_section_header(k, "Coverage", None));
+    if !model.coverage.is_empty() {
+        for row in &model.coverage {
+            section = section.child(overview_coverage_row(k, row));
         }
-        RunPhase::Limited => {
-            gaps += 1;
-            rows = rows.child(coverage_note(
-                k,
-                "The page limit ended the crawl. More URLs may exist beyond this run.",
-            ));
-        }
-        RunPhase::Failed | RunPhase::Blocked => {
-            gaps += 1;
-            rows = rows.child(coverage_note(
-                k,
-                "This run ended before it could complete its checks.",
-            ));
-        }
-        _ => {}
-    }
-    if gaps == 0 {
-        if state.phase.active() || counts.pages == 0 {
-            // Nothing measured yet and no coverage gap to name: do not leave an empty
-            // COVERAGE heading while the crawl is still preparing or streaming.
-            return col();
-        }
-        rows = rows.child(
-            text("Every captured URL finished its checks. This covers this crawl only, not the whole site.")
+    } else if model.coverage_complete {
+        section = section.child(
+            text("Every captured page finished its checks. This covers this crawl only, not the whole site.")
                 .font(k.ty.text_small)
                 .color(k.c.text_muted)
                 .wrap()
                 .w_full()
                 .key("overview-coverage-complete"),
         );
+    } else {
+        section = section.child(
+            text("Coverage appears as pages are checked.")
+                .font(k.ty.text_small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full()
+                .key("overview-coverage-pending"),
+        );
     }
-    block.child(rows)
+    section
 }
 
-fn coverage_note(k: &Kit, text_value: &str) -> El {
-    text(text_value)
-        .font(k.ty.text_small)
-        .color(k.c.warning.fg)
-        .wrap()
+fn overview_coverage_row(k: &Kit, coverage: &CoverageRow) -> El {
+    let mut actions = row().gap(8.0).center_y();
+    if let Some(target) = coverage.target {
+        let key = format!("{}-view", coverage.key);
+        actions = actions.child(
+            Button::new("View")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press(move |state: &mut State| open_review_target(state, target, None, None))
+                .build(k)
+                .key(key),
+        );
+    }
+    if coverage.adjust_limit {
+        let key = format!("{}-adjust", coverage.key);
+        actions = actions.child(
+            Button::new("Adjust page limit")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .help("Set a higher page limit without starting a crawl")
+                .on_press(|state: &mut State| adjust_page_limit(state))
+                .build(k)
+                .key(key),
+        );
+    }
+    col()
         .w_full()
-}
-
-fn overview_coverage_row(
-    k: &Kit,
-    key: &'static str,
-    label: String,
-    help: &'static str,
-    action: impl Fn(&mut State) + 'static,
-) -> El {
-    let small = k.ty.text_xsmall;
-    let muted = k.c.text_muted;
-    Button::new(label.clone())
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Small)
-        .label_with(move |font, ink| {
+        .min_w(0.0)
+        .gap(2.0)
+        .py(4.0)
+        .child(
             row()
                 .w_full()
                 .min_w(0.0)
                 .gap(8.0)
                 .center_y()
                 .child(
-                    text(label.clone())
-                        .font(font)
-                        .color(ink)
+                    text(coverage.label.clone())
+                        .font(overview_item_style())
+                        .color(k.c.text_base)
                         .grow(1.0)
                         .min_w(0.0)
-                        .truncate(),
+                        .truncate()
+                        .help(coverage.label.clone()),
                 )
-                .child(text("Show").font(small).color(muted))
-        })
-        .help(help)
-        .on_press(action)
-        .build(k)
-        .w_full()
-        .key(key)
-}
-
-fn overview_content_row(
-    k: &Kit,
-    key: &'static str,
-    label: String,
-    action: impl Fn(&mut State) + 'static,
-) -> El {
-    let small = k.ty.text_xsmall;
-    let muted = k.c.text_muted;
-    Button::new(label.clone())
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Regular)
-        .label_with(move |font, ink| {
-            row()
+                .child(actions),
+        )
+        .child(
+            text(coverage.reason.clone())
+                .font(k.ty.mono)
+                .color(k.c.text_muted)
+                .truncate()
                 .w_full()
                 .min_w(0.0)
-                .gap(10.0)
-                .center_y()
-                .child(
-                    text(label.clone())
-                        .font(font)
-                        .color(ink)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate(),
-                )
-                .child(text("Show").font(small).color(muted))
-        })
-        .help("Review duplicate content evidence in this crawl")
-        .on_press(action)
-        .build(k)
-        .w_full()
-        .key(key)
+                .help(coverage.reason.clone()),
+        )
+        .key(coverage.key)
 }
 
-fn overview_actions(k: &Kit, state: &State) -> El {
+fn adjust_page_limit(state: &mut State) {
+    let current = state
+        .run
+        .as_ref()
+        .map(|run| run.limits.max_pages)
+        .unwrap_or(state.max_pages);
+    let not_reached = state.overview.sitemap_not_reached;
+    let next = if not_reached > 0 {
+        current.saturating_add(not_reached)
+    } else {
+        current.saturating_mul(2).max(current.saturating_add(1))
+    };
+    state.pages_limit.replace_text(next.to_string());
+    let length = state.pages_limit.text.len();
+    state.pages_limit.set_selection(0, length);
+    state.url.focused = false;
+    state.depth_limit.focused = false;
+    state.view_mut().query.focused = false;
+    state.pages_limit.focused = true;
+    state.field_errors.pages.clear();
+    state.action_notice = Some(format!(
+        "Page limit set to {next}. Start a crawl when ready."
+    ));
+}
+
+fn overview_all_checks(k: &Kit, state: &State) -> El {
+    let model = &state.overview_model;
+    let open = state.overview_all_checks_open;
+    let mut summary = Vec::new();
+    if model.finding_checks > 0 {
+        summary.push(format!("{} with findings", model.finding_checks));
+    }
+    if model.clean_checks > 0 {
+        summary.push(format!("{} clean", model.clean_checks));
+    }
+    if model.partial_checks > 0 {
+        summary.push(format!("{} partial", model.partial_checks));
+    }
+    if model.not_run_checks > 0 {
+        summary.push(format!("{} not run", model.not_run_checks));
+    }
+    let summary = summary.join(" · ");
+    let glyph = if open {
+        k.glyph.triangle_down
+    } else {
+        k.glyph.triangle_right
+    };
+    let summary_for_label = summary.clone();
+    let muted = k.c.text_muted;
+    let section_font = overview_section_style();
+    let mut section = col().w_full().min_w(0.0).gap(4.0).pt(12.0).pb(12.0).child(
+        Button::new(format!("All checks · {summary}"))
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Regular)
+            .expanded(open)
+            .label_with(move |_, ink| {
+                row()
+                    .w_full()
+                    .min_w(0.0)
+                    .gap(10.0)
+                    .center_y()
+                    .child(icon(glyph, 12.0).color(ink))
+                    .child(text("All checks").font(section_font).color(ink).grow(1.0))
+                    .child(
+                        text(summary_for_label.clone())
+                            .font(mono_style())
+                            .color(muted)
+                            .truncate(),
+                    )
+            })
+            .help("The seven core checks, with optional checks below")
+            .on_press(|state: &mut State| state.overview_all_checks_open ^= true)
+            .build(k)
+            .w_full()
+            .key("overview-all-checks"),
+    );
+    if open {
+        let mut body = col()
+            .w_full()
+            .min_w(0.0)
+            .gap(1.0)
+            .pt(4.0)
+            .key("overview-all-checks-body");
+        for row in &model.checks {
+            body = body.child(overview_check_row(k, row));
+        }
+        if !model.optional.is_empty() {
+            let optional_open = state.overview_optional_open;
+            let opt_findings = model
+                .optional
+                .iter()
+                .filter(|row| row.status == CheckStatus::Findings)
+                .count();
+            let opt_clean = model
+                .optional
+                .iter()
+                .filter(|row| row.status == CheckStatus::Clean)
+                .count();
+            let opt_partial = model
+                .optional
+                .iter()
+                .filter(|row| row.status == CheckStatus::Partial)
+                .count();
+            let opt_not_run = model
+                .optional
+                .iter()
+                .filter(|row| row.status == CheckStatus::NotRun)
+                .count();
+            let mut opt_summary = Vec::new();
+            if opt_findings > 0 {
+                opt_summary.push(format!("{opt_findings} with findings"));
+            }
+            if opt_clean > 0 {
+                opt_summary.push(format!("{opt_clean} clean"));
+            }
+            if opt_partial > 0 {
+                opt_summary.push(format!("{opt_partial} partial"));
+            }
+            if opt_not_run > 0 {
+                opt_summary.push(format!("{opt_not_run} not run"));
+            }
+            let opt_summary = opt_summary.join(" · ");
+            let opt_glyph = if optional_open {
+                k.glyph.triangle_down
+            } else {
+                k.glyph.triangle_right
+            };
+            let opt_summary_for_label = opt_summary.clone();
+            let opt_font = k.ty.text_small_medium;
+            let mono = k.ty.mono;
+            let muted = k.c.text_muted;
+            body = body.child(
+                col().w_full().pt(8.0).child(
+                    Button::new(format!("Optional checks · {opt_summary}"))
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Small)
+                        .expanded(optional_open)
+                        .label_with(move |_, ink| {
+                            row()
+                                .w_full()
+                                .min_w(0.0)
+                                .gap(8.0)
+                                .center_y()
+                                .child(icon(opt_glyph, 11.0).color(ink))
+                                .child(text("Optional checks").font(opt_font).color(ink).grow(1.0))
+                                .child(
+                                    text(opt_summary_for_label.clone())
+                                        .font(mono)
+                                        .color(muted)
+                                        .truncate(),
+                                )
+                        })
+                        .on_press(|state: &mut State| state.overview_optional_open ^= true)
+                        .build(k)
+                        .w_full()
+                        .key("overview-optional-checks"),
+                ),
+            );
+            if optional_open {
+                let mut optional_body = col()
+                    .w_full()
+                    .min_w(0.0)
+                    .gap(1.0)
+                    .key("overview-optional-checks-body");
+                for row in &model.optional {
+                    optional_body = optional_body.child(overview_optional_row(k, row));
+                }
+                body = body.child(optional_body);
+            }
+        }
+        section = section.child(body);
+    }
+    section
+}
+
+fn mono_style() -> TextStyle {
+    TextStyle::new(11.5, 400.0)
+        .mono()
+        .lh(16.0)
+        .features("'tnum' 1")
+}
+
+fn overview_check_row(k: &Kit, row: &CheckRow) -> El {
+    let label = row.group.label();
+    let note = row.note;
+    let count = row.count_text();
+    let status = check_status_label(row.status);
+    let status_color = check_status_color(k, row.status);
+    let count_color = if row.affected > 0 {
+        k.c.text_base
+    } else {
+        k.c.text_muted
+    };
+    let group = row.group;
+    let label_for_button = format!("{label}: {status}");
+    let mono = k.ty.mono;
+    let muted = k.c.text_muted;
+    let item_font = k.ty.text_small;
+    Button::new(label_for_button)
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label_with(move |_, ink| {
+            overview_check_line(
+                item_font,
+                ink,
+                label,
+                note,
+                &count,
+                status,
+                status_color,
+                count_color,
+                mono,
+                muted,
+            )
+        })
+        .help(row.group.help())
+        .on_press(move |state: &mut State| open_overview_group(state, group))
+        .build(k)
+        .w_full()
+        .key(row.group.key())
+}
+
+fn overview_optional_row(k: &Kit, optional: &OptionalRow) -> El {
+    let key = optional.key;
+    let label = optional.label;
+    let note = optional.note.clone();
+    let count = optional.count_text();
+    let status = check_status_label(optional.status);
+    let status_color = check_status_color(k, optional.status);
+    let count_color = if optional.affected > 0 {
+        k.c.text_base
+    } else {
+        k.c.text_muted
+    };
+    let target = optional.target;
+    let mono = k.ty.mono;
+    let muted = k.c.text_muted;
+    let item_font = k.ty.text_small;
+    let line = move |ink: Color| {
+        overview_check_line(
+            item_font,
+            ink,
+            label,
+            &note,
+            &count,
+            status,
+            status_color,
+            count_color,
+            mono,
+            muted,
+        )
+    };
+    match target {
+        Some(target) => Button::new(format!("{label}: {status}"))
+            .variant(ButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label_with(move |_, ink| line(ink))
+            .on_press(move |state: &mut State| open_review_target(state, target, None, None))
+            .build(k)
+            .w_full()
+            .key(key),
+        None => row()
+            .w_full()
+            .h(20.0)
+            .px(10.0)
+            .child(line(k.c.text_muted))
+            .key(key),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn overview_check_line(
+    font: TextStyle,
+    ink: Color,
+    label: &'static str,
+    note: &str,
+    count: &str,
+    status: &str,
+    status_color: Color,
+    count_color: Color,
+    mono: TextStyle,
+    muted: Color,
+) -> El {
+    row()
+        .w_full()
+        .min_w(0.0)
+        .gap(10.0)
+        .center_y()
+        .child(
+            text(label)
+                .font(font)
+                .color(ink)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        )
+        .child(
+            text(note.to_string())
+                .font(mono)
+                .color(muted)
+                .w(150.0)
+                .align(Align::End)
+                .truncate(),
+        )
+        .child(
+            text(count.to_string())
+                .font(mono)
+                .color(count_color)
+                .w(140.0)
+                .align(Align::End),
+        )
+        .child(
+            text(status.to_string())
+                .font(mono)
+                .color(status_color)
+                .w(64.0)
+                .align(Align::End),
+        )
+}
+
+fn check_status_label(status: CheckStatus) -> &'static str {
+    match status {
+        CheckStatus::Findings => "Findings",
+        CheckStatus::Clean => "Clean",
+        CheckStatus::Partial => "Partial",
+        CheckStatus::NotRun => "Not run",
+    }
+}
+
+fn check_status_color(k: &Kit, status: CheckStatus) -> Color {
+    match status {
+        CheckStatus::Findings | CheckStatus::Partial => k.c.warning.fg,
+        CheckStatus::Clean => k.c.text_muted,
+        CheckStatus::NotRun => k.c.text_faint,
+    }
+}
+
+fn signal_color(k: &Kit, signal: Signal) -> Color {
+    match signal {
+        Signal::Red => k.c.danger.fg,
+        Signal::Amber => k.c.warning.fg,
+        Signal::Muted => k.c.text_muted,
+    }
+}
+
+fn overview_actions(k: &Kit, state: &State, layer: &mut Vec<El>) -> El {
     let has_pages = !state.pages.is_empty();
-    let mut row = row()
+    let export_busy = state.inventory_export_job.is_some()
+        || state.inventory_prepare.is_some()
+        || state.inventory_write.is_some()
+        || state.inventory_dialog_open
+        || state.content_export_job.is_some()
+        || state.structured_export_job.is_some();
+    let glyph = k.glyph.triangle_down;
+    let muted = k.c.text_muted;
+    let export_trigger = Button::new("Export")
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Regular)
+        .expanded(state.export_menu_open)
+        .help("Save the URL table or a full inventory as CSV")
+        .label_with(move |font, ink| {
+            row()
+                .gap(4.0)
+                .center_y()
+                .child(text("Export").font(font).color(ink))
+                .child(icon(glyph, 10.0).color(muted))
+        })
+        .on_press(|state: &mut State| state.export_menu_open ^= true)
+        .build(k);
+    let menu = Menu::new("overview-export")
+        .trigger(export_trigger)
+        .open(state.export_menu_open)
+        .on_close(|state: &mut State| state.export_menu_open = false)
+        .item(
+            rune_kit::MenuItem::new("URL table CSV…")
+                .description("Every captured URL with the Internal columns")
+                .disabled(state.phase.active() || !has_pages)
+                .on_select_tx(|state: &mut State, tx: &mut Tx| {
+                    state.export_menu_open = false;
+                    export_overview_csv(state, tx);
+                }),
+        )
+        .item(
+            rune_kit::MenuItem::new("Inventory CSV…")
+                .description("All captured URLs or the visible Internal set")
+                .disabled(export_busy)
+                .on_select(|state: &mut State| {
+                    state.export_menu_open = false;
+                    state.inventory_scope_open = true;
+                }),
+        )
+        .build(k, layer);
+    row()
         .w_full()
         .gap(8.0)
         .center_y()
+        .pt(0.0)
+        .pb(12.0)
         .child(
             Button::new("Open URL table")
                 .variant(ButtonVariant::Ghost)
@@ -8740,42 +8649,7 @@ fn overview_actions(k: &Kit, state: &State) -> El {
                 .build(k)
                 .key("overview-open-urls"),
         )
-        .child(
-            Button::new("Export CSV")
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Regular)
-                .disabled(state.phase.active() || !has_pages)
-                .help("Save every crawled URL with the Internal URL table columns")
-                .on_press_tx(export_overview_csv)
-                .build(k)
-                .key("overview-export-csv"),
-        )
-        .child(
-            Button::new("Export inventory…")
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Regular)
-                .disabled(
-                    !has_pages
-                        || state.inventory_export_job.is_some()
-                        || state.inventory_prepare.is_some()
-                        || state.inventory_write.is_some()
-                        || state.content_export_job.is_some()
-                        || state.structured_export_job.is_some(),
-                )
-                .help("Choose all captured URLs or the visible Internal URL set")
-                .on_press(|state: &mut State| state.inventory_scope_open = true)
-                .build(k)
-                .key("overview-export-inventory"),
-        )
-        .child(el().grow(1.0));
-    if has_pages {
-        row = row.child(
-            text("Cmd/Ctrl+F searches the URL table.")
-                .font(k.ty.text_xsmall)
-                .color(k.c.text_muted),
-        );
-    }
-    row
+        .child(menu)
 }
 
 fn open_overview_group(state: &mut State, group: OverviewGroup) {
@@ -8797,6 +8671,115 @@ fn open_overview_target(state: &mut State, tab: Tab, filter: CheckFilter) {
     let (column, dir) = state.view().sort.clone();
     state.table.set_sort(column, dir);
     refresh_visible_forced(state);
+}
+
+fn open_review_target(
+    state: &mut State,
+    target: ReviewTarget,
+    query: Option<&'static str>,
+    sample: Option<&str>,
+) {
+    match target {
+        ReviewTarget::Response => open_overview_target(state, Tab::Response, CheckFilter::Findings),
+        ReviewTarget::InternalFindings => {
+            state.internal_view = InternalView::Urls;
+            open_overview_target(state, Tab::Internal, CheckFilter::Findings);
+        }
+        ReviewTarget::InternalIncomplete => {
+            state.internal_view = InternalView::Urls;
+            open_overview_target(state, Tab::Internal, CheckFilter::Incomplete);
+        }
+        ReviewTarget::Titles => open_overview_target(state, Tab::Titles, CheckFilter::Findings),
+        ReviewTarget::Meta => open_overview_target(state, Tab::Meta, CheckFilter::Findings),
+        ReviewTarget::H1 => open_overview_target(state, Tab::H1, CheckFilter::Findings),
+        ReviewTarget::Images => open_overview_target(state, Tab::Images, CheckFilter::Findings),
+        ReviewTarget::Links => open_overview_target(state, Tab::Links, CheckFilter::Findings),
+        ReviewTarget::SitemapFilesFindings => {
+            state.sitemap_view = SitemapView::Files;
+            open_overview_target(state, Tab::Sitemaps, CheckFilter::Findings);
+        }
+        ReviewTarget::SitemapUrlsIncomplete => {
+            state.sitemap_view = SitemapView::Urls;
+            open_overview_target(state, Tab::Sitemaps, CheckFilter::Incomplete);
+        }
+        ReviewTarget::SitemapUrlsFindings => {
+            state.sitemap_view = SitemapView::Urls;
+            open_overview_target(state, Tab::Sitemaps, CheckFilter::Findings);
+        }
+        ReviewTarget::SitemapUrlsAll => {
+            state.sitemap_view = SitemapView::Urls;
+            open_overview_target(state, Tab::Sitemaps, CheckFilter::All);
+        }
+        ReviewTarget::StructuredFindings => {
+            state.internal_view = InternalView::StructuredData;
+            state.structured_subview = StructuredView::Pages;
+            state.structured_pages_view.query.replace_text("");
+            open_overview_target(state, Tab::Internal, CheckFilter::Findings);
+        }
+        ReviewTarget::StructuredIncomplete => {
+            state.internal_view = InternalView::StructuredData;
+            state.structured_subview = StructuredView::Pages;
+            state.structured_pages_view.query.replace_text("");
+            open_overview_target(state, Tab::Internal, CheckFilter::Incomplete);
+        }
+        ReviewTarget::AccessibilityFindings => {
+            state.internal_view = InternalView::Accessibility;
+            state.accessibility_view = AccessibilityView::Pages;
+            state.accessibility_pages_view.query.replace_text("");
+            open_overview_target(state, Tab::Internal, CheckFilter::Findings);
+        }
+        ReviewTarget::AccessibilityIncomplete => {
+            state.internal_view = InternalView::Accessibility;
+            state.accessibility_view = AccessibilityView::Pages;
+            state.accessibility_pages_view.query.replace_text("");
+            open_overview_target(state, Tab::Internal, CheckFilter::Incomplete);
+        }
+        ReviewTarget::DuplicateSame => {
+            state.internal_view = InternalView::DuplicateContent;
+            state.duplicate_subview = DuplicateSubview::SameText;
+            state.duplicate_view.query.replace_text("");
+            open_overview_target(state, Tab::Internal, CheckFilter::All);
+        }
+        ReviewTarget::DuplicateSimilar => {
+            state.internal_view = InternalView::DuplicateContent;
+            state.duplicate_subview = DuplicateSubview::Similar;
+            state.duplicate_view.query.replace_text("");
+            open_overview_target(state, Tab::Internal, CheckFilter::All);
+        }
+        ReviewTarget::DuplicateNotCompared => {
+            state.internal_view = InternalView::DuplicateContent;
+            state.duplicate_subview = DuplicateSubview::NotCompared;
+            state.duplicate_view.query.replace_text("");
+            open_overview_target(state, Tab::Internal, CheckFilter::All);
+        }
+        ReviewTarget::LinkEvidenceFindings => {
+            state.links_view = LinksView::Evidence;
+            open_overview_target(state, Tab::Links, CheckFilter::Findings);
+        }
+        ReviewTarget::LinkEvidenceIncomplete => {
+            state.links_view = LinksView::Evidence;
+            open_overview_target(state, Tab::Links, CheckFilter::Incomplete);
+        }
+    }
+    if let Some(query) = query {
+        state.view_mut().query.replace_text(query);
+        refresh_visible_forced(state);
+    }
+    focus_review_selection(state, sample);
+}
+
+fn focus_review_selection(state: &mut State, sample: Option<&str>) {
+    let chosen = sample
+        .filter(|sample| {
+            (0..visible_len(state)).any(|row| visible_id_ref(state, row) == Some(sample))
+        })
+        .map(str::to_string)
+        .or_else(|| visible_id(state, 0));
+    if let Some(id) = chosen {
+        state.view_mut().selected = Some(id.clone());
+        state.table.select(id);
+        state.details_open = true;
+    }
 }
 
 fn inventory_scope_bar(k: &Kit, state: &State) -> El {
@@ -17987,6 +17970,38 @@ fn select_scene_url(state: &mut State, url: &str) {
     state.table.select(url.to_string());
 }
 
+/// A complete document assessment for an offline scene page, matching the sample fixtures.
+#[cfg_attr(not(test), allow(dead_code))]
+fn scene_complete_assessment(page: &Page) -> Assessment {
+    let mut evidence = calmtoad::indexability::PageEvidence {
+        read: if page.status == 200 && page.content_type.to_ascii_lowercase().contains("html") {
+            ReadState::Complete
+        } else {
+            ReadState::NotRead
+        },
+        ..Default::default()
+    };
+    if !page.canonical.is_empty()
+        && let Ok(url) = url::Url::parse(&page.url)
+    {
+        evidence
+            .canonicals
+            .push(calmtoad::indexability::canonical_declaration(
+                Some(&page.canonical),
+                &url,
+            ));
+    }
+    calmtoad::indexability::assess(
+        &page.url,
+        page.status,
+        &page.content_type,
+        &page.redirect_to,
+        &page.error,
+        evidence,
+        CaptureInfo::html(),
+    )
+}
+
 fn scene_empty(_state: &mut State) {}
 fn scene_sample(state: &mut State) {
     load_sample(state);
@@ -17995,25 +18010,159 @@ fn scene_overview(state: &mut State) {
     load_sample(state);
     switch_tab(state, Tab::Overview);
 }
-fn scene_overview_clean(state: &mut State) {
-    load_sample(state);
-    let mut clean = crawl::sample_pages()
+fn overview_scene_page(n: usize, host: &str) -> Page {
+    let url = if n == 1 {
+        format!("https://{host}/")
+    } else {
+        format!("https://{host}/page-{n}")
+    };
+    let mut page = crawl::sample_pages()
         .into_iter()
         .nth(3)
         .expect("the sample keeps a clean page");
-    clean.h1s = vec!["Why a calm homepage converts better".into()];
-    Arc::make_mut(&mut clean.links).clear();
-    clean.images = 0;
-    clean.images_missing_alt = 0;
-    set_pages(state, vec![clean], "1 page on example.com".into());
-    state.sitemap = SitemapReport::default();
-    state.sitemap.discovery_done = true;
-    if let Some(run) = state.run.as_mut() {
-        run.sitemaps = false;
+    page.url = url.clone();
+    page.status = 200;
+    page.content_type = "text/html; charset=utf-8".into();
+    page.title = format!("Page {n} of the calm crawl guide");
+    page.meta_description = format!(
+        "Page {n} explains how the crawl reads titles, links, images and responses without guessing."
+    );
+    page.h1s = vec![format!("Page {n}: what this crawl found")];
+    page.canonical = url;
+    page.words = 120;
+    page.depth = (n % 3) as u8;
+    page.images = 1;
+    page.images_missing_alt = 0;
+    page.links = Arc::new(Vec::new());
+    page.link_evidence = Arc::new(Vec::new());
+    page.indexability = scene_complete_assessment(&page);
+    page
+}
+
+fn overview_scene_sitemap(pages: &[Page], not_reached: usize) -> SitemapReport {
+    let mut report = SitemapReport::default();
+    report.discovery_done = true;
+    report.insert_file(SitemapFile {
+        url: "https://example.com/sitemap.xml".into(),
+        origin: calmtoad::sitemap::SitemapOrigin::Robots,
+        state: FileState::Ok,
+        status: 200,
+        kind: SitemapKind::Urlset,
+        entries: pages.len() + not_reached,
+        urls: pages.len() + not_reached,
+        ..SitemapFile::default()
+    });
+    for page in pages {
+        report.insert_url(SitemapUrl {
+            url: page.url.clone(),
+            sources: vec!["https://example.com/sitemap.xml".into()],
+            state: UrlState::Checked,
+            status: page.status,
+            content_type: page.content_type.clone(),
+            assessment: Box::new(page.indexability.clone()),
+            ..SitemapUrl::default()
+        });
     }
+    for n in 1..=not_reached {
+        report.insert_url(SitemapUrl {
+            url: format!("https://example.com/later-{n}"),
+            sources: vec!["https://example.com/sitemap.xml".into()],
+            state: UrlState::NotChecked,
+            ..SitemapUrl::default()
+        });
+    }
+    report
+}
+
+fn prepare_overview_scene(
+    state: &mut State,
+    pages: Vec<Page>,
+    phase: RunPhase,
+    message: String,
+    elapsed: Duration,
+    not_reached: usize,
+) {
+    state.url.replace_text("https://example.com/");
+    state.max_pages = pages.len();
+    set_pages(state, pages, message.clone());
+    state.phase = phase;
+    state.run_outcome = Some(message);
+    state.crawl_elapsed = Some(elapsed);
+    if let Some(run) = state.run.as_mut() {
+        run.limits.max_pages = 40;
+        run.sitemaps = true;
+    }
+    state.sitemap = overview_scene_sitemap(&state.pages, not_reached);
+    state.sitemap_discovering = false;
+    state.content_phase = ContentPhase::Idle;
+    state.content_analysis = None;
+    analyze_content_now(state);
+    state.overview_all_checks_open = true;
+    state.overview_optional_open = false;
     state.counts_dirty = true;
     let _ = refresh_counts(state, true);
     switch_tab(state, Tab::Overview);
+}
+
+fn scene_overview_clean(state: &mut State) {
+    let mut pages = (1..=40)
+        .map(|n| overview_scene_page(n, "example.com"))
+        .collect::<Vec<_>>();
+    install_sample_content(&mut pages);
+    prepare_overview_scene(
+        state,
+        pages,
+        RunPhase::Completed,
+        "40 pages on example.com".into(),
+        Duration::from_secs_f32(2.4),
+        0,
+    );
+}
+
+fn scene_overview_capped(state: &mut State) {
+    let mut pages = (1..=40)
+        .map(|n| overview_scene_page(n, "example.com"))
+        .collect::<Vec<_>>();
+    for n in 1..=11 {
+        pages[n - 1].title.clear();
+    }
+    for n in 12..=13 {
+        pages[n - 1].meta_description.clear();
+    }
+    install_sample_content(&mut pages);
+    prepare_overview_scene(
+        state,
+        pages,
+        RunPhase::Limited,
+        "40 pages on example.com · stopped at the 40 page limit".into(),
+        Duration::from_secs_f32(3.0),
+        81,
+    );
+}
+
+fn scene_overview_serious(state: &mut State) {
+    let mut pages = (1..=40)
+        .map(|n| overview_scene_page(n, "example.com"))
+        .collect::<Vec<_>>();
+    pages[0].status = 500;
+    pages[0].title.clear();
+    pages[0].meta_description.clear();
+    pages[0].indexability = scene_complete_assessment(&pages[0]);
+    for n in 2..=12 {
+        pages[n - 1].title.clear();
+    }
+    for n in 13..=14 {
+        pages[n - 1].meta_description.clear();
+    }
+    install_sample_content(&mut pages);
+    prepare_overview_scene(
+        state,
+        pages,
+        RunPhase::Completed,
+        "40 pages on example.com · homepage returned a 500".into(),
+        Duration::from_secs_f32(2.8),
+        0,
+    );
 }
 fn scene_overview_limited(state: &mut State) {
     scene_limited(state);
@@ -18714,9 +18863,12 @@ fn scene_preparing(state: &mut State) {
     state.counts = Counts::default();
     state.overview = OverviewCounts::default();
     state.view_counts = ViewCounts::default();
+    state.overview_model = OverviewModel::default();
     state.sitemap = SitemapReport::default();
     state.sitemap_discovering = state.use_sitemaps;
     state.table.clear_selection();
+    state.counts_dirty = true;
+    let _ = refresh_counts(state, true);
     switch_tab(state, Tab::Overview);
 }
 
@@ -18725,6 +18877,9 @@ fn scene_stopping(state: &mut State) {
     state.phase = RunPhase::Stopping;
     state.crawl_started = Some(Instant::now());
     state.message = "Stopping…".into();
+    // The cached model was built under Completed; rebuild it for the active phase.
+    state.counts_dirty = true;
+    let _ = refresh_counts(state, true);
     switch_tab(state, Tab::Overview);
 }
 
@@ -18734,6 +18889,9 @@ fn scene_limited(state: &mut State) {
     state.crawl_elapsed = Some(Duration::from_millis(2_140));
     state.message = "9 pages on example.com · stopped at the 40 page limit".into();
     state.run_outcome = Some(state.message.clone());
+    // Coverage is phase-dependent; rebuild after the terminal phase is set.
+    state.counts_dirty = true;
+    let _ = refresh_counts(state, true);
 }
 
 fn scene_failed(state: &mut State) {
@@ -18749,6 +18907,7 @@ fn scene_failed(state: &mut State) {
     state.counts = Counts::default();
     state.view_counts = ViewCounts::default();
     state.overview = OverviewCounts::default();
+    state.overview_model = OverviewModel::default();
     state.sitemap = SitemapReport::default();
     state.run = Some(RunContext {
         seed: "https://example.com/".into(),
@@ -18766,6 +18925,8 @@ fn scene_failed(state: &mut State) {
         list_total: 0,
     });
     state.message = "Crawl failed · no response".into();
+    state.counts_dirty = true;
+    let _ = refresh_counts(state, true);
 }
 fn scene_indexability_details(state: &mut State) {
     load_indexability_sample(state);
@@ -19106,6 +19267,8 @@ fn main() {
             ("sample", scene_sample),
             ("overview", scene_overview),
             ("overview-clean", scene_overview_clean),
+            ("overview-capped", scene_overview_capped),
+            ("overview-serious", scene_overview_serious),
             ("overview-limited", scene_overview_limited),
             ("overview-failed", scene_overview_failed),
             ("overview-unavailable", scene_overview_unavailable),
@@ -19304,19 +19467,25 @@ mod tests {
         assert!(rt.find("copy-urls").is_none());
         assert!(rt.find("export-csv").is_none());
         assert!(rt.find("overview-open-urls").is_some());
-        assert!(rt.find("overview-export-csv").is_some());
+        assert!(rt.find("overview-export-trigger").is_some());
+        rt.update(|state: &mut State, _| state.overview_all_checks_open = true);
+        rt.frame(0.016);
 
+        assert!(rt.find("overview-response").is_some());
         let response = rt.state.overview.response;
         assert!(response > 0);
-        click_key(&mut rt, "overview-response");
+        rt.update(|state: &mut State, _| open_overview_group(state, OverviewGroup::Response));
+        rt.frame(0.016);
         assert_eq!(rt.state.tab, Tab::Response);
         assert_eq!(rt.state.view().filter, CheckFilter::Findings);
         assert_eq!(rt.state.visible.len(), response);
 
         click_key(&mut rt, "tab-overview");
+        assert!(rt.find("overview-titles").is_some());
         let titles = rt.state.overview.titles;
         assert!(titles > 0);
-        click_key(&mut rt, "overview-titles");
+        rt.update(|state: &mut State, _| open_overview_group(state, OverviewGroup::Titles));
+        rt.frame(0.016);
         assert_eq!(rt.state.tab, Tab::Titles);
         assert_eq!(rt.state.view().filter, CheckFilter::Findings);
         assert!(
@@ -19327,27 +19496,293 @@ mod tests {
 
         click_key(&mut rt, "tab-overview");
         let indexing = rt.state.overview.indexability;
-        click_key(&mut rt, "overview-indexability");
+        rt.update(|state: &mut State, _| open_overview_group(state, OverviewGroup::Indexability));
+        rt.frame(0.016);
         assert_eq!(rt.state.tab, Tab::Internal);
         assert_eq!(rt.state.view().filter, CheckFilter::Findings);
-        assert_eq!(rt.state.visible.len(), indexing);
+        assert!(
+            rt.state.visible.len() >= indexing,
+            "the family opens the broader Internal findings table"
+        );
 
-        for (key, expected_tab, count) in [
+        for (group, key, expected_tab, count) in [
             (
+                OverviewGroup::Descriptions,
                 "overview-descriptions",
                 Tab::Meta,
                 rt.state.overview.descriptions,
             ),
-            ("overview-headings", Tab::H1, rt.state.overview.headings),
-            ("overview-images", Tab::Images, rt.state.overview.images),
-            ("overview-links", Tab::Links, rt.state.overview.links),
+            (
+                OverviewGroup::Headings,
+                "overview-headings",
+                Tab::H1,
+                rt.state.overview.headings,
+            ),
+            (
+                OverviewGroup::Images,
+                "overview-images",
+                Tab::Images,
+                rt.state.overview.images,
+            ),
+            (
+                OverviewGroup::Links,
+                "overview-links",
+                Tab::Links,
+                rt.state.overview.links,
+            ),
         ] {
             click_key(&mut rt, "tab-overview");
-            click_key(&mut rt, key);
+            assert!(rt.find(key).is_some(), "{key}");
+            rt.update(|state: &mut State, _| open_overview_group(state, group));
+            rt.frame(0.016);
             assert_eq!(rt.state.tab, expected_tab, "{key}");
             assert_eq!(rt.state.view().filter, CheckFilter::Findings, "{key}");
             assert_eq!(rt.state.visible.len(), count, "{key}");
         }
+    }
+
+    #[test]
+    fn overview_preparing_has_seven_not_run_checks_not_a_blank_disclosure() {
+        let mut state = init();
+        scene_preparing(&mut state);
+        assert_eq!(state.pages.len(), 0);
+        assert_eq!(state.overview_model.checks.len(), 7);
+        assert!(
+            state
+                .overview_model
+                .checks
+                .iter()
+                .all(|row| row.status == CheckStatus::NotRun)
+        );
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("overview-all-checks").is_some());
+        assert!(rt.find("overview-response").is_some());
+        assert!(rt.find("overview-no-findings").is_some());
+    }
+
+    #[test]
+    fn overview_capped_scene_has_the_evidenced_shape() {
+        let mut state = init();
+        scene_overview_capped(&mut state);
+        assert_eq!(state.phase, RunPhase::Limited);
+        assert_eq!(state.pages.len(), 40);
+        assert_eq!(state.overview.titles, 11);
+        assert_eq!(state.overview.descriptions, 2);
+        assert_eq!(state.overview.sitemap_not_reached, 81);
+        assert_eq!(state.overview.sitemap_total, 121);
+        assert_eq!(
+            state.overview_model.review[0].kind,
+            super::overview::ReviewKind::MissingTitle
+        );
+        assert_eq!(
+            state.overview_model.review[1].kind,
+            super::overview::ReviewKind::MissingMeta
+        );
+        assert_eq!(
+            state.overview_model.review[0].count_text(),
+            "11 of 40 pages"
+        );
+        assert_eq!(state.overview_model.review[1].count_text(), "2 of 40 pages");
+        assert_eq!(
+            state.overview_model.coverage[0].label,
+            "81 of 121 sitemap URLs not reached"
+        );
+    }
+
+    #[test]
+    fn overview_serious_scene_puts_the_homepage_error_first() {
+        let mut state = init();
+        scene_overview_serious(&mut state);
+        assert_eq!(state.phase, RunPhase::Completed);
+        assert_eq!(state.overview.response, 1);
+        assert_eq!(state.overview.titles, 11);
+        assert_eq!(state.overview.descriptions, 2);
+        assert_eq!(
+            state.overview_model.review[0].kind,
+            super::overview::ReviewKind::HomepageError
+        );
+        assert_eq!(
+            state.overview_model.review[1].kind,
+            super::overview::ReviewKind::MissingTitle
+        );
+        assert_eq!(
+            state.overview_model.review[2].kind,
+            super::overview::ReviewKind::MissingMeta
+        );
+        assert!(state.overview_model.review[0].priority > state.overview_model.review[1].priority);
+    }
+
+    #[test]
+    fn overview_review_ranks_homepage_error_and_opens_its_exact_evidence() {
+        let mut state = init();
+        load_sample(&mut state);
+        if let Some(home) = state.pages.first_mut() {
+            home.status = 500;
+            home.content_type = "text/html; charset=utf-8".into();
+            home.indexability = scene_complete_assessment(home);
+        }
+        state.audit = Arc::new(Audit::from_pages(&state.pages));
+        state.counts_dirty = true;
+        let _ = refresh_counts(&mut state, true);
+        switch_tab(&mut state, Tab::Overview);
+        let first = state
+            .overview_model
+            .review
+            .first()
+            .expect("the homepage error is ranked");
+        assert_eq!(first.kind, super::overview::ReviewKind::HomepageError);
+        assert_eq!(first.title, "Homepage returned a 500");
+        assert_eq!(first.affected, 1);
+        assert_eq!(first.eligible, Some(state.pages.len()));
+        assert_eq!(first.count_text(), "1 of 9 pages");
+
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("overview-review-0").is_some());
+        let (x, y) = rt.find("overview-review-0").expect("first review row");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.016);
+        assert_eq!(rt.state.tab, Tab::Response);
+        assert_eq!(rt.state.view().filter, CheckFilter::Findings);
+        assert_eq!(
+            rt.state.view().selected.as_deref(),
+            Some("https://example.com/")
+        );
+        assert!(rt.state.details_open, "the evidence drawer opens");
+    }
+
+    #[test]
+    fn overview_review_names_the_subtype_and_drills_to_that_subtype() {
+        let mut state = init();
+        load_sample(&mut state);
+        switch_tab(&mut state, Tab::Overview);
+        let candidate = state
+            .overview_model
+            .review
+            .iter()
+            .find(|candidate| candidate.kind == super::overview::ReviewKind::MissingMeta)
+            .expect("the sample has a missing meta description");
+        assert_eq!(candidate.affected, 1);
+        assert_eq!(
+            candidate.eligible,
+            Some(state.overview.descriptions_eligible)
+        );
+        assert_eq!(candidate.query, Some("Missing"));
+        let sample = candidate.sample.clone().expect("the finding names a row");
+        let target = candidate.target;
+        let query = candidate.query;
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        rt.update(|state: &mut State, _| open_review_target(state, target, query, Some(&sample)));
+        rt.frame(0.016);
+        assert_eq!(rt.state.tab, Tab::Meta);
+        assert_eq!(rt.state.view().filter, CheckFilter::Findings);
+        assert_eq!(rt.state.view().query.text, "Missing");
+        assert!(!rt.state.visible.is_empty());
+        assert!(rt.state.visible.iter().all(|index| {
+            issue_for(Tab::Meta, &rt.state.pages[*index], &rt.state.audit) == "Missing"
+        }));
+        assert_eq!(
+            rt.state.view().selected.as_deref(),
+            Some(sample.as_str()),
+            "the clicked finding selects its own evidence row"
+        );
+        assert!(rt.state.details_open);
+    }
+
+    #[test]
+    fn overview_server_error_review_opens_its_subtype_and_sample() {
+        let mut state = init();
+        scene_overview_capped(&mut state);
+        let url = state.pages[1].url.clone();
+        state.pages[1].status = 503;
+        state.pages[1].indexability = scene_complete_assessment(&state.pages[1]);
+        state.audit = Arc::new(Audit::from_pages(&state.pages));
+        state.counts_dirty = true;
+        let _ = refresh_counts(&mut state, true);
+        let candidate = state
+            .overview_model
+            .review
+            .iter()
+            .find(|candidate| candidate.kind == super::overview::ReviewKind::ServerError)
+            .expect("the 503 is a server-error finding");
+        assert_eq!(candidate.query, Some("Server error"));
+        assert_eq!(candidate.sample.as_deref(), Some(url.as_str()));
+
+        let target = candidate.target;
+        let query = candidate.query;
+        let sample = candidate.sample.clone();
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        rt.update(|state: &mut State, _| {
+            open_review_target(state, target, query, sample.as_deref())
+        });
+        rt.frame(0.016);
+        assert_eq!(rt.state.tab, Tab::Response);
+        assert_eq!(rt.state.view().filter, CheckFilter::Findings);
+        assert_eq!(rt.state.view().query.text, "Server error");
+        assert_eq!(
+            rt.state.view().selected.as_deref(),
+            Some(url.as_str()),
+            "the server-error finding opens its own row"
+        );
+        assert!(rt.state.details_open);
+    }
+
+    #[test]
+    fn overview_coverage_adjusts_the_page_limit_without_starting_a_crawl() {
+        let mut state = init();
+        load_sample(&mut state);
+        switch_tab(&mut state, Tab::Overview);
+        state.phase = RunPhase::Limited;
+        if let Some(run) = state.run.as_mut() {
+            run.limits.max_pages = 40;
+        }
+        state.max_pages = 40;
+        state.overview.sitemap_not_reached = 81;
+        state.overview_model.coverage = vec![CoverageRow {
+            key: "overview-sitemap-not-reached",
+            label: "81 of 121 sitemap URLs not reached".into(),
+            reason: "page limit".into(),
+            target: Some(ReviewTarget::SitemapUrlsIncomplete),
+            adjust_limit: true,
+            signal: Signal::Amber,
+        }];
+        let mut rt = test_runtime(state);
+        rt.frame(0.016);
+        assert!(rt.find("overview-sitemap-not-reached-adjust").is_some());
+        rt.update(|state: &mut State, _| adjust_page_limit(state));
+        rt.frame(0.016);
+        assert_eq!(rt.state.pages_limit.text, "121");
+        assert!(rt.state.pages_limit.focused);
+        assert!(!rt.state.phase.active());
+        assert!(rt.state.job.is_none(), "adjusting never starts a crawl");
+        assert!(
+            rt.state
+                .action_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Page limit set to 121"))
+        );
+    }
+
+    #[test]
+    fn custom_extraction_editor_collapses_on_crawl_start_and_keeps_drafts() {
+        let mut state = init();
+        state.extraction_editor_open = true;
+        state.extraction_open = true;
+        let drafts = state.extraction_drafts.len();
+        collapse_extraction_editor(&mut state);
+        assert!(
+            !state.extraction_editor_open,
+            "the command-bar editor closes"
+        );
+        assert!(
+            state.extraction_open,
+            "the Internal inspector disclosure keeps its own state"
+        );
+        assert_eq!(state.extraction_drafts.len(), drafts);
     }
 
     #[test]
@@ -19442,26 +19877,31 @@ mod tests {
         load_sample(&mut state);
         switch_tab(&mut state, Tab::Overview);
         state.phase = RunPhase::Stopped;
-        state.overview = OverviewCounts {
-            pages: 9,
-            incomplete: 2,
-            ..OverviewCounts::default()
+        state.overview_model = OverviewModel {
+            review: Vec::new(),
+            coverage: vec![CoverageRow {
+                key: "overview-incomplete",
+                label: "2 pages did not finish capture or read".into(),
+                reason: "content checks withheld".into(),
+                target: Some(ReviewTarget::InternalIncomplete),
+                adjust_limit: false,
+                signal: Signal::Amber,
+            }],
+            ..OverviewModel::default()
         };
         let mut rt = test_runtime(state);
         rt.frame(0.016);
         assert!(rt.find("overview-no-findings").is_some());
         assert!(rt.find("overview-incomplete").is_some());
         assert!(rt.find("overview-coverage-complete").is_none());
-        assert!(rt.find("overview-outcome").is_some());
 
         let mut state = init();
         load_sample(&mut state);
         switch_tab(&mut state, Tab::Overview);
-        state.overview = OverviewCounts {
-            pages: 9,
-            ..OverviewCounts::default()
+        state.overview_model = OverviewModel {
+            coverage_complete: true,
+            ..OverviewModel::default()
         };
-        state.sitemap = SitemapReport::default();
         state.phase = RunPhase::Completed;
         let mut rt = test_runtime(state);
         rt.frame(0.016);
@@ -19687,7 +20127,11 @@ mod tests {
         assert_eq!(state.overview.sitemap_incomplete, 2);
         let mut rt = test_runtime(state);
         rt.frame(0.016);
-        click_key(&mut rt, "overview-sitemap-incomplete");
+        assert!(rt.find("overview-sitemap-incomplete").is_some());
+        rt.update(|state: &mut State, _| {
+            open_review_target(state, ReviewTarget::SitemapUrlsIncomplete, None, None)
+        });
+        rt.frame(0.016);
         assert_eq!(rt.state.tab, Tab::Sitemaps);
         assert_eq!(rt.state.sitemap_view, SitemapView::Urls);
         assert_eq!(rt.state.view().filter, CheckFilter::Incomplete);
@@ -19745,16 +20189,39 @@ mod tests {
         );
         let mut rt = test_runtime(state);
         rt.frame(0.016);
+        rt.update(|state: &mut State, _| {
+            state.overview_all_checks_open = true;
+            state.overview_optional_open = true;
+        });
+        rt.frame(0.016);
         assert!(rt.find("overview-sitemap-files").is_some());
         assert!(
-            rt.find("overview-coverage-complete").is_none(),
-            "file findings are coverage gaps"
+            rt.find("overview-coverage-complete").is_some(),
+            "a sitemap file finding is observed, not a captured-page coverage gap"
         );
-        click_key(&mut rt, "overview-sitemap-files");
+        let candidate = rt
+            .state
+            .overview_model
+            .review
+            .iter()
+            .find(|candidate| candidate.kind == super::overview::ReviewKind::SitemapFile)
+            .expect("the broken sitemap file is ranked");
+        let target = candidate.target;
+        let sample = candidate.sample.clone();
+        rt.update(|state: &mut State, _| {
+            open_review_target(state, target, None, sample.as_deref())
+        });
+        rt.frame(0.016);
         assert_eq!(rt.state.tab, Tab::Sitemaps);
         assert_eq!(rt.state.sitemap_view, SitemapView::Files);
         assert_eq!(rt.state.view().filter, CheckFilter::Findings);
         assert_eq!(visible_len(&rt.state), 1);
+        assert_eq!(
+            rt.state.view().selected.as_deref(),
+            Some("https://example.com/broken-sitemap.xml"),
+            "the sitemap finding opens its own file evidence"
+        );
+        assert!(rt.state.details_open);
     }
 
     #[test]
@@ -20445,7 +20912,7 @@ mod tests {
         scene_inventory_scope(&mut state);
         let mut rt = test_runtime(state);
         rt.frame(0.016);
-        assert!(rt.find("overview-export-inventory").is_some());
+        assert!(rt.find("overview-export-trigger").is_some());
         assert!(rt.find("inventory-all").is_some());
         assert!(rt.find("inventory-visible").is_some());
         click_key(&mut rt, "inventory-cancel");
@@ -20461,7 +20928,11 @@ mod tests {
         state.tab = Tab::Overview;
         let mut rt = test_runtime(state);
         rt.frame(0.016);
-        click_key(&mut rt, "overview-export-inventory");
+        rt.update(|state: &mut State, _| state.export_menu_open = true);
+        rt.frame(0.016);
+        assert!(rt.find("overview-export-item0").is_some());
+        assert!(rt.find("overview-export-item1").is_some());
+        click_key(&mut rt, "overview-export-item1");
         assert!(
             rt.state.inventory_scope_open,
             "an active crawl can start a snapshot export"
@@ -20658,6 +21129,11 @@ mod tests {
         switch_tab(&mut state, Tab::Overview);
         let mut rt = test_runtime(state);
         rt.frame(0.016);
+        rt.update(|state: &mut State, _| {
+            state.overview_all_checks_open = true;
+            state.overview_optional_open = true;
+        });
+        rt.frame(0.016);
         assert!(rt.find("overview-content-same").is_some());
         assert!(rt.find("overview-content-similar").is_some());
         click_key(&mut rt, "overview-content-same");
@@ -20775,7 +21251,11 @@ mod tests {
         );
         let mut rt = test_runtime(state);
         rt.frame(0.016);
-        click_key(&mut rt, "overview-incomplete");
+        assert!(rt.find("overview-incomplete").is_some());
+        rt.update(|state: &mut State, _| {
+            open_review_target(state, ReviewTarget::InternalIncomplete, None, None)
+        });
+        rt.frame(0.016);
         assert_eq!(rt.state.tab, Tab::Internal);
         assert_eq!(rt.state.view().filter, CheckFilter::Incomplete);
         assert_eq!(visible_len(&rt.state), 2);
@@ -20844,6 +21324,65 @@ mod tests {
             );
         }
         assert_eq!(rt.state.tab, Tab::Overview);
+    }
+
+    #[test]
+    fn set_pages_builds_the_overview_under_its_terminal_phase() {
+        let mut state = init();
+        state.phase = RunPhase::Crawling;
+        state.sitemap.discovery_done = true;
+        set_pages(
+            &mut state,
+            crawl::sample_pages(),
+            "9 pages on example.com".into(),
+        );
+        assert_eq!(state.phase, RunPhase::Completed);
+        assert!(
+            state.overview_model.coverage_complete,
+            "a completed fixture must not inherit the previous phase's coverage copy"
+        );
+        assert!(
+            state
+                .overview_model
+                .coverage
+                .iter()
+                .all(|row| row.reason != "crawl still running"),
+            "terminal coverage rows must not describe a running crawl"
+        );
+    }
+
+    #[test]
+    fn overview_coverage_action_stays_visible_at_the_minimum_window() {
+        let mut state = init();
+        scene_overview_capped(&mut state);
+        let mut rt = Runtime::new(
+            state,
+            view,
+            (880.0, 560.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.016);
+        let (rect, opacity) = rt
+            .presented("overview-sitemap-not-reached-adjust")
+            .expect("the page-limit action is still built at 880x560");
+        let [x, y, width, height] = rect;
+        assert!(opacity > 0.0, "the action is not hidden: {rect:?}");
+        assert!(width > 0.0 && height > 0.0, "the action has a hit target");
+        assert!(
+            x >= 0.0 && x + width <= 880.0,
+            "the action is inside the minimum width: {rect:?}"
+        );
+        assert!(
+            y >= 0.0 && y + height <= 560.0,
+            "the action is inside the minimum height: {rect:?}"
+        );
+        assert!(
+            rt.presented("overview-sitemap-not-reached").is_some(),
+            "the coverage row itself is drawn"
+        );
     }
 
     #[test]
@@ -23611,10 +24150,18 @@ mod tests {
         assert!(state.overview.structured_incomplete > 0);
         let mut rt = test_runtime(state);
         rt.frame(0.016);
+        rt.update(|state: &mut State, _| {
+            state.overview_all_checks_open = true;
+            state.overview_optional_open = true;
+        });
+        rt.frame(0.016);
         assert!(rt.find("overview-structured").is_some());
         assert!(rt.find("overview-structured-incomplete").is_some());
 
-        click_key(&mut rt, "overview-structured");
+        rt.update(|state: &mut State, _| {
+            open_review_target(state, ReviewTarget::StructuredFindings, None, None)
+        });
+        rt.frame(0.016);
         assert_eq!(rt.state.tab, Tab::Internal);
         assert_eq!(rt.state.internal_view, InternalView::StructuredData);
         assert_eq!(rt.state.structured_subview, StructuredView::Pages);
@@ -23623,7 +24170,10 @@ mod tests {
 
         switch_tab(&mut rt.state, Tab::Overview);
         rt.frame(0.016);
-        click_key(&mut rt, "overview-structured-incomplete");
+        rt.update(|state: &mut State, _| {
+            open_review_target(state, ReviewTarget::StructuredIncomplete, None, None)
+        });
+        rt.frame(0.016);
         assert_eq!(
             rt.state.structured_pages_view.filter,
             CheckFilter::Incomplete
