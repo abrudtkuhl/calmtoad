@@ -179,6 +179,74 @@ The workflow creates the matching `vX.Y.Z` tag, builds downloads for Linux x86_6
 oras pull ghcr.io/abrudtkuhl/calmtoad:v0.2.0
 ```
 
+### Downloads, packaging, and the one-line installer
+
+`scripts/package-macos.sh` builds the macOS downloads from `target/release/calmtoad`:
+the `.app` bundle, the `.zip` the in-app updater consumes, and a `.dmg` that opens
+with the app and an **Applications** drop link. Run it locally with any Mach-O binary:
+
+```sh
+scripts/package-macos.sh --binary target/release/calmtoad \
+  --version 0.13.0 --name Calm-Toad-Mac-Apple-Silicon --out dist
+```
+
+`scripts/install.sh` is the user-facing installer
+(`curl -fsSL …/scripts/install.sh | sh`). It detects macOS/Linux and the processor,
+downloads `latest.json`, verifies its minisign signature against the committed
+`assets/updater.pub`, then verifies the download's size and SHA-256 against that
+signed manifest before installing. When `minisign` is not installed it fetches the
+official verifier into a temporary directory and checks the archive against a
+pinned SHA-256; a bad or missing signature fails closed. On macOS it prefers
+`/Applications`, falls back to `~/Applications` without asking for an administrator
+password, and clears `com.apple.quarantine` so a fresh install never hits a
+Gatekeeper dialog. It needs POSIX sh plus curl or wget, a SHA-256 tool, `tar`
+(and `zipinfo`/`unzip` on macOS), `mktemp`, `find`, `sed`, `awk`, `wc`, `tr`,
+`chmod`, `mv`, `ln`, `mkdir`, `rm`, `cat`, and platform `xattr`/`open`/`pgrep`
+on macOS. `minisign` is optional; otherwise the installer fetches a pinned
+verifier. The manifest parser is awk, not jq or python. `CALMTOAD_PREFIX`,
+`CALMTOAD_VERSION`, `CALMTOAD_NO_LAUNCH` and `CALMTOAD_RELEASES_URL` override
+defaults; `CALMTOAD_RELEASES_URL` is for tests and mirrors. Production signing
+and verifier trust anchors cannot be overridden by environment variables.
+`CALMTOAD_TEST_MODE=1` enables test-only injection and must not be used for a
+real installation. The release also uploads it as the `install.sh` asset.
+
+Both are tested offline and run in CI:
+
+```sh
+scripts/test-install.sh        # signed fixtures, tampered manifests, rollback, Linux prefixes
+scripts/test-package-macos.sh  # sealed bundle, updater zip, dmg layout, signing order (macOS)
+```
+
+### Apple signing and notarization
+
+Without credentials the bundle is **ad-hoc signed**, which seals `Info.plist` into
+the signature. That matters: the old downloads shipped a bare linker-signed binary
+with an unsealed `Info.plist`, and Gatekeeper reported those as "damaged" rather
+than as an ordinary unverified app. Ad-hoc signing does not remove the warning for a
+quarantined browser download; the installer avoids it, and a Developer ID build
+removes it.
+
+To publish signed and notarized downloads, add these repository secrets:
+
+- `MACOS_CERT_P12` — base64 of the exported Developer ID Application certificate.
+- `MACOS_CERT_PASSWORD` — the export password.
+- `MACOS_SIGN_IDENTITY` — for example `Developer ID Application: Name (TEAMID)`.
+- `APPLE_ID`, `APPLE_APP_PASSWORD`, and `APPLE_TEAM_ID` — used by `notarytool` on
+  each CI runner. Do not rely on an `APPLE_KEYCHAIN_PROFILE` secret: the profile
+  would not exist on a fresh runner.
+
+Locally you may instead set `APPLE_KEYCHAIN_PROFILE` to a profile created with
+`xcrun notarytool store-credentials`. A build with `MACOS_SIGN_IDENTITY` but no
+notarization credentials fails unless `CALMTOAD_ALLOW_UNNOTARIZED=1` is set
+explicitly.
+
+The workflow imports the certificate into a temporary keychain and signs with the
+hardened runtime and `assets/entitlements.plist`. It notarizes and staples the app
+**before** building the zip and dmg, then signs the dmg with Developer ID,
+notarizes it, staples it, and validates it. Both the app and the dmg therefore carry
+their own stapled ticket. `assets/entitlements.plist` is intentionally empty; add a
+key only with the feature that needs it.
+
 ### Update signing key
 
 The app downloads `latest.json` from `releases/latest/download/` and verifies its
@@ -194,9 +262,11 @@ rsign generate -p calmtoad.pub -s calmtoad.key --unencrypted \
 
 Keep the private key offline and add its full contents as the
 `MINISIGN_SECRET_KEY` repository secret. Put the public key in
-`assets/updater.pub` and commit it with the release that starts using it. Rotate
-by adding a second public key to `PUBLIC_KEY` handling in `src/update/mod.rs` for
-one release before removing the old key.
+`assets/updater.pub`, embed the same key in `scripts/install.sh`, and commit both
+with the release that starts using it. `test-install.sh` verifies they match.
+Rotate by adding a second public key to `PUBLIC_KEY` handling in
+`src/update/mod.rs` for one release before removing the old key, and update the
+one-line installer's embedded key atomically with `assets/updater.pub`.
 
 The release workflow builds `latest.json` with `scripts/release-manifest.sh`,
 signs it with `minisign -Sm`, verifies the signature, uploads the manifest and
@@ -209,4 +279,4 @@ the `releases/latest` URL keeps pointing at the previous version.
 Users who installed a build from before in-app updates existed need one manual
 upgrade; later versions update themselves.
 
-The Linux build needs the `libxkbcommon` runtime and glibc 2.35 or newer (Ubuntu 22.04 or later). Release and CI build it in an `ubuntu:22.04` container (`.github/workflows/linux-build.yml`), fail if the binary needs a newer glibc symbol, and open it on Ubuntu 22.04, Ubuntu 24.04, and Debian 13 before publishing. Building on a newer system, as v0.6.0 did on Ubuntu 26.04, produces a download that only starts on that system or newer. macOS app bundles are currently unsigned and unnotarized.
+The Linux build needs the `libxkbcommon` runtime and glibc 2.35 or newer (Ubuntu 22.04 or later). Release and CI build it in an `ubuntu:22.04` container (`.github/workflows/linux-build.yml`), fail if the binary needs a newer glibc symbol, and open it on Ubuntu 22.04, Ubuntu 24.04, and Debian 13 before publishing. Building on a newer system, as v0.6.0 did on Ubuntu 26.04, produces a download that only starts on that system or newer. macOS downloads are ad-hoc signed and unnotarized unless the Apple signing secrets above are configured.

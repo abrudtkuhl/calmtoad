@@ -5,6 +5,18 @@ date are being prepared for release.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-27
+
+### Added
+
+- **Install Calm Toad on macOS or Linux with one command.** The installer detects the computer, verifies the signed release manifest and download checksum, installs Calm Toad without an administrator password, and opens it. It can pin a version, choose a location, skip launch, and safely recover interrupted upgrades.
+- **Download a macOS disk image.** Apple silicon and Intel releases include a `.dmg` with Calm Toad and an Applications shortcut, alongside the updater `.zip`.
+- **Package macOS releases consistently.** CI creates and checks the app bundle, updater archive, and disk image. When Apple Developer ID and notarization credentials are configured, releases are signed, notarized, and stapled.
+
+### Fixed
+
+- Seal the macOS app bundle during signing so Gatekeeper no longer reports the unsealed app as damaged.
+
 ## [0.12.0]
 
 ### Improved
