@@ -138,12 +138,15 @@ jobs:
               exit 1
             fi
             # Build and publish check out the tag, not this commit. If the tag carries
-            # different signing material or manifest tooling, retrying it here cannot
-            # repair that: the new scripts and key would never be used.
-            if ! git diff --quiet "$tag" "$GITHUB_SHA" -- assets/updater.pub scripts/release-manifest.sh; then
-              echo "$tag predates the current updater signing tooling." >&2
-              echo "An existing tag builds with its own assets/updater.pub and" >&2
-              echo "scripts/release-manifest.sh, so this retry cannot fix it." >&2
+            # different signing material, packaging scripts, or manifest tooling,
+            # retrying it here cannot repair that: the new files would never be used.
+            if ! git diff --quiet "$tag" "$GITHUB_SHA" -- \
+              assets/updater.pub assets/entitlements.plist \
+              scripts/release-manifest.sh scripts/install.sh scripts/package-macos.sh \
+              scripts/check-macos-codesign-identity.sh; then
+              echo "$tag predates the current packaging or updater signing tooling." >&2
+              echo "An existing tag builds with its own assets and scripts, so this" >&2
+              echo "retry cannot fix it." >&2
               echo "Release a new version, or deliberately delete and recreate the tag" >&2
               echo "before retrying with current tooling." >&2
               exit 1
@@ -242,34 +245,56 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      - name: Prepare macOS app download
+      - name: Import the Developer ID certificate when one is configured
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MACOS_CERT_P12:-}" ]]; then
+            echo "No MACOS_CERT_P12 secret; the downloads will be ad-hoc signed."
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          password="$(openssl rand -hex 16)"
+          p12="$RUNNER_TEMP/developer-id.p12"
+          trap 'rm -f "$p12"' EXIT
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | openssl base64 -d -A -out "$p12"
+          # PKCS#12 is an aggregate: import certificate + private key, not cert-only.
+          if ! security import "$p12" \
+            -P "${MACOS_CERT_PASSWORD:-}" -A -t agg -f pkcs12 -k "$keychain" >/dev/null 2>&1; then
+            echo "Could not import the Developer ID PKCS#12 signing identity." >&2
+            exit 1
+          fi
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
+          chmod +x scripts/check-macos-codesign-identity.sh
+          scripts/check-macos-codesign-identity.sh "$keychain"
+          rm -f "$p12"
+          trap - EXIT
+
+      - name: Prepare macOS downloads
         if: runner.os == 'macOS'
         env:
           VERSION: ${{ needs.create_tag.outputs.version }}
           DOWNLOAD: ${{ matrix.download }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          package="dist/Calm Toad"
-          app="$package/Calm Toad.app"
-          mkdir -p "$app/Contents/MacOS"
-          cp target/release/calmtoad "$app/Contents/MacOS/calmtoad"
-          cp README.md "$package/README.md"
-          cat > "$app/Contents/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleExecutable</key><string>calmtoad</string>
-            <key>CFBundleIdentifier</key><string>app.calmtoad.desktop</string>
-            <key>CFBundleName</key><string>Calm Toad</string>
-            <key>CFBundleDisplayName</key><string>Calm Toad</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
-            <key>CFBundleVersion</key><string>${VERSION}</string>
-          </dict>
-          </plist>
-          PLIST
-          ditto -c -k --sequesterRsrc --keepParent "$package" "dist/${DOWNLOAD}"
+          chmod +x scripts/package-macos.sh
+          scripts/package-macos.sh \
+            --binary target/release/calmtoad \
+            --version "$VERSION" \
+            --name "${DOWNLOAD%.zip}" \
+            --out dist
 
       - name: Prepare Windows download
         if: runner.os == 'Windows'
@@ -286,7 +311,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.asset }}
-          path: dist/${{ matrix.download }}
+          path: dist/Calm-Toad-*
           if-no-files-found: error
           retention-days: 7
 
@@ -329,6 +354,15 @@ jobs:
         with:
           version: 1.3.6
 
+      # The one-line installer ships as a release asset too, so
+      # releases/latest/download/install.sh always installs the newest version.
+      - name: Stage the installer script
+        run: |
+          set -euo pipefail
+          sh -n scripts/install.sh
+          cp scripts/install.sh dist/install.sh
+          chmod +x dist/install.sh
+
       - name: Install minisign
         run: |
           set -euo pipefail
@@ -360,10 +394,10 @@ jobs:
                 gh release delete-asset "$TAG" "$asset" --yes
               fi
             done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
-            gh release upload "$TAG" dist/Calm-Toad-* --clobber
+            gh release upload "$TAG" dist/Calm-Toad-* dist/install.sh --clobber
             gh release edit "$TAG" --title "Calm Toad $TAG" --notes-file "$notes"
           else
-            gh release create "$TAG" dist/Calm-Toad-* \
+            gh release create "$TAG" dist/Calm-Toad-* dist/install.sh \
               --draft \
               --verify-tag \
               --title "Calm Toad $TAG" \
@@ -426,6 +460,14 @@ jobs:
               exit 1
             fi
           done
+
+          for required in install.sh Calm-Toad-Mac-Apple-Silicon.dmg Calm-Toad-Mac-Intel.dmg; do
+            if [[ ! -f "$verify/$required" ]]; then
+              echo "The draft is missing $required." >&2
+              exit 1
+            fi
+          done
+          sh -n "$verify/install.sh"
 
       - name: Publish downloads to GitHub Packages
         env:

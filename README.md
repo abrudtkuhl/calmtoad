@@ -8,28 +8,53 @@ Calm Toad checks a website for common problems like missing page titles, broken 
 
 ## Install Calm Toad
 
-The easiest way to install Calm Toad is to ask an AI assistant that can use your computer. Copy and paste this:
+**Mac or Linux — one command.** Paste this into Terminal and press Return:
 
-```text
-Please install Calm Toad on this computer for me. Use the official download for my computer:
-
-- Windows: https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Windows.zip
-- Mac with an Apple chip: https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Apple-Silicon.zip
-- Mac with an Intel processor: https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Intel.zip
-- Linux: https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Linux.tar.gz
-
-Figure out which link matches this computer. If you are unsure, ask me before downloading. Install Calm Toad in the usual place for apps and open it to make sure it works. Ask me before using an administrator password or changing security settings. If something gets in the way, explain it in plain language. When you're done, tell me where Calm Toad is and confirm that it opened.
+```sh
+curl -fsSL https://raw.githubusercontent.com/abrudtkuhl/calmtoad/main/scripts/install.sh | sh
 ```
 
-### Install it yourself
+That is the whole install. It finds the right download for your computer, verifies the release's signature and checksum, installs it, and opens Calm Toad.
+
+- No admin password. It uses `/Applications` when it can and `~/Applications` otherwise.
+- No "damaged" or "unidentified developer" dialog, and no right-click-Open workaround: the installer clears the quarantine flag itself.
+- No guessing between Apple silicon and Intel, and no extracting folders by hand.
+- Safe to re-run: it upgrades an existing copy, refuses a download whose signature or checksum does not match, and never replaces a copy that is still running.
+
+**Want a computer-use assistant to install it?** Paste this:
+
+```text
+Please install Calm Toad on this Mac using its official installer:
+curl -fsSL https://raw.githubusercontent.com/abrudtkuhl/calmtoad/main/scripts/install.sh | sh
+Run it in Terminal, then tell me whether it opened and where it was installed.
+```
+
+Useful variations:
+
+```sh
+# Install without opening the app, or pick where it goes.
+curl -fsSL https://raw.githubusercontent.com/abrudtkuhl/calmtoad/main/scripts/install.sh | sh -s -- --no-launch
+curl -fsSL https://raw.githubusercontent.com/abrudtkuhl/calmtoad/main/scripts/install.sh | sh -s -- --prefix ~/Applications
+
+# Install a specific version instead of the latest.
+curl -fsSL https://raw.githubusercontent.com/abrudtkuhl/calmtoad/main/scripts/install.sh | sh -s -- --version 0.13.0
+```
 
 **Windows:** [Download Calm Toad for Windows](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Windows.zip). In Downloads, right-click the file, choose **Extract All**, open the new folder, and double-click **Calm Toad**.
 
-**Mac:** Choose the [Apple chip download](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Apple-Silicon.zip) for an M-series Mac, or the [Intel download](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Intel.zip). If you are unsure, open the Apple menu and choose **About This Mac**. Open the download, open the **Calm Toad** folder it creates, then drag **Calm Toad.app** into Applications.
+### Download it yourself instead
 
-**Linux:** [Download Calm Toad for Linux](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Linux.tar.gz). Open the download, choose **Extract**, then open the new folder and double-click **Calm Toad**. If Linux asks whether to run or display it, choose **Run**. It needs Ubuntu 22.04, Debian 12, or another Linux from 2022 or later (glibc 2.35+). If it does not open, use the instructions above to ask an AI assistant to set it up.
+| Computer | Download | What to do |
+| --- | --- | --- |
+| Mac with an Apple chip | [Calm-Toad-Mac-Apple-Silicon.dmg](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Apple-Silicon.dmg) | Open the disk image and drag **Calm Toad** onto **Applications**. |
+| Mac with an Intel processor | [Calm-Toad-Mac-Intel.dmg](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Mac-Intel.dmg) | Same: open, drag to **Applications**. Not sure which Mac you have? Apple menu → **About This Mac**, or just use the command above. |
+| Windows | [Calm-Toad-Windows.zip](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Windows.zip) | Right-click → **Extract All**, then double-click **Calm Toad**. |
+| Linux | [Calm-Toad-Linux.tar.gz](https://github.com/abrudtkuhl/calmtoad/releases/latest/download/Calm-Toad-Linux.tar.gz) | Extract and run **Calm Toad**, or use the command above to get a launcher and a `calmtoad` command. Needs Ubuntu 22.04, Debian 12, or newer (glibc 2.35+). |
 
-The Mac app is not signed by Apple yet, so macOS may show a security warning the first time you open it. If you choose to continue, follow [Apple's instructions](https://support.apple.com/en-us/102445).
+Each Mac download is also available as a `.zip` with the same name; that is the package the in-app updater uses, and most people do not need it.
+
+The Mac downloads are ad-hoc signed unless the release is built with an Apple Developer ID identity (see [Apple signing and notarization](CONTRIBUTING.md#apple-signing-and-notarization)). If you download the disk image by hand and macOS warns about an unverified developer, the install command above avoids that entirely.
+
 
 ### Updates
 

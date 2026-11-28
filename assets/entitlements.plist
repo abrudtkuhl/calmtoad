@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Hardened-runtime entitlements for the macOS download.
+  Calm Toad needs none today: it draws with Metal and starts the user's own
+  Chrome/Chromium as a child process, with no JIT, no injected libraries and no
+  Apple events. Keep this list empty rather than granting rights the app does
+  not use; add a key here only with the feature that needs it.
+-->
+<dict/>
+</plist>
